@@ -1,0 +1,6 @@
+[perception]
+segmentation_mode = "punctuation"
+split_pause_threshold = 0.20
+silence_threshold = 0.80
+max_chars = 60
+sentence_endings = ["。","！","？","；","\n","，",",",".","!","?",";",":","：","—","…","、","（","）","(",")","“","”","\"","'","《","》"]

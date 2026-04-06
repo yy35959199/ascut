@@ -1,0 +1,12 @@
+models/
+samples/
+outputs/
+pycache/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.pyc
+*.pyo
+.venv/
+*.log

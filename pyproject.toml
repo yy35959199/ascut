@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autosmartcut"
+version = "0.1.0"
+description = "Semantic video cutting pipeline"
+requires-python = ">=3.11"
+dependencies = [
+"qwen-asr",
+"smartcut",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["autosmartcut*"]
+
+[project.scripts]
+ascut = "autosmartcut.runner:main"
