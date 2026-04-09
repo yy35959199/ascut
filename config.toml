@@ -5,6 +5,9 @@ silence_threshold = 0.80
 max_chars = 60
 sentence_endings = ["。","！","？","；","\n","，",",",".","!","?",";",":","：","—","…","、","（","）","(",")","“","”","\"","'","《","》"]
 
+# Layer3：keep 段右边界 = 末句 t_end + min(gap_after, gap_after_cap)
+[execution]
+gap_after_cap = 0.6
 
 [llm]
 api_key = "sk-f46d082357234fd2977e400835892f35"                       

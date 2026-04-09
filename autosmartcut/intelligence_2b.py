@@ -4,25 +4,26 @@
 基于 2a 的理解结果，对每个 speech 标注做出保留/删除决策，生成 keep_mask。
 这是智能层的核心输出，直接决定最终视频的内容。
 
-## 决策逻辑（待 LLM 实现）
-- 输入：消歧后的文本 + 主旨 + 分块信息 + 用户目标
-- 任务：判断每个 speech 片段是否与目标相关，是否包含有价值内容
-- 输出：对每个 speech 标注输出 keep=true/false
-- 静音：keep=null（不由 LLM 决策，由执行层规则推导）
+## 决策逻辑
+- 输入：2a 产出的稠密消歧文本 + 主旨 + 分块信息 + 用户目标
+- 任务：判断每个句级标注是否与目标相关、是否值得保留
+- 输出：对每个 annotation index 输出 keep=true 或 keep=false
 
 ## 输入 Schema
 manifest_dict = {
-    "annotations": [            # 来自 Layer 1
+    "annotations": [            # 来自 Layer 1（MVP：句级 speech，含 gap_after）
         {
             "index": int,
-            "type": str,        # "speech" | "silence"
             "content": str,
+            "t_start": float,
+            "t_end": float,
+            "gap_after": float,
             ...
         }
     ],
     "comprehension": {          # 来自 2a
         "purpose": str,             # 精化主旨
-        "cleaned_annotations": [    # 消歧文本
+        "cleaned_annotations": [    # 稠密消歧文本（与 annotations 等长对齐）
             {
                 "annotation_index": int,
                 "cleaned_content": str
@@ -43,7 +44,7 @@ manifest_dict = {
 manifest_dict["keep_mask"] = [
     {
         "index": int,           # 对应 annotations[].index
-        "keep": bool | None     # True=保留, False=删除, None=静音
+        "keep": bool           # True=保留, False=删除（MVP 仅布尔，不用 null）
     },
     ...
 ]
@@ -51,8 +52,7 @@ manifest_dict["keep_mask"] = [
 ## 注意
 - keep_mask 长度必须等于 annotations 长度
 - keep_mask 与 annotations 通过 index 一一对应
-- speech 条目：keep 为 bool（LLM 决策）
-- silence 条目：keep 为 null（执行层规则推导）
+- 每条 keep 均为 bool，与 JSON3 / intelligence-layer2-mvp 一致
 """
 
 from autosmartcut.intelligence_llm import call_llm_structured
@@ -133,7 +133,7 @@ def _generate_keep_mask(
         goal: 用户目标
 
     Returns:
-        keep_mask 列表 [{"index": int, "keep": bool|None}, ...]
+        keep_mask 列表 [{"index": int, "keep": bool}, ...]
     """
     print("[2b] 调用 LLM 生成决策")
 
@@ -166,7 +166,7 @@ def _build_prompt(
     输入元素：
     - 用户目标
     - 2a 的主旨
-    - 2a 的消歧标注（优先使用）
+    - 2a 的稠密消歧标注（唯一文本来源）
     - 2a 的分块信息
     - 所有 speech 标注
 
@@ -174,11 +174,9 @@ def _build_prompt(
     对每个 speech 标注判断是否保留
     """
     purpose = comprehension.get("purpose", "")
-    cleaned_map = {
-        c["annotation_index"]: c["cleaned_content"]
-        for c in comprehension.get("cleaned_annotations", [])
-    }
+    cleaned_annotations = comprehension.get("cleaned_annotations", [])
     outline_blocks = comprehension.get("outline_blocks", [])
+    _validate_dense_cleaned_annotations(annotations, cleaned_annotations)
 
     # 构造分块摘要
     if outline_blocks:
@@ -190,12 +188,11 @@ def _build_prompt(
     else:
         blocks_section = "内容分块：无"
 
-    # 构造标注列表（使用消歧文本）
+    # 构造标注列表（仅使用稠密消歧文本）
     speech_lines = []
-    for ann in annotations:
+    for i, ann in enumerate(annotations):
         idx = ann["index"]
-        # 优先使用消歧文本
-        text = cleaned_map.get(idx, ann.get("content", ""))
+        text = cleaned_annotations[i]["cleaned_content"]
         speech_lines.append(f"[{idx}] {text}")
 
     speech_text = "\n".join(speech_lines)
@@ -222,6 +219,43 @@ def _build_prompt(
 3. 必须覆盖所有条目
 
 请以 JSON 格式输出。"""
+
+
+def _validate_dense_cleaned_annotations(
+    annotations: list[dict],
+    cleaned_annotations: list[dict],
+) -> None:
+    """校验 cleaned_annotations 为与 annotations 严格对齐的稠密序列。"""
+    if len(cleaned_annotations) != len(annotations):
+        raise ValueError(
+            "comprehension.cleaned_annotations 必须为稠密全量序列："
+            f"长度不匹配 {len(cleaned_annotations)} != {len(annotations)}"
+        )
+
+    for i, ann in enumerate(annotations):
+        expected_idx = ann["index"]
+        item = cleaned_annotations[i]
+        actual_idx = item.get("annotation_index")
+        if not isinstance(actual_idx, int):
+            raise ValueError(
+                "comprehension.cleaned_annotations.annotation_index 必须为整数："
+                f"位置{i} 实际={actual_idx!r}"
+            )
+        if actual_idx != expected_idx:
+            raise ValueError(
+                "comprehension.cleaned_annotations 与 annotations 未对齐："
+                f"位置{i} 期望 annotation_index={expected_idx}，实际={actual_idx}"
+            )
+        if "cleaned_content" not in item:
+            raise ValueError(
+                "comprehension.cleaned_annotations 缺少 cleaned_content："
+                f"位置{i} annotation_index={expected_idx}"
+            )
+        if not isinstance(item["cleaned_content"], str):
+            raise ValueError(
+                "comprehension.cleaned_annotations.cleaned_content 必须为字符串："
+                f"位置{i} annotation_index={expected_idx}"
+            )
 
 
 def _get_schema() -> dict:

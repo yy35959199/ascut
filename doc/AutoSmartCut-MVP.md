@@ -363,7 +363,7 @@ LLM 输出的 keep_mask 数组，与人工 overrides 合并后写入此文件，
 }
 ```
 
-**约束：** `len(keep_mask) == len(JSON1.annotations)`；每条 `keep` 为 `true` 或 `false`。Layer 3 根据相邻保留句的时间边界与 `gap_after` 合并输出时间区间。
+**约束：** `len(keep_mask) == len(JSON1.annotations)`；每条 `keep` **仅**为 `true` 或 `false`（**不使用** `null`）。句间间隔由 JSON1 的 `gap_after` 表达，无独立静音标注行。Layer 3 将 JSON3 与 JSON1 对齐后合并保留段：每段右边界为 **该段最后一句** 的 `t_end + min(gap_after, gap_after_cap)`（`gap_after_cap` 默认见 `config.toml` 的 `[execution]`，避免长静音整段吃进成片）；再经 `pre_pad` / `post_pad` / `min_duration` 等后处理。
 
 #### 切点参数默认值
 

@@ -270,7 +270,7 @@ flowchart TD
 
 #### 2b — 决策子阶段（Decision）
 
-**输入（MVP）：** `comprehension.purpose`、`outline_blocks`、`cleaned_annotations`（缺省回退 `content`）+ 句级 `annotations[]`（含 `gap_after`，用于校验与执行层）。
+**输入（MVP）：** `comprehension.purpose`、`outline_blocks`、`cleaned_annotations`（稠密全量，未纠错句与原文一致）+ 句级 `annotations[]`（含 `gap_after`，用于校验与执行层）。
 
 **输入（完整版）：** 2a 产出的检查清单 + `cleaned_annotations[]` + 句级 `annotations[]`（含 `gap_after`）
 

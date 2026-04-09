@@ -15,6 +15,8 @@ from typing import Any
 from pathlib import Path
 
 import toml
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 from openai import OpenAI
 
 # ============================================================================
@@ -292,17 +294,45 @@ def _extract_json(content: str) -> dict:
 
 
 def _validate_json(data: dict, schema: dict) -> None:
-    """验证 JSON 是否符合 schema
+    """验证 JSON 是否符合 schema（Draft 2020-12）"""
+    logger = logging.getLogger(__name__)
 
-    简化实现：只验证必需字段是否存在
-    """
-    if "required" in schema:
-        for field in schema["required"]:
-            if field not in data:
-                raise LLMJSONParseError(
-                    json.dumps(data),
-                    f"缺少必需字段: {field}"
-                )
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError as e:
+        raise LLMJSONParseError(
+            json.dumps(schema, ensure_ascii=False),
+            f"SCHEMA_ERROR: 无效 JSON Schema ({e.message})"
+        )
+
+    validator = Draft202012Validator(schema)
+    errors = sorted(validator.iter_errors(data), key=lambda err: list(err.path))
+    if not errors:
+        return
+
+    def _format_path(path_parts: list[Any]) -> str:
+        path = "$"
+        for part in path_parts:
+            if isinstance(part, int):
+                path += f"[{part}]"
+            else:
+                path += f".{part}"
+        return path
+
+    formatted_errors = []
+    for err in errors[:5]:
+        err_path = _format_path(list(err.path))
+        formatted_errors.append(
+            f"{err_path}: {err.message} (validator={err.validator})"
+        )
+
+    first_path = _format_path(list(errors[0].path))
+    logger.warning("[LLM] Schema 校验失败，首条路径: %s", first_path)
+
+    raise LLMJSONParseError(
+        json.dumps(data, ensure_ascii=False),
+        "INSTANCE_ERROR: 输出不符合 JSON Schema; " + "; ".join(formatted_errors)
+    )
 
 
 # ============================================================================
@@ -419,6 +449,8 @@ def call_llm_structured(
                 raise
 
         except LLMJSONParseError as e:
+            if "SCHEMA_ERROR:" in str(e):
+                raise
             if attempt < max_retries - 1:
                 print(f"[LLM] JSON 解析失败，重试 {attempt+1}/{max_retries}")
                 time.sleep(RETRY_DELAY_SECONDS * (2 ** attempt))

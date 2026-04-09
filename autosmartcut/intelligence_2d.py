@@ -18,7 +18,7 @@ manifest_dict = {
     "keep_mask": [              # 来自 2b/2c
         {
             "index": int,
-            "keep": bool | None
+            "keep": bool
         }
     ],
     "annotations": [            # 来自 Layer 1
@@ -26,7 +26,6 @@ manifest_dict = {
             "index": int,
             "t_start": float,
             "t_end": float,
-            "type": str,
             "content": str,
             ...
         }
@@ -37,7 +36,7 @@ manifest_dict = {
 manifest_dict["keep_mask"] = [  # 最终有效决策（keep_mask + overrides 合并后）
     {
         "index": int,
-        "keep": bool | None
+        "keep": bool
     }
 ]
 

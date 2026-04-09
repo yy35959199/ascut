@@ -66,17 +66,18 @@ Layer 2 的语义处理坐标统一用 index，不用时间戳做主输入。
 
 - `manifest.goal`：用户剪辑目标。
 - `manifest.annotations[]`：来自 Layer 1 的句级语音标注（含 `index`、`t_start`、`t_end`、`content`、`gap_after`）。
-- **LLM 句面输入**：由 Layer 1 侧 `build_layer2_input_document` 从 `annotations` 生成，与 `layer2_input.json` 一致——`tokens[]` 每项仅 `**index`** 与 `**text**`（`text` 来自 `content`）。2a 的 R1/R2 **只消费该 `tokens` 列表**（加 `goal`），不把 `t_start`/`t_end`/`gap_after` 等塞进 Prompt。
+- **LLM 句面输入**：由 Layer 1 侧 `build_layer2_input_document` 从 `annotations` 生成，与 `layer2_input.json` 一致——`tokens[]` 每项仅 `**index`** 与 `**text`**（`text` 来自 `content`）。2a 的 R1/R2 **只消费该 `tokens` 列表**（加 `goal`），不把 `t_start`/`t_end`/`gap_after` 等塞进 Prompt。
 
 ### 4.2 2a 写入字段（`manifest.comprehension`）
 
 - `purpose`：最终主旨。
 - `outline_blocks[]`：分块结果（index 范围 + 块总结）。
-- `cleaned_annotations[]`：虚拟消歧文本（`annotation_index` + `cleaned_content`）。
+- `cleaned_annotations[]`：虚拟消歧文本（`annotation_index` + `cleaned_content`），
+  **稠密全量**，与 `annotations[]` 等长且按 `index` 对齐。
 
 ### 4.3 2b 写入字段
 
-- `keep_mask[]`：与 `annotations[]` 等长；每条均为 `keep=true|false`（布尔）。
+- `keep_mask[]`：与 `annotations[]` 等长；每条均为 `keep=true|false`（**仅布尔**）。MVP **不使用** `keep: null`；句间静音由 Layer1 的 `gap_after` 表达，**无**独立 `type=silence` 标注行。
 - `checklist_coverage[]`：MVP 阶段作为预留字段，可为空。
 
 ### 4.4 2c 写入字段（`manifest.review_reports[]`）
@@ -107,7 +108,9 @@ R2 结束后丢弃上述中间结构；**不**持久化 `symbol_table` / `symbol
 
 1. **R1（LLM）**：粗主旨 + 粗分块 + 疑似错词候选表。
 2. **R2（LLM）**：精化主旨 + 精化分块 + **错词唯一替换表** `corrections`。
-3. **程序（非 LLM）**：根据 `corrections` 在 `**annotations[].content` 的副本**上做替换，生成 `**comprehension.cleaned_annotations[]`**；**不**改写 Layer 1 已落盘的 `annotations[].content`。
+3. **程序（非 LLM）**：根据 `corrections` 在 `**annotations[].content` 的副本**上做替换，
+   先得到变化项，再回填为**稠密全量** `**comprehension.cleaned_annotations[]`**；
+   **不**改写 Layer 1 已落盘的 `annotations[].content`。
 
 LLM 调用统一走已封装的 `call_llm_structured`（见 `autosmartcut.intelligence_llm`）。
 
@@ -115,13 +118,13 @@ LLM 调用统一走已封装的 `call_llm_structured`（见 `autosmartcut.intell
 
 - `purpose_rough`：粗糙主旨。
 - `outline_blocks_rough[]`：草稿分块，`start_index` / `end_index` / `topic`（或等价主题字段）。
-- `candidate_misrecognitions[]`：疑似 ASR 误识，每条含 `index`（annotation index）、`original`（如 `[词字串, 句内起始字符下标]`，0-based Unicode，与 Prompt 及程序替换规则一致）、`suggestions[]`（若干候选正确写法）。
+- `candidate_misrecognitions[]`：疑似 ASR 误识，每条含 `annotation_index`（句子 index）、`wrong`（原文错误子串）、`suggestions[]`（候选正确写法）。
 
 ### 5.3 R2 输出（中间态，仅内存）
 
 - `purpose`：精化主旨。
 - `outline_blocks[]`：最终分块，每项含 `start_index` / `end_index` / `**summary`**（供 2b Prompt 使用；若模型输出 `topic`，实现层映射为 `summary`）。
-- `corrections[]`：唯一替换列表，每项含 `index`、`original`（与 R1 候选同一坐标约定）、`corrected`（确定的替换词）。
+- `corrections[]`：唯一替换列表，每项含 `index`、`old`（原文错误子串）、`nth`（该子串在原句中第几次出现，1-based）、`new`（替换词）。
 
 ### 5.4 程序步骤输出（写入 `manifest.comprehension`）
 
@@ -129,7 +132,9 @@ LLM 调用统一走已封装的 `call_llm_structured`（见 `autosmartcut.intell
 
 - `purpose`（来自 R2）
 - `outline_blocks[]`（来自 R2，字段名为 `summary`）
-- `cleaned_annotations[]`：**仅**由程序根据 `corrections` 生成；稀疏列表，仅包含有变化的 `{annotation_index, cleaned_content}`。2b 对未出现的 index 回退使用 `annotations[].content`。
+- `cleaned_annotations[]`：**仅**由程序根据 `corrections` 生成；为稠密全量列表，
+  每条均为 `{annotation_index, cleaned_content}`。未发生纠错的句子，
+  `cleaned_content` 与原始 `annotations[].content` 相同。
 
 ### 5.5 输入与不变量
 
@@ -142,7 +147,7 @@ LLM 调用统一走已封装的 `call_llm_structured`（见 `autosmartcut.intell
 
 ### 6.1 输入（固定）
 
-- `comprehension.cleaned_annotations[]`
+- `comprehension.cleaned_annotations[]`（稠密全量，与 `annotations[]` 等长对齐）
 - `comprehension.purpose`
 - `comprehension.outline_blocks[]`（块 index 范围 + 块总结）
 
@@ -224,7 +229,7 @@ flowchart LR
 ## 11. 层间 JSON 解耦与 EDL 归属
 
 - **解耦方式**：识别层、智能层、执行层之间通过**约定 JSON 文件**读写交接（具体文件名与字段命名与工程一致时，以 [AutoSmartCut-MVP.md](AutoSmartCut-MVP.md) 为准）。
-- **识别层输出 JSON**：提供带 `index` 的句级标注序列、每条 `**t_start`/`t_end`** 及 `**gap_after**`（至下一句起点或媒体结尾的间隔秒数），即执行层所需的「时间–index 映射」来源。
+- **识别层输出 JSON**：提供带 `index` 的句级标注序列、每条 `**t_start`/`t_end`** 及 `**gap_after`**（至下一句起点或媒体结尾的间隔秒数），即执行层所需的「时间–index 映射」来源。
 - **智能层输出 JSON**：提供与上述序列 **等长对齐** 的 `**keep_mask`**（经 2b 与 2d `overrides` 合并后的定稿）。
 - **EDL**：由**执行层**读取上述两份 JSON 后，在**执行层内部**将 `keep_mask` 与时间–index 映射合并计算得到；**不作为 Layer 2 的输出字段**，也不应在智能层落盘为对外契约的一部分。
 

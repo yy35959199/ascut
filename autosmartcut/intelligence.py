@@ -95,14 +95,14 @@ def save_layer2_json(keep_mask: list[dict], output_path: Path) -> None:
     """保存 Layer 2 输出的 keep_mask JSON 文件
 
     Args:
-        keep_mask: 决策掩码列表 [{"index": int, "keep": bool|None}, ...]
+        keep_mask: 决策掩码列表 [{"index": int, "keep": bool}, ...]
         output_path: 输出文件路径
 
     输出格式:
         {
             "keep_mask": [
                 {"index": 0, "keep": true},
-                {"index": 1, "keep": null},
+                {"index": 1, "keep": false},
                 ...
             ]
         }

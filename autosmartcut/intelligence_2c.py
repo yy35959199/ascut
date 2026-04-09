@@ -27,7 +27,7 @@ manifest_dict = {
     "keep_mask": [              # 来自 2b
         {
             "index": int,
-            "keep": bool | None
+            "keep": bool
         }
     ],
     "annotations": [            # 来自 Layer 1

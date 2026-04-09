@@ -7,8 +7,9 @@
    `candidate_misrecognitions`。
 3. **R2（LLM，仅内存）**：`purpose`、`outline_blocks`、`corrections`
    （唯一替换列表，nth 1-based）。
-4. **程序**：按 `corrections` 生成稀疏 `cleaned_annotations[]`，
-   **不**改写 `annotations[].content`（Append-only）。
+4. **程序**：按 `corrections` 先生成稀疏变化集，再回填为稠密
+   `cleaned_annotations[]`（全量 index），**不**改写 `annotations[].content`
+   （Append-only）。
 
 LLM 调用封装：`autosmartcut.intelligence_llm.call_llm_structured`。
 
@@ -21,14 +22,14 @@ LLM 调用封装：`autosmartcut.intelligence_llm.call_llm_structured`。
 manifest_dict["comprehension"] = {
     "purpose": str,
     "outline_blocks": [{"start_index", "end_index", "summary"}, ...],
-    "cleaned_annotations": [{"annotation_index", "cleaned_content"}, ...],  # 稀疏；程序生成
+    "cleaned_annotations": [{"annotation_index", "cleaned_content"}, ...],  # 稠密；程序生成
 }
 
 不持久化 R1/R2 中间结构（candidate_misrecognitions、corrections、outline_blocks_rough）；
 不写入 symbol_table。
 
 ## 注意
-- 2b 对未出现在 cleaned_annotations 的 index 回退使用 `annotations[].content`。
+- cleaned_annotations 为稠密序列，长度与 annotations 一致。
 """
 
 from collections import defaultdict
@@ -70,7 +71,7 @@ class Correction:
 # ============================================================================
 
 def run_2a_comprehension(manifest_dict: dict) -> dict:
-    """2a 理解子阶段：两轮 LLM + 一次程序替换
+    """2a 理解子阶段：两轮 LLM + 稀疏纠错 + 稠密回填
 
     Args:
         manifest_dict: 包含 annotations、goal、source 的工作数据
@@ -106,9 +107,13 @@ def run_2a_comprehension(manifest_dict: dict) -> dict:
         {ann["index"]: ann.get("content", "") for ann in annotations}
     )
 
-    # 程序步骤：按 corrections 在原文上锚定并一次性替换，生成稀疏 cleaned_annotations
-    cleaned_annotations = _build_cleaned_annotations(
+    # 程序步骤 1：按 corrections 在原文上锚定并一次性替换，生成稀疏变化集
+    sparse_cleaned_annotations = _build_sparse_cleaned_annotations(
         annotation_content_view, raw_corrections
+    )
+    # 程序步骤 2：将稀疏变化集回填为稠密 cleaned_annotations（全量 index）
+    cleaned_annotations = _densify_cleaned_annotations(
+        annotations, sparse_cleaned_annotations
     )
 
     manifest_dict["comprehension"] = {
@@ -118,7 +123,7 @@ def run_2a_comprehension(manifest_dict: dict) -> dict:
     }
 
     print(f"[2a] 完成 - 主旨: {purpose[:60]}...")
-    print(f"[2a] 消歧标注: {len(cleaned_annotations)} 条")
+    print(f"[2a] 消歧标注(稠密): {len(cleaned_annotations)} 条")
     print(f"[2a] 分块: {len(outline_blocks)} 块")
 
     return manifest_dict
@@ -171,7 +176,9 @@ def _build_r1_prompt(tokens: list[dict], goal: str) -> str:
 {text_block}
 
 请完成以下任务：
-1. 用 1-2 句话概括内容的核心主旨（purpose_rough）
+1. 用 1-2 句话描述内容的核心论点与叙事意图（purpose_rough）：
+   - 重点是“说话者要论证/传达什么”，而非仅描述“讲了什么话题”
+   - 若内容有明显的先后论述顺序，需适度体现（如“先…再…最后…”）
 2. 将内容按主题/段落初步划分为若干块（outline_blocks_rough），每块给出 index 范围和主题词
 3. 识别可能被 ASR 误识的专有名词、人名、术语，给出候选正确形式
 
@@ -280,36 +287,68 @@ def _build_r2_prompt(
     outline_blocks_rough: list[dict],
     candidate_misrecognitions: list[dict],
 ) -> str:
-    lines = [f"[{t['index']}] {t['text']}" for t in tokens]
-    text_block = "\n".join(lines)
     goal_line = f"用户目标：{goal}" if goal else "用户目标：无特定目标，提取核心内容"
 
-    if candidate_misrecognitions:
-        cand_lines = [
-            f"  - [{c['annotation_index']}] 错词：\"{c['wrong']}\" → 候选：{c['suggestions']}"
-            for c in candidate_misrecognitions
+    # ── 开头区（primacy）：短小的全局语义锚点 ──
+
+    if outline_blocks_rough:
+        block_lines = [
+            f"  块 {i+1} [index {b['start_index']}-{b['end_index']}]: "
+            f"{b.get('topic', b.get('summary', ''))}"
+            for i, b in enumerate(outline_blocks_rough)
         ]
-        cand_section = "R1 识别出的 ASR 误识候选：\n" + "\n".join(cand_lines)
+        blocks_section = "R1 初步分块（供参考）：\n" + "\n".join(block_lines)
+    else:
+        blocks_section = "R1 初步分块：无"
+
+    # ── 中间区：完整标注序列（长文本参考材料） ──
+
+    lines = [f"[{t['index']}] {t['text']}" for t in tokens]
+    text_block = "\n".join(lines)
+
+    # ── 近结尾区（recency）：候选列表，由代码查表内联原句 ──
+
+    token_map = {t["index"]: t["text"] for t in tokens}
+
+    if candidate_misrecognitions:
+        cand_lines = []
+        for c in candidate_misrecognitions:
+            ann_idx = c["annotation_index"]
+            original = token_map.get(ann_idx, "（未找到原句）")
+            cand_lines.append(
+                f"  - [{ann_idx}] 原句：\"{original}\"\n"
+                f"    错词：\"{c['wrong']}\" → 候选：{c['suggestions']}"
+            )
+        cand_section = (
+            "R1 识别出的 ASR 误识候选（每条附原句供核对）：\n"
+            + "\n".join(cand_lines)
+        )
     else:
         cand_section = "R1 未识别到 ASR 误识候选。"
+
+    # ── 结尾区（recency）：任务指令 ──
 
     return f"""{goal_line}
 
 粗糙主旨（供参考）：{purpose_rough}
 
-{cand_section}
+{blocks_section}
 
 以下是完整标注序列（格式：[index] 文字内容）：
 
 {text_block}
 
+{cand_section}
+
 请完成以下任务：
 
-1. 精化主旨描述（purpose），比粗糙版更准确、完整
+1. 精化核心论点与叙事意图（purpose），比粗糙版更准确、完整
+   - 聚焦“说话者要论证/传达什么”，以及贯穿全文的核心结论
+   - 叙事结构细节（先讲什么/再讲什么）由 outline_blocks 承载，purpose 无需重复
 
 2. 将内容按主题/段落划分为若干块（outline_blocks），每块给出 index 范围和摘要
 
-3. 对 R1 候选中确认存在误识的条目，给出唯一纠错规则（corrections）
+3. 对上方候选中确认存在误识的条目，给出唯一纠错规则（corrections）
    每条纠错包含：
    - index：发生误识的句子 index
    - old：原文中的错误子串（必须是该句子的真实子串）
@@ -450,7 +489,7 @@ def _apply_corrections_to_sentence(
     return "".join(parts)
 
 
-def _build_cleaned_annotations(
+def _build_sparse_cleaned_annotations(
     annotation_content_view: dict[int, str],
     raw_corrections: list[dict],
 ) -> list[dict]:
@@ -488,3 +527,35 @@ def _build_cleaned_annotations(
             cleaned.append({"annotation_index": ann_index, "cleaned_content": result})
 
     return cleaned
+
+
+def _densify_cleaned_annotations(
+    annotations: list[dict],
+    sparse_cleaned_annotations: list[dict],
+) -> list[dict]:
+    """将稀疏 cleaned_annotations 回填为稠密全量序列。
+
+    规则：
+    - 若某 index 在 sparse_cleaned_annotations 中，使用对应 cleaned_content。
+    - 否则回填 annotations[].content 原文。
+    - 输出长度与 annotations 一致，且 annotation_index 与 annotations[].index 对齐。
+    """
+    sparse_map = {
+        int(item["annotation_index"]): item["cleaned_content"]
+        for item in sparse_cleaned_annotations
+    }
+
+    dense: list[dict] = []
+    for i, ann in enumerate(annotations):
+        ann_index = int(ann["index"])
+        if ann_index != i:
+            raise ValueError(
+                f"annotations index 不连续，无法构造稠密 cleaned_annotations: "
+                f"位置{i} 实际 index={ann_index}"
+            )
+        dense.append({
+            "annotation_index": ann_index,
+            "cleaned_content": sparse_map.get(ann_index, ann.get("content", "")),
+        })
+
+    return dense

@@ -28,8 +28,15 @@ class PerceptionConfig:
 
 
 @dataclass
+class ExecutionConfig:
+	# 保留段右边界：最后一句 t_end 后再纳入 min(gap_after, 本值) 秒；0 表示不延伸
+	gap_after_cap: float = 0.6
+
+
+@dataclass
 class AppConfig:
 	perception: PerceptionConfig = field(default_factory=PerceptionConfig)
+	execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 
 
 def load_config(path: Path | None = None) -> AppConfig:
@@ -42,6 +49,13 @@ def load_config(path: Path | None = None) -> AppConfig:
 
 	with config_path.open("rb") as file:
 		raw = tomllib.load(file)
+
+	execution = raw.get("execution", {})
+	config.execution = ExecutionConfig(
+		gap_after_cap=float(
+			execution.get("gap_after_cap", config.execution.gap_after_cap)
+		),
+	)
 
 	perception = raw.get("perception", {})
 	config.perception = PerceptionConfig(

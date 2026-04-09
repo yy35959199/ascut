@@ -6,6 +6,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from autosmartcut.config import load_config
+
 
 def _ensure_indices(annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """保证每条 annotation 带连续 index；缺省时按列表下标补齐。"""
@@ -19,6 +21,7 @@ def _ensure_indices(annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _keep_map_from_mask(keep_mask: list[dict[str, Any]]) -> dict[int, bool | None]:
+    """JSON3 约定每条 keep 为 bool；若输入损坏则 get 可能为 None，按不保留处理。"""
     m: dict[int, bool | None] = {}
     for item in keep_mask:
         idx = int(item["index"])
@@ -30,54 +33,33 @@ def resolve_keep_flags(
     annotations: list[dict[str, Any]],
     keep_by_index: dict[int, bool | None],
 ) -> list[bool]:
-    """
-    当前 schema 为 speech-only annotations：
-    keep == True -> 保留；其余值视为不保留。
-    若历史数据仍带 type=silence，则沿用旧逻辑兼容。
-    """
+    """按排序后的 annotations 顺序，``keep`` 为 True 的 index 视为保留。"""
     anns = _ensure_indices(annotations)
-    n = len(anns)
+    return [keep_by_index.get(int(ann["index"])) is True for ann in anns]
 
-    if all(str(ann.get("type", "speech")) != "silence" for ann in anns):
-        return [keep_by_index.get(int(ann["index"])) is True for ann in anns]
 
-    speech_kept: list[bool | None] = [None] * n
-    for i, ann in enumerate(anns):
-        if ann.get("type") != "speech":
-            continue
-        idx = int(ann["index"])
-        raw = keep_by_index.get(idx)
-        speech_kept[i] = raw is True
-
-    resolved = [False] * n
-    for i, ann in enumerate(anns):
-        typ = ann.get("type", "")
-        if typ == "speech":
-            resolved[i] = bool(speech_kept[i])
-        elif typ == "silence":
-            left_ok = False
-            for j in range(i - 1, -1, -1):
-                if anns[j].get("type") == "speech":
-                    left_ok = speech_kept[j] is True
-                    break
-            right_ok = False
-            for j in range(i + 1, n):
-                if anns[j].get("type") == "speech":
-                    right_ok = speech_kept[j] is True
-                    break
-            resolved[i] = left_ok and right_ok
-        else:
-            idx = int(ann["index"])
-            resolved[i] = keep_by_index.get(idx) is True
-
-    return resolved
+def _tail_seconds_after_t_end(ann: dict[str, Any], gap_after_cap: float) -> float:
+    """句末向后延伸的秒数：min(gap_after, gap_after_cap)；cap<=0 时不延伸。"""
+    if gap_after_cap <= 0:
+        return 0.0
+    raw = float(ann.get("gap_after") or 0)
+    if raw <= 0:
+        return 0.0
+    return min(raw, gap_after_cap)
 
 
 def collect_kept_intervals(
     annotations: list[dict[str, Any]],
     resolved: list[bool],
+    *,
+    gap_after_cap: float = 0.6,
 ) -> list[tuple[float, float]]:
-    """按 index 顺序将连续 resolved=True 的条合并为时间区间。"""
+    """按 index 顺序将连续 resolved=True 的条合并为时间区间。
+
+    每段右边界取 **该段最后一句** 的 ``t_end + min(gap_after, gap_after_cap)``，
+    避免长静音（大 gap_after）被整段吃进成片；中间句之间仍由 ``t_start``/``t_end``
+    自然覆盖句间间隔。
+    """
     anns = _ensure_indices(annotations)
     if len(anns) != len(resolved):
         raise ValueError("annotations 与 resolved 长度不一致")
@@ -89,11 +71,13 @@ def collect_kept_intervals(
             i += 1
             continue
         t0 = float(anns[i]["t_start"])
-        t1 = float(anns[i]["t_end"])
         j = i + 1
         while j < len(anns) and resolved[j]:
-            t1 = max(t1, float(anns[j]["t_end"]))
             j += 1
+        last = j - 1
+        t_end_last = float(anns[last]["t_end"])
+        tail = _tail_seconds_after_t_end(anns[last], gap_after_cap)
+        t1 = t_end_last + tail
         intervals.append((t0, t1))
         i = j
 
@@ -192,10 +176,14 @@ def keep_mask_to_positive_segments(
     pre_pad: float = 0.15,
     post_pad: float = 0.25,
     min_duration: float = 1.0,
+    gap_after_cap: float = 0.6,
 ) -> list[tuple[Fraction, Fraction]]:
     """
-    layer1 annotations（含 index/t_start/t_end/type）+ layer2 keep_mask ->
+    layer1 annotations（index / t_start / t_end / gap_after 等）+ layer2 keep_mask ->
     smartcut positive_segments（Fraction 秒，相对文件起点）。
+
+    gap_after_cap：每段末尾在 ``t_end`` 基础上最多再纳入 ``min(gap_after, cap)`` 秒静音尾；
+    设为 0 则退化为仅用句末 ``t_end`` 作为段尾（旧行为）。
     """
     anns = _ensure_indices(annotations)
     keep_by = _keep_map_from_mask(keep_mask)
@@ -205,7 +193,7 @@ def keep_mask_to_positive_segments(
             raise ValueError(f"keep_mask 缺少 index={idx}")
 
     resolved = resolve_keep_flags(anns, keep_by)
-    intervals = collect_kept_intervals(anns, resolved)
+    intervals = collect_kept_intervals(anns, resolved, gap_after_cap=gap_after_cap)
     intervals = apply_padding(intervals, duration=video_duration, pre=pre_pad, post=post_pad)
     intervals = merge_short_intervals(intervals, min_duration)
     return intervals_to_fraction_segments(intervals)
@@ -237,6 +225,7 @@ def positive_segments_from_mask_files(
     pre_pad: float = 0.15,
     post_pad: float = 0.25,
     min_duration: float = 1.0,
+    gap_after_cap: float | None = None,
 ) -> tuple[list[tuple[Fraction, Fraction]], Path, float]:
     """
     从 layer1_annotations.json 与 layer2_output_mock.json 生成 positive_segments。
@@ -256,6 +245,9 @@ def positive_segments_from_mask_files(
     finally:
         media.close()
 
+    if gap_after_cap is None:
+        gap_after_cap = load_config().execution.gap_after_cap
+
     positive = keep_mask_to_positive_segments(
         annotations,
         keep_mask,
@@ -263,5 +255,6 @@ def positive_segments_from_mask_files(
         pre_pad=pre_pad,
         post_pad=post_pad,
         min_duration=min_duration,
+        gap_after_cap=gap_after_cap,
     )
     return positive, video, duration
