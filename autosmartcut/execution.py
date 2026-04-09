@@ -31,15 +31,15 @@ def resolve_keep_flags(
     keep_by_index: dict[int, bool | None],
 ) -> list[bool]:
     """
-    speech: keep == True -> True，否则 False。
-    silence: keep 应为 null；两侧「最近」speech 均保留则该 silence 保留，否则不保留；
-             片头/片尾某一侧无 speech 则该侧视为不保留。
-
-    注意：silence 依赖左右 speech 的 mask，必须先由 keep_mask 确定各 speech 再推导 silence，
-    不能单趟从左到右读 resolved[j]（右侧 speech 尚未赋值）。
+    当前 schema 为 speech-only annotations：
+    keep == True -> 保留；其余值视为不保留。
+    若历史数据仍带 type=silence，则沿用旧逻辑兼容。
     """
     anns = _ensure_indices(annotations)
     n = len(anns)
+
+    if all(str(ann.get("type", "speech")) != "silence" for ann in anns):
+        return [keep_by_index.get(int(ann["index"])) is True for ann in anns]
 
     speech_kept: list[bool | None] = [None] * n
     for i, ann in enumerate(anns):

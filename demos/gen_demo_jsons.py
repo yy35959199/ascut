@@ -24,15 +24,12 @@ def gen_mock_keep_mask(
     seed: int = 42,
 ) -> list[dict[str, Any]]:
     rng = random.Random(seed)
-    speech_indices = [ann["index"] for ann in layer1 if ann["type"] == "speech"]
+    speech_indices = [ann["index"] for ann in layer1]
     n_speech = len(speech_indices)
     cut_set: set[int] = set()
 
     if n_speech == 0:
-        return [
-            {"index": ann["index"], "keep": None} if ann["type"] == "silence" else {"index": ann["index"], "keep": True}
-            for ann in layer1
-        ]
+        return [{"index": ann["index"], "keep": True} for ann in layer1]
 
     target_cut = min(int(n_speech * cut_ratio), n_speech)
     attempts = 0
@@ -45,11 +42,8 @@ def gen_mock_keep_mask(
 
     keep_mask: list[dict[str, Any]] = []
     for ann in layer1:
-        if ann["type"] == "silence":
-            keep_mask.append({"index": ann["index"], "keep": None})
-        else:
-            keep = ann["index"] not in cut_set
-            keep_mask.append({"index": ann["index"], "keep": keep})
+        keep = ann["index"] not in cut_set
+        keep_mask.append({"index": ann["index"], "keep": keep})
     return keep_mask
 
 
@@ -107,12 +101,11 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    n_speech = sum(1 for a in layer1 if a["type"] == "speech")
-    n_silence = sum(1 for a in layer1 if a["type"] == "silence")
+    n_speech = len(layer1)
     n_keep = sum(1 for m in keep_mask if m["keep"] is True)
     n_cut = sum(1 for m in keep_mask if m["keep"] is False)
-    print(f"总 annotations: {len(layer1)} (speech={n_speech}, silence={n_silence})")
-    print(f"mock keep_mask: keep={n_keep}, cut={n_cut}, silence(null)={n_silence}")
+    print(f"总 annotations: {len(layer1)} (speech={n_speech})")
+    print(f"mock keep_mask: keep={n_keep}, cut={n_cut}")
     print(
         f"已写入: {full_path.name}, layer1_annotations.json, layer2_input.json, layer2_output_mock.json -> {out_dir}"
     )

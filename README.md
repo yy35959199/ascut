@@ -38,3 +38,5 @@ python demos/demo3_smartcut.py dense --input samples\alxe_01.mp4
 ```
 
 `layer1_annotations.json` 中的 `source` 需能解析到真实视频文件（相对 `outputs` 父目录或当前工作目录）。
+
+Layer 1 清单为**句级语音**：每条含 `index`、`t_start`、`t_end`、`content`、`gap_after`（无独立静音行）。`layer2_input.json` 中 `tokens[]` 仅 `index` 与 `text`。

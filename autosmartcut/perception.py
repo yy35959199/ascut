@@ -5,6 +5,7 @@ output into the JSON1/JSON2 documents used by later stages.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -216,48 +217,30 @@ def infer_segments(
 def _annotations_from_segments(
 	segments: Sequence[SpeechSegment],
 	duration: float,
-	silence_threshold: float,
+	_silence_threshold_unused: float,
 	*,
 	include_char_timestamps: bool,
 ) -> list[dict[str, Any]]:
 	annotations: list[dict[str, Any]] = []
 
 	if not segments:
-		if duration > 0:
-			annotations.append(
-				{
-					"index": len(annotations),
-					"t_start": 0.0,
-					"t_end": duration,
-					"type": "silence",
-					"content": "",
-					"confidence": 1.0,
-					"metadata": {},
-				}
-			)
 		return annotations
 
-	first = segments[0]
-	if first.t_start >= silence_threshold:
-		annotations.append(
-			{
-				"index": len(annotations),
-				"t_start": 0.0,
-				"t_end": first.t_start,
-				"type": "silence",
-				"content": "",
-				"confidence": 1.0,
-				"metadata": {},
-			}
-		)
-
 	for idx, seg in enumerate(segments):
+		if idx + 1 < len(segments):
+			nxt = segments[idx + 1]
+			gap_after = max(0.0, float(nxt.t_start - seg.t_end))
+		elif duration > 0:
+			gap_after = max(0.0, float(duration - seg.t_end))
+		else:
+			gap_after = 0.0
+
 		item: dict[str, Any] = {
-			"index": len(annotations),
+			"index": idx,
 			"t_start": seg.t_start,
 			"t_end": seg.t_end,
-			"type": "speech",
 			"content": seg.content,
+			"gap_after": gap_after,
 			"confidence": 1.0,
 		}
 		if include_char_timestamps:
@@ -270,36 +253,6 @@ def _annotations_from_segments(
 		else:
 			item["metadata"] = {}
 		annotations.append(item)
-
-		if idx + 1 < len(segments):
-			nxt = segments[idx + 1]
-			gap = nxt.t_start - seg.t_end
-			if gap >= silence_threshold:
-				annotations.append(
-					{
-						"index": len(annotations),
-						"t_start": seg.t_end,
-						"t_end": nxt.t_start,
-						"type": "silence",
-						"content": "",
-						"confidence": 1.0,
-						"metadata": {},
-					}
-				)
-
-	last = segments[-1]
-	if duration > 0 and duration - last.t_end >= silence_threshold:
-		annotations.append(
-			{
-				"index": len(annotations),
-				"t_start": last.t_end,
-				"t_end": duration,
-				"type": "silence",
-				"content": "",
-				"confidence": 1.0,
-				"metadata": {},
-			}
-		)
 
 	return annotations
 
@@ -348,8 +301,8 @@ def compact_annotations(annotations: Sequence[Mapping[str, Any]]) -> list[dict[s
 				"index": int(ann.get("index", i)),
 				"t_start": ann["t_start"],
 				"t_end": ann["t_end"],
-				"type": ann["type"],
 				"content": ann.get("content", ""),
+				"gap_after": float(ann.get("gap_after", 0.0)),
 				"confidence": ann.get("confidence", 1.0),
 			}
 		)
@@ -361,16 +314,36 @@ def build_layer2_input_document(layer1_document: Mapping[str, Any]) -> dict[str,
 	annotations = list(layer1_document.get("annotations", []))
 	tokens: list[dict[str, Any]] = []
 	for i, ann in enumerate(annotations):
-		is_speech = ann.get("type") == "speech"
 		tokens.append(
 			{
 				"index": int(ann.get("index", i)),
-				"type": ann.get("type", ""),
-				"text": ann.get("content") if is_speech else None,
-				"selectable": is_speech,
+				"text": ann.get("content", ""),
 			}
 		)
 	return {
 		"source": layer1_document.get("source", ""),
 		"tokens": tokens,
 	}
+
+
+def write_perception_outputs(
+	layer1_document: Mapping[str, Any],
+	layer2_document: Mapping[str, Any],
+	output_dir: Path,
+	*,
+	layer1_filename: str = "layer1_annotations.json",
+	layer2_filename: str = "layer2_input.json",
+) -> tuple[Path, Path]:
+	"""Write compact layer1 and layer2 input json into output folder."""
+	output_dir.mkdir(parents=True, exist_ok=True)
+	layer1_path = output_dir / layer1_filename
+	layer2_path = output_dir / layer2_filename
+	layer1_path.write_text(
+		json.dumps(layer1_document, ensure_ascii=False, indent=2),
+		encoding="utf-8",
+	)
+	layer2_path.write_text(
+		json.dumps(layer2_document, ensure_ascii=False, indent=2),
+		encoding="utf-8",
+	)
+	return layer1_path, layer2_path

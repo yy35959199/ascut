@@ -2,6 +2,10 @@
 
 > 本文档是 [AutoSmartCut-MVP.md](AutoSmartCut-MVP.md) 的配套设计文档，专门记录智能层的架构决策与实现细节。
 > 架构愿景见 [AutoSmartCut.md](AutoSmartCut.md)。
+> 设计演进过程和变更说明见 [intelligence-decisions.md](intelligence-decisions.md)。
+>
+> **说明（MVP）**：当前 MVP 的 Layer 2 实现与评审以 [intelligence-layer2-mvp.md](intelligence-layer2-mvp.md) 为准。本文保留为历史/完整版设计参考，不作为当前 MVP 的直接实现依据。  
+> **冲突处理**：凡本文与 intelligence-layer2-mvp 不一致之处（例如状态机中的 **`symbol_table` 固化**、**2d 后编译 `edl[]`**、**`segments` 嵌套 `keep_mask`**、2a 直接 LLM 输出整表 `cleaned_annotations` 等），**均以 intelligence-layer2-mvp 与 [AutoSmartCut-MVP.md](AutoSmartCut-MVP.md) 修订版为准**；下文状态机与 §4 起可视为**完整版草图**。
 
 ---
 
@@ -9,11 +13,14 @@
 
 1. [设计原则](#1-设计原则)
 2. [整体结构](#2-整体结构)
-3. [2a 理解层](#3-2a-理解层)
-4. [2b 决策层](#4-2b-决策层)
-5. [2c 审核层](#5-2c-审核层)
-6. [2d 人工层](#6-2d-人工层)
-7. [MVP 简化对照](#7-mvp-简化对照)
+3. [周目与跨周目管理](#3-周目与跨周目管理)
+4. [2a 理解层](#4-2a-理解层)
+5. [2b 决策层](#5-2b-决策层)
+6. [2c 审核层](#6-2c-审核层)
+7. [2d 人工层](#7-2d-人工层)
+8. [反馈分类与层级映射](#8-反馈分类与层级映射)
+9. [Token 消耗监控](#9-token-消耗监控)
+10. [MVP 简化对照](#10-mvp-简化对照)
 
 ---
 
@@ -33,7 +40,8 @@
 
 **P4：Append-only 保证重跑安全**
 
-重跑时，固化字段（`symbol_table`、`cleaned_annotations`）不被覆盖，只有可变字段（`purpose`、`checklist`）被更新。Append-only 原则天然防止重跑时引入不一致。
+**完整版叙事**：重跑时，固化字段（`symbol_table`、`cleaned_annotations`）不被覆盖，只有可变字段（`purpose`、`checklist`）被更新。  
+**MVP**：不持久化 `symbol_table`；`cleaned_annotations` 由程序根据 R2 `corrections` 生成；仍不原地改写 Layer1 `annotations[].content`。Append-only 指清单上已写入的上游字段不被下游抹掉。
 
 ---
 
@@ -170,9 +178,41 @@ flowchart LR
 
 ---
 
-## 3. 2a 理解层
+## 3. 周目与跨周目管理
 
-### 3.1 对外契约
+### 3.1 周目的定义
+
+**一个周目 = 2a→2b→2c→2d 的完整循环。**
+
+每个周目是独立的处理单元，有独立的 TimelineManifest 实例。跨周目时创建新的 Manifest，将前一周目作为参考上下文，而非覆盖原数据。
+
+**关键原则：**
+- 新周目继承前一周目的反馈信息，但不修改前一周目的数据
+- 符合 Append-only 原则，保证数据可追溯性和重跑安全性
+- 跨周目反馈需要结构化，明确指向"理解问题"还是"决策问题"
+
+### 3.2 跨周目的反馈流转
+
+用户的反馈在 2d 人工层产生，根据反馈类型映射到不同的处理路径：
+
+| 反馈类型 | 来源 | 处理方式 | 是否创建新周目 |
+|---------|------|---------|--------------|
+| 理解反馈 | 输入框 1、2、3（主旨、关键词、内容选择） | 创建新周目，重跑 2a | **是** |
+| 决策反馈 | 输入框 4（剪辑时间节点） | 在当前周目的 2d overrides 中处理 | **否** |
+
+**理解反馈的处理：**
+- 创建新���目，进入 2a 重跑模式
+- 根据反馈内容决定是否重新生成 `symbol_table` 和 `cleaned_annotations`
+  - 如果反馈涉及"纠错"（关键词识别错误），需要重新生成
+  - 如果反馈仅涉及"理解"（主旨、内容选择），继承前一周目的消歧结果
+
+---
+
+## 4. 2a 理解层
+
+**MVP 现行**（R1/R2/程序替换、`tokens`、持久化字段）见 [intelligence-layer2-mvp.md §5](intelligence-layer2-mvp.md)；**本节下文为完整版/历史契约草图**。
+
+### 4.1 对外契约
 
 **输入：**
 - `manifest.annotations[]`（Layer 1 产出的原始标注，含 ASR 误识）
@@ -289,7 +329,7 @@ ASR 原文（含误识）
 - `comprehension.purpose`
 - `comprehension.checklist[]`
 - `comprehension.cleaned_annotations[]`（消歧后文本）
-- `annotations[]` 中的 silence 条目（用于确定 keep=null 的位置）
+- `annotations[]`（句级语音；含 `gap_after`，无独立静音行）
 
 > 注意：`comprehension.symbol_table` **不在输入列表中**。
 
@@ -298,9 +338,8 @@ ASR 原文（含误识）
 - `segments[].checklist_coverage[]`：checklist 各项的覆盖情况
 
 **keep_mask 格式约束：**
-- `len(keep_mask) == len(JSON2.tokens)`，不得有缺失 index
-- speech 条目：`keep=true/false`（LLM 决策）
-- silence 条目：`keep=null`（不由 LLM 决策，由规则推导：两侧 speech 均保留则静音保留）
+- `len(keep_mask) == len(annotations)`（与 JSON1 句级条数一致），不得有缺失 index
+- 每条：`keep=true/false`（LLM 决策）
 
 ---
 
