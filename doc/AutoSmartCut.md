@@ -362,15 +362,19 @@ flowchart TD
 
 ### Layer 3 — 执行层（Execution）
 
-**输入：** `edl[]` 中 `action=keep` 的时间区间列表（由 Layer 2 的 2d 人工子阶段写入）
+**输入（完整版叙事）：** `edl[]` 中 `action=keep` 的时间区间列表（常由 Layer 2 的 2d 人工子阶段写入）。
+
+**输入（MVP 现行）：** JSON1 `annotations[]`（含 `t_start`/`t_end`/`gap_after`）+ JSON3 **`keep_mask`**（与句级 `index` 等长的布尔决策）。由执行层将连续 `keep=true` 的句合并为保留区间：段尾取 **末句 `t_end + min(gap_after, gap_after_cap)`**（`gap_after_cap` 见 `config.toml` `[execution]`，默认 `0.6`），再经 padding / 最短段合并后转为 `Fraction` 区间供 smartcut 使用。详见 [intelligence-layer2-mvp.md](intelligence-layer2-mvp.md) §10.1。
 
 **输出：** 单一视频文件，时长等于所有 keep 片段之和，非切点区域为原始比特流
 
 **处理流程：**
 
-1. **EDL 转换**：将 `edl[]` 中所有 `action=keep` 的记录提取为时间区间列表，时间值从浮点数转为 `Fraction`（有理数精确表示），避免浮点误差在高帧率视频中积累导致偏移。
+1. **决策 → 区间（MVP）**：`resolve_keep_flags` 仅当 `keep` 为 **严格 True** 时保留该 index；其余（含缺失、`false`）视为删除。合并连续保留句并应用 `gap_after_cap` 等规则后，将区间转为 `Fraction` 列表，避免浮点误差积累。
 
-2. **GOP 级精确剪切（smartcut）**：
+2. **EDL 转换（完整版）**：将 `edl[]` 中所有 `action=keep` 的记录提取为时间区间列表，时间值从浮点数转为 `Fraction`（有理数精确表示），避免浮点误差在高帧率视频中积累导致偏移。
+
+3. **GOP 级精确剪切（smartcut）**：
 
    视频文件在编码层面以 GOP（画面组）为单位存储，而非逐帧独立。普通 FFmpeg 复制流切割只能在 GOP 边界切，切点精度约为一个 GOP 时长（H.264 通常 2–4 秒）；要达到帧精确必须全片重编码，速度与视频时长正相关，一小时视频需数十分钟。
 
@@ -380,9 +384,9 @@ flowchart TD
    - 非切点区域比特流原封搬运，**零质量损失**
    - 切点精度达到帧级别
 
-3. **HEVC（H.265）特殊处理**：H.265 的 CRA/RASL 帧结构导致 naive 切割在切点附近出现花屏（RASL 帧依赖切点前的参考帧，切割后参考帧丢失）。smartcut 内建 hybrid recode 处理方案，自动识别并修复此问题，用户无需关心编码细节。
+4. **HEVC（H.265）特殊处理**：H.265 的 CRA/RASL 帧结构导致 naive 切割在切点附近出现花屏（RASL 帧依赖切点前的参考帧，切割后参考帧丢失）。smartcut 内建 hybrid recode 处理方案，自动识别并修复此问题，用户无需关心编码细节。
 
-4. **多音轨处理**：原视频所有音轨自动 passthrough，无论原始文件有几条音轨（如主音轨 + 环境音轨 + 章节音频），全部按 keep 区间同步截取后保留到输出文件中。
+5. **多音轨处理**：原视频所有音轨自动 passthrough，无论原始文件有几条音轨（如主音轨 + 环境音轨 + 章节音频），全部按 keep 区间同步截取后保留到输出文件中。
 
 **与 Layer 1 的数据闭环**：Layer 1 用 PyAV 提取音频进行 ASR；Layer 3 用 smartcut（底层同样基于 PyAV）读取视频做剪切。两处共用同一套 PyAV，不引入额外的 FFmpeg 集成方式。执行层结束之后，视频文件完整生命周期（打开→读取→关闭）终结，时间轴清单作为可永久保存的语义档案留存。
 

@@ -142,6 +142,7 @@
 ## 文档对齐任务
 
 - [x] `doc/AutoSmartCut-MVP.md`、`doc/intelligence-layer2-mvp.md`、`doc/AutoSmartCut.md` 等与当前 Layer1（speech + `gap_after`）及 JSON2（`index`+`text`）契约对齐。
+- [x] 执行层：`gap_after_cap`、`resolve_keep_flags`（仅 `keep is True` 保留）、`[execution]` 配置与 §10.1 / D18 等技术决策已写入上述文档。
 - [ ] Demo 2 脚本落地后，将 `demos/demo2_llm.py` 与文档中的示例路径、Prompt 字段再核对一遍。
 - [ ] 统一仓库文档命名：`outline_blocks`（理解分块）与 **`keep_mask`**（MVP 多为 manifest/JSON3 顶层；历史文档或曾用 `segments.keep_mask` 嵌套）的术语使用。
 

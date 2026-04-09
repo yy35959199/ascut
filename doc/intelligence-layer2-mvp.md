@@ -163,7 +163,7 @@ LLM 调用统一走已封装的 `call_llm_structured`（见 `autosmartcut.intell
 ### 6.3 校验与重试
 
 - 必须校验 `keep_mask` 的长度、索引对齐、类型约束。
-- 失败时整体重试，最多 3 次。
+- 底层 `call_llm_structured`（`autosmartcut.intelligence_llm`）在 JSON/空响应等失败时整体重试，**默认最多 3 次**（`DEFAULT_MAX_RETRIES`）；2b 业务层当前为**单次**生成后再做长度与 index 校验。
 
 ---
 
@@ -224,6 +224,13 @@ flowchart LR
 - 识别层输出中带 `**index`、`t_start`、`t_end` 与 `gap_after`** 的句级序列，构成「时间–index 映射」；执行层用其与 `keep_mask` 合并后**在内部**得到连续时间上的 keep 区间，再**在执行层内部**合成 EDL 并驱动剪切。
 - Layer 2 语义决策主坐标为 `index`；**时间换算与 EDL 合成**属于执行层职责。
 
+### 10.1 执行层：`keep_mask` → 时间区间（与 `execution.py` 一致）
+
+- **连续保留句合并**：按句 `index` 排序后，将 `resolve_keep_flags` 为真的相邻条合并为一个区间；区间起点为第一句的 `t_start`，**区间终点为末句的 `t_end + min(gap_after, gap_after_cap)`**（仅末句延伸，避免长静音被整段吃进成片；中间句之间仍由相邻 `t_start`/`t_end` 自然覆盖句间间隔）。
+- **`gap_after_cap`**：默认 `0.6`（秒）；由 `config.toml` 的 **`[execution]`** 与 **`autosmartcut.config.ExecutionConfig.gap_after_cap`** 提供。`gap_after_cap <= 0` 时不在句末额外延伸（等价于段尾取末句 `t_end`）。
+- **`resolve_keep_flags`**：对排序后的每条 annotation，仅当 `keep_by_index.get(index) is True` 时视为保留；缺失键、`false`、非布尔损坏值等均视为不保留。MVP **无**历史 `type=silence` 等分支。
+- **入口函数**：`positive_segments_from_mask_files(..., gap_after_cap=None)` 在未显式传入时使用 `load_config().execution.gap_after_cap`；再经 `pre_pad` / `post_pad` / `min_duration` 等与 smartcut 衔接。
+
 ---
 
 ## 11. 层间 JSON 解耦与 EDL 归属
@@ -235,5 +242,5 @@ flowchart LR
 
 ---
 
-*文档版本：0.3.0*  
+*文档版本：0.3.1*  
 *状态：MVP 现行实现依据*  
