@@ -9,12 +9,12 @@
 """
 
 import json
-import time
 import logging
-from typing import Any
+import time
+import tomllib
 from pathlib import Path
+from typing import Any
 
-import toml
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from openai import OpenAI
@@ -91,7 +91,8 @@ def _load_config() -> dict:
     if not config_path.exists():
         raise FileNotFoundError(f"配置文件不存在: {config_path}")
 
-    config = toml.load(config_path)
+    with config_path.open("rb") as f:
+        config = tomllib.load(f)
 
     if "llm" not in config:
         raise ValueError("config.toml 中缺少 [llm] 配置段")

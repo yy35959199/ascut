@@ -6,6 +6,7 @@ output into the JSON1/JSON2 documents used by later stages.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -13,6 +14,13 @@ from typing import Any, Mapping, Sequence
 import av
 import bisect
 import numpy as np
+import torch
+from qwen_asr.inference.qwen3_asr import Qwen3ASRModel
+
+from autosmartcut.config import AppConfig
+from autosmartcut.pipeline_run import PipelineRun
+
+logger = logging.getLogger(__name__)
 
 _ASR_SAMPLE_RATE = 16000
 
@@ -347,3 +355,167 @@ def write_perception_outputs(
 		encoding="utf-8",
 	)
 	return layer1_path, layer2_path
+
+
+def _torch_dtype(dtype_name: str) -> torch.dtype:
+	mapping = {
+		"float16": torch.float16,
+		"bfloat16": torch.bfloat16,
+		"float32": torch.float32,
+	}
+	return mapping[dtype_name]
+
+
+def _build_qwen3_asr_model(
+	*,
+	asr_model_path: Path,
+	forced_aligner_path: Path,
+	backend: str,
+	device: str,
+	dtype: torch.dtype,
+	gpu_memory_utilization: float,
+) -> Qwen3ASRModel:
+	asr_path = str(asr_model_path)
+	forced_path = str(forced_aligner_path)
+	if backend == "transformers":
+		return Qwen3ASRModel.from_pretrained(
+			pretrained_model_name_or_path=asr_path,
+			forced_aligner=forced_path,
+			forced_aligner_kwargs={
+				"dtype": dtype,
+				"device_map": device,
+			},
+			dtype=dtype,
+			device_map=device,
+			max_new_tokens=1024,
+		)
+	return Qwen3ASRModel.LLM(
+		model=asr_path,
+		forced_aligner=forced_path,
+		forced_aligner_kwargs={
+			"dtype": dtype,
+			"device_map": device,
+		},
+		gpu_memory_utilization=gpu_memory_utilization,
+		max_new_tokens=1024,
+	)
+
+
+def run_perception_layer(
+	run: PipelineRun,
+	*,
+	asr_model_path: Path,
+	forced_aligner_path: Path,
+	config: AppConfig | None = None,
+	backend: str = "transformers",
+	device: str = "cuda:0",
+	dtype: str = "float16",
+	language: str = "Chinese",
+	include_char_timestamps: bool = True,
+	gpu_memory_utilization: float = 0.8,
+	split_pause_threshold: float | None = None,
+	silence_threshold: float | None = None,
+	max_chars: int | None = None,
+	segmentation_mode: str | None = None,
+) -> Path:
+	"""L1 端到端：视频 → layer1_annotations.json + layer2_input.json，返回 JSON1 路径。"""
+	from autosmartcut.log import ensure_autosmartcut_logging
+
+	ensure_autosmartcut_logging(verbose=False)
+
+	if config is None:
+		from autosmartcut.config import load_config
+
+		config = load_config()
+
+	perception_config = config.perception
+	split_pause = (
+		split_pause_threshold
+		if split_pause_threshold is not None
+		else perception_config.split_pause_threshold
+	)
+	silence_thr = (
+		silence_threshold
+		if silence_threshold is not None
+		else perception_config.silence_threshold
+	)
+	max_c = max_chars if max_chars is not None else perception_config.max_chars
+	sentence_endings = set(perception_config.sentence_endings)
+	seg_mode = (
+		segmentation_mode
+		if segmentation_mode is not None
+		else getattr(perception_config, "segmentation_mode", "punctuation")
+	)
+
+	if not run.video_path.exists():
+		raise FileNotFoundError(f"输入视频不存在: {run.video_path}")
+	if not asr_model_path.exists():
+		raise FileNotFoundError(f"ASR 模型目录不存在: {asr_model_path}")
+	if not forced_aligner_path.exists():
+		raise FileNotFoundError(f"Forced aligner 目录不存在: {forced_aligner_path}")
+
+	logger.info("[L1] 开始识别层 backend=%s", backend)
+	torch_dtype = _torch_dtype(dtype)
+	model = _build_qwen3_asr_model(
+		asr_model_path=asr_model_path,
+		forced_aligner_path=forced_aligner_path,
+		backend=backend,
+		device=device,
+		dtype=torch_dtype,
+		gpu_memory_utilization=gpu_memory_utilization,
+	)
+
+	logger.info("[L1] PyAV 解码音频…")
+	audio_arr, audio_sr = load_audio_mono(run.video_path)
+	logger.info(
+		"[L1] 音频就绪 %.1fs @ %dHz", audio_arr.shape[0] / audio_sr, audio_sr
+	)
+
+	results = model.transcribe(
+		audio=(audio_arr, audio_sr),
+		language=language,
+		return_time_stamps=True,
+	)
+	if not results:
+		raise RuntimeError("ASR 返回空结果")
+
+	transcription = results[0]
+	raw_text = getattr(transcription, "text", "")
+	lang_out = getattr(transcription, "language", "") or language
+	duration = duration_seconds(run.video_path)
+
+	full_doc = build_layer1_document(
+		source=str(run.video_path),
+		language=lang_out,
+		raw_text=raw_text,
+		transcription=transcription,
+		duration=duration,
+		segmentation_mode=seg_mode,
+		split_pause_threshold=split_pause,
+		silence_threshold=silence_thr,
+		max_chars=max_c,
+		sentence_endings=sentence_endings,
+		include_char_timestamps=include_char_timestamps,
+	)
+	light_doc = {
+		"source": full_doc["source"],
+		"language": full_doc["language"],
+		"raw_text": full_doc["raw_text"],
+		"annotations": compact_annotations(full_doc["annotations"]),
+	}
+	layer2_doc = build_layer2_input_document(light_doc)
+
+	write_perception_outputs(
+		{
+			"source": light_doc["source"],
+			"annotations": light_doc["annotations"],
+		},
+		layer2_doc,
+		run.output_dir,
+		layer1_filename=run.json1_path.name,
+		layer2_filename=run.json2_path.name,
+	)
+
+	n = len(light_doc["annotations"])
+	logger.info("[L1] 完成 segmentation=%s 标注数=%d → %s", seg_mode, n, run.json1_path)
+	return run.json1_path

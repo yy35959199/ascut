@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-from autosmartcut.config import load_config
+from autosmartcut.config import AppConfig, load_config
+from autosmartcut.pipeline_run import PipelineRun
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_indices(annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -258,3 +262,72 @@ def positive_segments_from_mask_files(
         gap_after_cap=gap_after_cap,
     )
     return positive, video, duration
+
+
+def run_execution_layer(
+    run: PipelineRun,
+    *,
+    config: AppConfig | None = None,
+    pre_pad: float = 0.15,
+    post_pad: float = 0.25,
+    min_duration: float = 1.0,
+    gap_after_cap: float | None = None,
+) -> Path:
+    """L3 端到端：JSON1 + JSON3 → 输出视频，返回输出路径。"""
+    from autosmartcut.log import ensure_autosmartcut_logging
+    from smartcut.media_container import MediaContainer
+    from smartcut.misc_data import AudioExportInfo, AudioExportSettings
+    from smartcut.smart_cut import smart_cut
+
+    ensure_autosmartcut_logging(verbose=False)
+
+    if gap_after_cap is None:
+        gap_after_cap = (
+            config.execution.gap_after_cap if config is not None else load_config().execution.gap_after_cap
+        )
+
+    logger.info("[L3] 开始执行层")
+    positive, video, duration = positive_segments_from_mask_files(
+        run.json1_path,
+        run.json3_path,
+        pre_pad=pre_pad,
+        post_pad=post_pad,
+        min_duration=min_duration,
+        gap_after_cap=gap_after_cap,
+    )
+    if not positive:
+        raise ValueError("keep_mask 解析后无保留区间")
+
+    out = run.output_video
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        "[L3] 源视频 %s 时长 %.2fs keep 段数 %d → %s",
+        video,
+        duration,
+        len(positive),
+        out,
+    )
+
+    media = MediaContainer(str(video))
+    try:
+        if not media.audio_tracks:
+            raise ValueError("输入文件没有音轨")
+        audio_info = AudioExportInfo(
+            output_tracks=[
+                AudioExportSettings(codec="passthru") for _ in media.audio_tracks
+            ]
+        )
+        err = smart_cut(
+            media_container=media,
+            positive_segments=positive,
+            out_path=str(out),
+            audio_export_info=audio_info,
+        )
+        if err is not None:
+            raise RuntimeError(f"smart_cut 失败: {err}")
+    finally:
+        media.close()
+
+    logger.info("[L3] 完成 → %s", out)
+    return out

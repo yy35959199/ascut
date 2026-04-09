@@ -209,7 +209,9 @@ flowchart TD
 
 **处理流程：**
 
-1. **音频提取**：用 PyAV 从视频中解码音频，重采样为 16kHz 单声道 WAV，写入临时文件。此步是整个管道中唯一打开视频文件的操作，完成之后后续所有层均只操作清单（JSON），不再读取视频二进制内容。
+> **管道级说明（纠正旧稿）**：Layer 1 与 Layer 3 都会打开源视频（前者解码音频做 ASR，后者经 smartcut 做剪切）；**Layer 2 只消费 JSON/清单，不读视频二进制**。旧述「全管道只有 Layer 1 打开视频、之后不再读二进制」不准确，已作废。
+
+1. **音频提取**：用 PyAV 从视频中解码音频，重采样为 16kHz 单声道 WAV，写入临时文件（或等价内存管线）。
 
 2. **语音转写 + 强制对齐**：将 WAV 送入 Qwen3-ASR-1.7B 产出段落级转写文本，再由 Qwen3-ForcedAligner-0.6B 产出字级时间戳。两者结合后，单条语音观测同时拥有可读文本与字级切点精度。
 
@@ -362,13 +364,17 @@ flowchart TD
 
 ### Layer 3 — 执行层（Execution）
 
-**输入：** `edl[]` 中 `action=keep` 的时间区间列表（由 Layer 2 的 2d 人工子阶段写入）
+**输入（完整版愿景）：** 清单中 `edl[]` 里 `action=keep` 的时间区间（常由 Layer 2 / 2d 确认后写入）。
+
+**输入（MVP 现行）：** JSON1（句级 `annotations[]`，含 `t_start`/`t_end`/`gap_after`）+ JSON3（定稿 **`keep_mask[]`**）。执行层在内部将连续 `keep=true` 的句合并为保留区间，再转为 `Fraction` 列表驱动 smartcut；**不**依赖智能层落盘 `edl[]`。参见 [intelligence-layer2-mvp.md](intelligence-layer2-mvp.md) §10–§11。
 
 **输出：** 单一视频文件，时长等于所有 keep 片段之和，非切点区域为原始比特流
 
 **处理流程：**
 
-1. **EDL 转换**：将 `edl[]` 中所有 `action=keep` 的记录提取为时间区间列表，时间值从浮点数转为 `Fraction`（有理数精确表示），避免浮点误差在高帧率视频中积累导致偏移。
+1. **得到 `Fraction` 时间区间**：
+   - **MVP**：由 `keep_mask` 与 JSON1 的时间–index 映射得到浮点保留区间，经 `gap_after_cap`、`pre_pad`/`post_pad`、`min_duration` 等规则整形后，转为 `Fraction`（有理数精确表示），避免浮点误差积累。
+   - **完整版**：若清单已含 `edl[]`，可直接提取所有 `action=keep` 的记录为时间区间，再转为 `Fraction`。
 
 2. **GOP 级精确剪切（smartcut）**：
 

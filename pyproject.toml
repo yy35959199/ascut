@@ -8,9 +8,18 @@ version = "0.1.0"
 description = "Semantic video cutting pipeline"
 requires-python = ">=3.11"
 dependencies = [
-"qwen-asr",
-"smartcut",
-"jsonschema>=4,<5",
+    "python-ulid>=3.1.0",  # autosmartcut.pipeline_run (from ulid import ULID)
+    "qwen-asr",
+    "smartcut",
+    "jsonschema>=4,<5",
+    "openai>=1.0",
+    "numpy>=1.24",
+    "av>=12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
 ]
 
 [tool.setuptools.packages.find]

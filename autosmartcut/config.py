@@ -34,9 +34,16 @@ class ExecutionConfig:
 
 
 @dataclass
+class ModelConfig:
+	asr_model_path: Path = Path("models/Qwen3-ASR-1.7B")
+	forced_aligner_path: Path = Path("models/Qwen3-ForcedAligner-0.6B")
+
+
+@dataclass
 class AppConfig:
 	perception: PerceptionConfig = field(default_factory=PerceptionConfig)
 	execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+	models: ModelConfig = field(default_factory=ModelConfig)
 
 
 def load_config(path: Path | None = None) -> AppConfig:
@@ -49,6 +56,18 @@ def load_config(path: Path | None = None) -> AppConfig:
 
 	with config_path.open("rb") as file:
 		raw = tomllib.load(file)
+
+	models = raw.get("models", {})
+	config.models = ModelConfig(
+		asr_model_path=Path(
+			models.get("asr_model_path", str(config.models.asr_model_path))
+		),
+		forced_aligner_path=Path(
+			models.get(
+				"forced_aligner_path", str(config.models.forced_aligner_path)
+			)
+		),
+	)
 
 	execution = raw.get("execution", {})
 	config.execution = ExecutionConfig(

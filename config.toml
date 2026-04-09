@@ -1,3 +1,7 @@
+[models]
+asr_model_path = "models/Qwen3-ASR-1.7B"
+forced_aligner_path = "models/Qwen3-ForcedAligner-0.6B"
+
 [perception]
 segmentation_mode = "punctuation"
 split_pause_threshold = 0.20

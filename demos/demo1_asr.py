@@ -1,7 +1,17 @@
 from __future__ import annotations
 
 """
-Demo 1：Qwen3-ASR + ForcedAligner + 句级聚合 + 间隙静音推导
+Demo 1：Qwen3-ASR + ForcedAligner + 句级聚合 + gap_after（Layer 1）
+
+与三阶段 I/O 对齐说明：
+  - 写入 ``--output`` 父目录下的标准名（与 Layer 2/3 文档一致）：
+    * layer1_annotations.json — JSON1，供 ``python -m autosmartcut.intelligence`` 或 ``demos/demo2_llm.py``
+    * layer2_input.json — JSON2（tokens: index + text），供核对/外部工具；智能层运行时由内存 build_layer2_input_document 生成
+  - 另写用户指定的精简 JSON（--output）与完整档（*_full.json）、以及同目录 demo2_input.json（与 layer2_input 内容类同，历史文件名）
+
+下游（默认路径）：
+  python demos/demo2_llm.py
+  python demos/demo3_smartcut.py json --layer1 outputs/layer1_annotations.json --mask outputs/layer2_output.json
 
 测试指令：
 	1. 使用默认配置运行：

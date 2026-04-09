@@ -3,10 +3,14 @@ from __future__ import annotations
 
 """
 模式 dense：不依赖 layer1，用合成密集 EDL 压测 smartcut。
-模式 json：读取 layer1_annotations.json + layer2_output_mock.json，走 execution.keep_mask 管线。
+模式 json：读取 JSON1 + 任意含 keep_mask 的 JSON3，走 execution.positive_segments_from_mask_files（与 Layer 3 一致）。
 
-示例（在仓库 ascut 目录下，且已 conda activate ascut）：
+JSON1：layer1_annotations.json（source + annotations，含 index / t_start / t_end / gap_after）。
+JSON3：仅要求顶层 keep_mask[]，可为真实智能层输出（layer2_output.json）或 gen_demo_jsons 的 mock。
+
+示例（在仓库 ascut 目录下）：
   python demos/demo3_smartcut.py dense --input samples/alxe_01.mp4
+  python demos/demo3_smartcut.py json --layer1 outputs/layer1_annotations.json --mask outputs/layer2_output.json
   python demos/demo3_smartcut.py json --layer1 outputs/layer1_annotations.json --mask outputs/layer2_output_mock.json
 """
 
@@ -151,9 +155,14 @@ def main() -> None:
     p_dense.add_argument("--target-keeps", type=int, default=52, help="目标 keep 段数上限")
     p_dense.set_defaults(func=run_dense)
 
-    p_json = sub.add_parser("json", help="layer1 + keep_mask JSON")
-    p_json.add_argument("--layer1", required=True, type=Path, help="layer1_annotations.json")
-    p_json.add_argument("--mask", required=True, type=Path, help="layer2_output_mock.json")
+    p_json = sub.add_parser("json", help="JSON1 + JSON3（keep_mask）→ smartcut")
+    p_json.add_argument("--layer1", required=True, type=Path, help="Layer 1 输出 JSON1（如 layer1_annotations.json）")
+    p_json.add_argument(
+        "--mask",
+        required=True,
+        type=Path,
+        help="Layer 2 输出 JSON3：须含 keep_mask（如 layer2_output.json 或 layer2_output_mock.json）",
+    )
     p_json.add_argument(
         "--output",
         default=str(_ROOT / "outputs" / "demo3_from_mask.mp4"),

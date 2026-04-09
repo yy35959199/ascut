@@ -58,6 +58,8 @@ layer2.json
 """
 
 import json
+import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +67,8 @@ from autosmartcut.intelligence_2a import run_2a_comprehension
 from autosmartcut.intelligence_2b import run_2b_decision
 from autosmartcut.intelligence_2c import run_2c_review
 from autosmartcut.intelligence_2d import run_2d_human_review
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -123,14 +127,17 @@ def save_layer2_json(keep_mask: list[dict], output_path: Path) -> None:
 def run_intelligence_layer(
     layer1_path: Path,
     output_path: Path,
-    goal: str = ""
+    goal: str = "",
+    *,
+    auto: bool = False,
+    verbose_log: bool = False,
 ) -> None:
     """Layer 2 主入口（文件交接模式）
 
     执行流程:
         1. 加载 Layer 1 输出（annotations）
         2. 验证输入格式
-        3. 依次执行 2a → 2b → 2c → 2d
+        3. 依次执行 2a → 2b → 2c → 2d（auto=True 时跳过 2d）
         4. 验证输出格式
         5. 保存 keep_mask 到文件
 
@@ -138,16 +145,20 @@ def run_intelligence_layer(
         layer1_path: Layer 1 输出的 JSON 文件路径
         output_path: Layer 2 输出的 JSON 文件路径
         goal: 用户指定的分析目标（如"提取核心观点"）
+        auto: True 时跳过 2d，直接使用 2b 的 keep_mask
+        verbose_log: 未配置流水线日志时，是否启用 DEBUG 级 stderr 日志
 
     Raises:
         ValueError: 输入格式错误或输出验证失败
         FileNotFoundError: 输入文件不存在
     """
-    print("[Layer 2] 智能层开始")
-    print(f"[Layer 2] 输入: {layer1_path}")
-    print(f"[Layer 2] 输出: {output_path}")
+    from autosmartcut.log import ensure_autosmartcut_logging
+
+    ensure_autosmartcut_logging(verbose=verbose_log)
+
+    logger.info("[L2] 智能层开始 输入=%s 输出=%s", layer1_path, output_path)
     if goal:
-        print(f"[Layer 2] 目标: {goal}")
+        logger.info("[L2] 目标: %s", goal)
 
     # 1. 加载 Layer 1 输出
     layer1_data = load_layer1_json(layer1_path)
@@ -162,7 +173,7 @@ def run_intelligence_layer(
         if ann.get("index") != i:
             raise ValueError(f"annotations[{i}] 的 index 不连续: 期望 {i}, 实际 {ann.get('index')}")
 
-    print(f"[Layer 2] 加载 {len(annotations)} 条标注")
+    logger.info("[L2] 加载 %d 条标注", len(annotations))
 
     # 2. 初始化工作数据（MVP 阶段直接用 dict，避免 dataclass 转换复杂度）
     manifest_dict = {
@@ -184,14 +195,26 @@ def run_intelligence_layer(
         # 2c 审核子阶段（MVP 占位，自动 pass）
         manifest_dict = run_2c_review(manifest_dict)
 
-        # 2d 人工子阶段（CLI 交互）
-        manifest_dict = run_2d_human_review(manifest_dict)
+        # 2d 人工子阶段（CLI 交互；auto 时跳过）
+        if auto:
+            logger.info("[L2] auto 模式，跳过 2d 人工审阅")
+            manifest_dict.setdefault("human_feedback_history", []).append(
+                {
+                    "round": 0,
+                    "verdict": "confirm",
+                    "overrides": [],
+                    "feedback": "",
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+        else:
+            manifest_dict = run_2d_human_review(manifest_dict)
 
     except KeyboardInterrupt:
-        print("\n[Layer 2] 用户中断")
+        logger.warning("[L2] 用户中断")
         raise
     except Exception as e:
-        print(f"\n[Layer 2] 执行失败: {e}")
+        logger.error("[L2] 执行失败: %s", e)
         raise
 
     # 4. 提取 keep_mask 并验证
@@ -218,9 +241,12 @@ def run_intelligence_layer(
     save_layer2_json(keep_mask, output_path)
 
     keep_count = sum(1 for e in keep_mask if e["keep"] is True)
-    print(f"[Layer 2] 智能层完成")
-    print(f"[Layer 2] 保留 {keep_count}/{len(keep_mask)} 个片段")
-    print(f"[Layer 2] 输出已保存至: {output_path}")
+    logger.info(
+        "[L2] 完成 保留 %d/%d 片段 → %s",
+        keep_count,
+        len(keep_mask),
+        output_path,
+    )
 
 
 # ============================================================================
@@ -239,10 +265,11 @@ def main():
     import sys
 
     if len(sys.argv) < 3:
-        print("用法: python -m autosmartcut.intelligence <layer1.json> <output.json> [--goal 目标]")
+        print("用法: python -m autosmartcut.intelligence <layer1.json> <output.json> [--goal 目标] [--auto] [--verbose]")
         print("\n示例:")
         print("  python -m autosmartcut.intelligence layer1.json layer2.json")
         print("  python -m autosmartcut.intelligence layer1.json layer2.json --goal '提取核心观点'")
+        print("  python -m autosmartcut.intelligence layer1.json layer2.json --auto")
         sys.exit(1)
 
     layer1_path = Path(sys.argv[1])
@@ -254,8 +281,17 @@ def main():
         if goal_idx + 1 < len(sys.argv):
             goal = sys.argv[goal_idx + 1]
 
+    auto = "--auto" in sys.argv
+    verbose_log = "--verbose" in sys.argv
+
     try:
-        run_intelligence_layer(layer1_path, output_path, goal)
+        run_intelligence_layer(
+            layer1_path,
+            output_path,
+            goal,
+            auto=auto,
+            verbose_log=verbose_log,
+        )
     except Exception as e:
         print(f"\n错误: {e}")
         sys.exit(1)
