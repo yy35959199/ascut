@@ -43,6 +43,7 @@ from autosmartcut.perception import (
 	compact_annotations,
 	duration_seconds,
 	load_audio_mono,
+	write_perception_outputs,
 )
 
 def parse_args() -> argparse.Namespace:
@@ -122,7 +123,7 @@ def parse_args() -> argparse.Namespace:
 		"--silence-threshold",
 		type=float,
 		default=None,
-		help="silence annotation 阈值（秒），覆盖配置文件",
+		help="兼容参数：不再生成 silence 条目，仅计算每句 gap_after",
 	)
 	parser.add_argument(
 		"--max-chars",
@@ -253,6 +254,13 @@ def main() -> None:
 		json.dump(light_doc, f, ensure_ascii=False, indent=2)
 	with layer2_output.open("w", encoding="utf-8") as f:
 		json.dump(layer2_doc, f, ensure_ascii=False, indent=2)
+	std_layer1, std_layer2 = write_perception_outputs(
+		{"source": light_doc["source"], "annotations": light_doc["annotations"]},
+		layer2_doc,
+		args.output.parent,
+		layer1_filename="layer1_annotations.json",
+		layer2_filename="layer2_input.json",
+	)
 
 	print(f"[demo1] backend={args.backend}")
 	print(f"[demo1] input={args.input}")
@@ -265,6 +273,8 @@ def main() -> None:
 	print(f"[demo1] full_output={full_output}")
 	print(f"[demo1] output={args.output}")
 	print(f"[demo1] layer2_input={layer2_output}")
+	print(f"[demo1] std_layer1={std_layer1}")
+	print(f"[demo1] std_layer2={std_layer2}")
 
 
 if __name__ == "__main__":

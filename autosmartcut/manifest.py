@@ -26,14 +26,13 @@ class SourceMedia:
 
 @dataclass
 class Annotation:
-    """ASR 识别和静音推导的原始事实记录。
-    只记录机器观测到了什么（这里有语音/静音），不承载语义判断。"""
+    """Layer 1 句级 ASR 与对齐产出的原始事实记录，不承载语义判断。"""
     index: int          # 全局唯一序号（0-based），JSON1/JSON2/JSON3 跨文件对齐的坐标
     t_start: float
     t_end: float
-    type: str           # "speech" | "silence"
-    content: str        # 转写文字（silence 时为空字符串）
+    content: str        # 句级转写文字
     confidence: float   # Qwen3-ASR 产出的置信度信号，仅作为模型可靠性参考，不用于 UI 显示
+    gap_after: float = 0.0   # 至下一句起点或媒体结尾的间隔（秒）
     metadata: dict = field(default_factory=dict)
     # 开放式扩展字段；speech 条目含：
     #   char_timestamps: [{"text": str, "start": float, "end": float}]
@@ -98,10 +97,9 @@ class Comprehension:
 @dataclass
 class KeepMaskEntry:
     """segments[].keep_mask[] 的单条条目。
-    LLM 只输出布尔决策，不输出时间戳——时间戳由 Layer 3 从 JSON1 反查。
-    静音条目不参与 LLM 决策，keep=None 由规则推导（两侧 speech 均保留则静音保留）。"""
+    LLM 只输出布尔决策，不输出时间戳——时间戳由 Layer 3 从 JSON1 反查。"""
     index: int          # 对应 JSON1 annotations[].index，跨文件对齐坐标
-    keep: bool | None   # True=保留, False=删除, None=静音（不由 LLM 决策）
+    keep: bool          # True=保留, False=删除
 
 
 @dataclass
@@ -195,7 +193,7 @@ class TimelineManifest:
 
     # --- Layer 1（perception.py）写入 ---
     annotations: list[Annotation] = field(default_factory=list)
-    # 识别层产出：speech/silence 逐条标注，含时间戳和 ASR 置信度
+    # 识别层产出：句级标注，含 t_start/t_end、gap_after 与 ASR 置信度
 
     # --- Layer 2 / 2a（intelligence.py）写入，固定两轮 ---
     comprehension: Comprehension | None = None

@@ -4,3 +4,15 @@ split_pause_threshold = 0.20
 silence_threshold = 0.80
 max_chars = 60
 sentence_endings = ["。","！","？","；","\n","，",",",".","!","?",";",":","：","—","…","、","（","）","(",")","“","”","\"","'","《","》"]
+
+# Layer3：keep 段右边界 = 末句 t_end + min(gap_after, gap_after_cap)
+[execution]
+gap_after_cap = 0.6
+
+[llm]
+api_key = "sk-f46d082357234fd2977e400835892f35"                       
+base_url = "https://api.deepseek.com/v1"    # API Base URL
+model = "deepseek-chat"                     # 默认模型
+reasoner_model = "deepseek-reasoner"        # Reasoner 模型
+default_temperature = 0.3                   # 默认温度
+default_max_tokens = 8192                   # 默认最大 tokens

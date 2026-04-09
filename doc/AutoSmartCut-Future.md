@@ -11,7 +11,7 @@
 > - **时机：** 近期 | 中期 | 远期（成熟度时间档，不作章节分组）
 > - **目标版本：** 完整版（相对 Demo / MVP 的能力边界，与附录配置对比表对应时标注）
 >
-> 对应文档：当前架构见 `AutoSmartCut.md`；MVP 落地规划见 `AutoSmartCut-MVP.md`。
+> 对应文档：当前架构见 `AutoSmartCut.md`；MVP 落地规划见 `AutoSmartCut-MVP.md`；**智能层 MVP 现行字段与 2a 流程**以 `doc/intelligence-layer2-mvp.md` 为准。本文中涉及 2a 轮次、符号表、checklist 等描述均为**扩展设想**，若与 intelligence-layer2-mvp 冲突，以实现依据为准。
 
 ---
 
@@ -70,10 +70,7 @@
 
 **目标版本：** 完整版
 
-**现状：** 当前架构中，2a 固定执行两轮：
-
-- 第 1 轮：原始文本 → 粗糙主旨 + 符号表
-- 第 2 轮：原始文本 + 粗糙主旨 + 符号表 → 精化主旨 + 消歧标注 + 检查清单
+**现状（MVP 工程）：** 2a 为 **两轮 LLM + 程序替换**（R1 粗分块 + 错词候选；R2 精化 + `corrections`；程序生成 `cleaned_annotations`），见 intelligence-layer2-mvp §5。下述「两轮 + 符号表 + 检查清单」为**完整版叙事**，供本扩展条对照。
 
 **完整版设计：** 当第 2 轮产生的消歧改动明显偏大时，条件触发第 3 轮，用干净文本重新验证主旨是否成立：
 
@@ -415,7 +412,7 @@ max_segment_duration = 10.0        # 单段视频最长生成时长（秒）
 | 时间戳粒度 | **字级**（char-level forced alignment）| 取决于实现，至少需字级或词级 |
 | 打码精度 | 精确到字/词边界（约 ±0.1s）| 取决于实现 |
 | 依赖 | Qwen3-ASR + Qwen3-ForcedAligner | 取决于实现 |
-| 识别层产出 | `type=speech` 标注，字级时间戳存于 `metadata.char_timestamps` | 与基线兼容的时间戳视图 |
+| 识别层产出 | 句级标注（`content`、`t_start`/`t_end`、`gap_after`），字级时间戳存于 `metadata.char_timestamps` | 与基线兼容的时间戳视图 |
 
 > 语音自动打码的核心前提不是某个特定模型，而是识别层能稳定提供字级时间戳。Qwen3-ForcedAligner 现已满足这一要求，因此该功能不再绑定 WhisperX。
 
@@ -423,7 +420,7 @@ max_segment_duration = 10.0        # 单段视频最长生成时长（秒）
 
 ```
 输入：
-  annotations[type=speech].metadata.char_timestamps   ← 来自识别层基线强制对齐结果
+  annotations[].metadata.char_timestamps   ← 来自识别层基线强制对齐结果（句级条目的字级明细）
   FilterReport.modified_line_indices ← 来自字幕过滤词系统，含命中词
 
 Step 1：时间戳关联
@@ -628,7 +625,7 @@ auto_learn = true               # 是否自动触发离线学习
 | 本地配置目录 | 无 | 无 | `~/.autosmartcut/` 完整结构 |
 | Token 预算 | 不适用（无循环）| 不适用（无循环）| `token_budget_per_minute × duration` |
 | 2c 审核子阶段 | 跳过 | 跳过 | 完整执行，产出 ReviewResult |
-| 识别层节点 | ASR + 静音 | ASR + 静音 | + 情绪识别、声纹识别（近期扩展）|
+| 识别层节点 | ASR + 句级聚合 + gap_after | ASR + 句级聚合 + gap_after | + 情绪识别、声纹识别（近期扩展）|
 | 执行层节点 | smartcut GOP 剪切 | smartcut GOP 剪切 | + B-roll 插入、多平台输出 |
 | 字幕过滤词系统 | 无 | 无 | 外接词库 + AC 自动机检测 + 字幕替换 |
 | 语音自动打码 | 无 | 无 | 字级时间戳 + sine beep 音频混音 |
