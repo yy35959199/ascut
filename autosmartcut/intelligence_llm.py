@@ -1,17 +1,19 @@
 """LLM 调用封装 - DeepSeek API
 
 职责：
-- 统一 LLM 调用接口
-- 结构化 JSON 输出
-- 重试机制
-- 日志记录
-- 缓存友好设计
+- 统一 LLM 调用接口（单轮 ``call_llm_structured`` / ``call_once_structured``）
+- 多轮单跳 ``call_turn_structured`` + ``prepare_next_turn_messages``（跨轮不传 reasoning_content）
+- 结构化 JSON 输出与 jsonschema 校验
+- 思考模式下屏蔽无效采样参数
+- 重试、日志、缓存友好（R1+R2 共享 system+首条 user 前缀）
 """
 
+import copy
 import json
 import logging
 import time
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +82,16 @@ class LLMAPIError(LLMCallError):
         super().__init__(f"API 错误 [{status_code}]: {message}")
 
 
+@dataclass(frozen=True)
+class StructuredLLMResult:
+    """单次结构化补全结果（供多轮衔接时取 assistant 原文与请求快照）"""
+
+    data: dict
+    assistant_content: str
+    usage: dict
+    request_messages: list[dict]
+
+
 # ============================================================================
 # 配置管理
 # ============================================================================
@@ -114,6 +126,58 @@ def _get_model_name(enable_reasoning: bool, config: dict) -> str:
         return config.get("reasoner_model", "deepseek-reasoner")
     else:
         return config.get("model", "deepseek-chat")
+
+
+def _is_thinking_request(enable_reasoning: bool, _model: str) -> bool:
+    """是否走思考模式请求路径（需屏蔽采样参数，见 DeepSeek 文档 3.1）"""
+    return bool(enable_reasoning)
+
+
+def _use_thinking_extra_body(model: str) -> bool:
+    """是否在 chat 模型上用 ``extra_body.thinking``（与 ``deepseek-reasoner`` 模型互斥）"""
+    if model == "deepseek-reasoner" or str(model).endswith("reasoner"):
+        return False
+    return True
+
+
+def sanitize_messages_for_api(
+    messages: list[dict],
+    *,
+    strip_reasoning: bool = True,
+) -> list[dict]:
+    """深拷贝消息列表；跨轮发送前移除不应带入下一轮的 reasoning 等字段。
+
+    DeepSeek：新一轮对话不应拼接历史轮次的 ``reasoning_content``。
+    """
+    out: list[dict] = []
+    for m in messages:
+        d = dict(m)
+        if strip_reasoning:
+            d.pop("reasoning_content", None)
+        out.append(d)
+    return out
+
+
+def prepare_next_turn_messages(
+    messages_so_far: list[dict],
+    *,
+    assistant_content: str,
+    next_user_content: str,
+    strip_reasoning: bool = True,
+) -> list[dict]:
+    """在已有前缀消息后追加 assistant（仅 content）与下一回合 user。"""
+    base = sanitize_messages_for_api(
+        [dict(x) for x in messages_so_far],
+        strip_reasoning=strip_reasoning,
+    )
+    base.append({"role": "assistant", "content": assistant_content})
+    base.append({"role": "user", "content": next_user_content})
+    return base
+
+
+def build_once_messages(prompt: str, schema: dict) -> list[dict]:
+    """构造单轮请求的 messages（system + user，已含 JSON 格式说明）。供调用方做多轮前缀复用。"""
+    return _build_messages(prompt, schema)
 
 
 # ============================================================================
@@ -183,28 +247,25 @@ def _call_api(
     max_tokens: int,
     enable_reasoning: bool
 ) -> dict:
-    """实际调用 DeepSeek API
+    """实际调用 DeepSeek API（非流式）
 
-    返回原始 response 对象
+    思考模式下按文档屏蔽 temperature / top_p 等采样参数，避免误传无效字段。
     """
     try:
-        # 构造请求参数
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "temperature": temperature,
             "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"}  # 启用 JSON mode
+            "response_format": {"type": "json_object"},
         }
 
-        # 如果启用 reasoning 且使用 chat 模型，通过 extra_body 传递
-        if enable_reasoning and model != "deepseek-reasoner":
-            response = client.chat.completions.create(
-                **kwargs,
-                extra_body={"thinking": {"type": "enabled"}}
-            )
+        if _is_thinking_request(enable_reasoning, model):
+            if _use_thinking_extra_body(model):
+                kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
         else:
-            response = client.chat.completions.create(**kwargs)
+            kwargs["temperature"] = temperature
+
+        response = client.chat.completions.create(**kwargs)
 
         return response
 
@@ -219,6 +280,18 @@ def _call_api(
 # ============================================================================
 # 响应处理
 # ============================================================================
+
+def _augment_last_user_with_schema(messages: list[dict], schema: dict) -> None:
+    """在 messages 副本上，为最后一条 user 追加 JSON Schema 格式说明。"""
+    json_example = _generate_json_example(schema)
+    suffix = JSON_FORMAT_INSTRUCTION.format(format_example=json_example)
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            content = messages[i].get("content") or ""
+            messages[i] = {**messages[i], "content": content + suffix}
+            return
+    raise ValueError("messages 中需要至少一条 role=user 的消息")
+
 
 def _parse_response(response: dict, enable_reasoning: bool) -> tuple[str, dict, str | None]:
     """解析 API 响应
@@ -377,77 +450,59 @@ def _log_call(
 # 核心接口
 # ============================================================================
 
-def call_llm_structured(
-    prompt: str,
+def _complete_structured(
+    messages: list[dict],
     schema: dict,
-    temperature: float | None = None,
-    enable_reasoning: bool = False,
-    max_retries: int = DEFAULT_MAX_RETRIES
-) -> dict:
-    """调用 LLM 并返回结构化 JSON 输出
+    *,
+    augment_last_user: bool,
+    temperature: float | None,
+    enable_reasoning: bool,
+    max_retries: int,
+    log_prompt_hint: str,
+) -> StructuredLLMResult:
+    """执行一次结构化补全（内部共用：单轮已带 schema / 多轮仅最后一跳追加 schema）。"""
+    request_snapshot = copy.deepcopy(messages)
+    msgs = copy.deepcopy(messages)
+    if augment_last_user:
+        _augment_last_user_with_schema(msgs, schema)
 
-    Args:
-        prompt: 用户输入的 prompt（不含 JSON 格式说明，由函数自动添加）
-        schema: JSON Schema 定义（用于生成格式样例和验证输出）
-        temperature: 温度参数（None 则使用默认值）
-        enable_reasoning: 是否启用思考模式（deepseek-reasoner）
-        max_retries: 最大重试次数
-
-    Returns:
-        解析后的 JSON 对象（dict）
-
-    Raises:
-        LLMEmptyContentError: 响应 content 为空
-        LLMTokenLimitError: Token 超限
-        LLMJSONParseError: JSON 解析失败
-        LLMAPIError: API 调用失败
-    """
-    # 1. 加载配置
     config = _load_config()
     model = _get_model_name(enable_reasoning, config)
     temp = temperature if temperature is not None else config.get("default_temperature", 0.3)
     max_tokens = config.get("default_max_tokens", 8192)
 
-    # 2. 初始化 OpenAI 客户端
     client = OpenAI(
         api_key=config["api_key"],
         base_url=config["base_url"]
     )
 
-    # 3. 构造 messages
-    messages = _build_messages(prompt, schema)
-
-    # 4. 重试循环
     for attempt in range(max_retries):
         try:
-            # 调用 API
-            response = _call_api(client, messages, model, temp, max_tokens, enable_reasoning)
+            response = _call_api(client, msgs, model, temp, max_tokens, enable_reasoning)
 
-            # 解析响应
             content, usage, reasoning_content = _parse_response(response, enable_reasoning)
 
-            # 检查空 content
             if not content or content.strip() == "":
                 raise LLMEmptyContentError(usage)
 
-            # 提取 JSON
             data = _extract_json(content)
-
-            # 验证 schema
             _validate_json(data, schema)
 
-            # 记录日志
-            _log_call(prompt, content, usage, enable_reasoning, reasoning_content)
+            _log_call(log_prompt_hint, content, usage, enable_reasoning, reasoning_content)
 
-            return data
+            return StructuredLLMResult(
+                data=data,
+                assistant_content=content,
+                usage=usage,
+                request_messages=request_snapshot,
+            )
 
-        except LLMEmptyContentError as e:
+        except LLMEmptyContentError:
             if attempt < max_retries - 1:
                 print(f"[LLM] 空 content，重试 {attempt+1}/{max_retries}")
                 time.sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
                 continue
-            else:
-                raise
+            raise
 
         except LLMJSONParseError as e:
             if "SCHEMA_ERROR:" in str(e):
@@ -456,14 +511,98 @@ def call_llm_structured(
                 print(f"[LLM] JSON 解析失败，重试 {attempt+1}/{max_retries}")
                 time.sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
                 continue
-            else:
-                raise
+            raise
 
-        except LLMAPIError as e:
-            # API 错误不重试（可能是配置问题）
+        except LLMAPIError:
             raise
 
     raise LLMCallError("不应到达此处")
+
+
+def call_llm_structured(
+    prompt: str,
+    schema: dict,
+    temperature: float | None = None,
+    enable_reasoning: bool = False,
+    max_retries: int = DEFAULT_MAX_RETRIES
+) -> dict:
+    """单轮调用 LLM 并返回结构化 JSON（system + user 由本函数构造）。"""
+    messages = _build_messages(prompt, schema)
+    return _complete_structured(
+        messages,
+        schema,
+        augment_last_user=False,
+        temperature=temperature,
+        enable_reasoning=enable_reasoning,
+        max_retries=max_retries,
+        log_prompt_hint=prompt,
+    ).data
+
+
+def call_once_structured(
+    prompt: str,
+    schema: dict,
+    temperature: float | None = None,
+    enable_reasoning: bool = False,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> dict:
+    """``call_llm_structured`` 的别名，语义上强调「单轮」。"""
+    return call_llm_structured(
+        prompt=prompt,
+        schema=schema,
+        temperature=temperature,
+        enable_reasoning=enable_reasoning,
+        max_retries=max_retries,
+    )
+
+
+def call_once_structured_with_raw_content(
+    prompt: str,
+    schema: dict,
+    temperature: float | None = None,
+    enable_reasoning: bool = False,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> StructuredLLMResult:
+    """单轮结构化补全，并返回 assistant 原始 JSON 字符串与请求 messages 快照（供多轮衔接）。"""
+    messages = _build_messages(prompt, schema)
+    return _complete_structured(
+        messages,
+        schema,
+        augment_last_user=False,
+        temperature=temperature,
+        enable_reasoning=enable_reasoning,
+        max_retries=max_retries,
+        log_prompt_hint=prompt,
+    )
+
+
+def call_turn_structured(
+    messages: list[dict],
+    schema: dict,
+    temperature: float | None = None,
+    enable_reasoning: bool = False,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+) -> dict:
+    """多轮中的单回合：``messages`` 须已含完整前缀；本函数仅为最后一条 user 追加 JSON 格式说明后请求。
+
+    调用方应使用 ``prepare_next_turn_messages`` 拼接历史，且勿将历史轮的 ``reasoning_content`` 传入。
+    """
+    sanitized = sanitize_messages_for_api([dict(m) for m in messages])
+    hint = ""
+    for m in reversed(sanitized):
+        if m.get("role") == "user":
+            c = m.get("content")
+            hint = (c[:500] + "...") if isinstance(c, str) and len(c) > 500 else (c or "")
+            break
+    return _complete_structured(
+        sanitized,
+        schema,
+        augment_last_user=True,
+        temperature=temperature,
+        enable_reasoning=enable_reasoning,
+        max_retries=max_retries,
+        log_prompt_hint=hint or "(multi-turn)",
+    ).data
 
 
 # ============================================================================

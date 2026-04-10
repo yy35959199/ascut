@@ -1,3 +1,9 @@
+"""快速查看 layer1 JSON 前后若干条与时长统计。
+
+辅助工具，非 L1/L2/L3 环节演示脚本。用法（仓库根目录）::
+
+    python demos/tools/inspect_demo1.py
+"""
 import json
 from pathlib import Path
 

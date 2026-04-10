@@ -1,3 +1,5 @@
+"""Layer 2 公共 LLM 封装（intelligence_llm）的 schema / 重试行为单测，无 torch。"""
+
 from types import SimpleNamespace
 
 import pytest
@@ -98,52 +100,6 @@ def test_call_llm_structured_schema_error_fail_fast(monkeypatch: pytest.MonkeyPa
     bad_schema = {"type": "object", "properties": {"x": {"type": "unknown-type"}}}
     with pytest.raises(LLMJSONParseError, match="SCHEMA_ERROR"):
         call_llm_structured(prompt="test", schema=bad_schema, max_retries=3)
-
-
-def test_call_llm_structured_instance_error_retries(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "autosmartcut.intelligence_llm._load_config",
-        lambda: {
-            "api_key": "dummy",
-            "base_url": "https://api.deepseek.com/v1",
-            "model": "deepseek-chat",
-            "reasoner_model": "deepseek-reasoner",
-            "default_temperature": 0.3,
-            "default_max_tokens": 1024,
-        },
-    )
-    monkeypatch.setattr(
-        "autosmartcut.intelligence_llm.OpenAI",
-        lambda **kwargs: SimpleNamespace(),
-    )
-    monkeypatch.setattr("autosmartcut.intelligence_llm.time.sleep", lambda _: None)
-
-    call_count = {"n": 0}
-
-    def _fake_call_api(*args, **kwargs):
-        call_count["n"] += 1
-        if call_count["n"] < 3:
-            content = '{"decisions":[{"index":0,"keep":"true"}]}'
-        else:
-            content = '{"decisions":[{"index":0,"keep":true}]}'
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
-            usage=SimpleNamespace(
-                prompt_tokens=1,
-                completion_tokens=1,
-                total_tokens=2,
-            ),
-        )
-
-    monkeypatch.setattr("autosmartcut.intelligence_llm._call_api", _fake_call_api)
-
-    out = call_llm_structured(
-        prompt="test",
-        schema=_decision_schema(),
-        max_retries=3,
-    )
-    assert out["decisions"][0]["keep"] is True
-    assert call_count["n"] == 3
 
 
 def test_call_llm_structured_instance_error_retries(monkeypatch: pytest.MonkeyPatch) -> None:

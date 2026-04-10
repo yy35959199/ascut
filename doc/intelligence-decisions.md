@@ -9,9 +9,9 @@
 
 **实现与层间 JSON 以 [intelligence-layer2-mvp.md](intelligence-layer2-mvp.md) 与 [AutoSmartCut-MVP.md](AutoSmartCut-MVP.md) 为准。** 与下文历史表格冲突时，以这两份文档为准。
 
-- **Layer1 → LLM 句面**：`build_layer2_input_document` → `tokens[]`（仅 `index` + `text`）。
-- **2a**：R1（内存）`purpose_rough`、`outline_blocks_rough`、`candidate_misrecognitions`；R2（内存）`purpose`、`outline_blocks`、`corrections`；**程序**生成持久化 `cleaned_annotations[]`；**不**持久化 `symbol_table` / 候选表 / `corrections`。
-- **2b**：`keep_mask`（与 `annotations` 等长）；**EDL 等价区间**在执行层由时间与 mask 合成，见 intelligence-layer2-mvp §11。
+- **Layer1 → LLM 句面**：`build_layer2_input_document` / **JSON2** → `tokens[]`（仅 `index` + `text`）；**L2 文件入口仅 JSON2**，不读 JSON1。
+- **2a**：R1（内存）`purpose_rough`、`outline_blocks_rough`、`candidate_misrecognitions`；R2（内存）`purpose`、`outline_blocks`、`corrections`；**程序**在 **`tokens[].text`** 上生成稠密 `cleaned_annotations[]`；**不**持久化 `symbol_table` / 候选表 / `corrections`。
+- **2b**：`keep_mask`（与 **`tokens[]`** 等长；全链与 JSON1 `annotations` 条数一致）；**EDL 等价区间**在执行层由时间与 mask 合成，见 intelligence-layer2-mvp §11。
 
 以下各节保留**演进讨论**；表格中「当前设计」若未反映上列契约，视为已被 MVP 文书覆盖。
 

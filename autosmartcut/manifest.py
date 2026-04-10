@@ -1,11 +1,11 @@
 """TimelineManifest 及相关 dataclass 定义（类型与愿景对齐用）。
 
 **运行时事实（MVP 现行）**
-- Layer 2 智能层在内存中使用 **dict** 承载 `annotations`、`comprehension`、`keep_mask` 等
-  （见 ``intelligence.run_intelligence_layer``），避免与 dataclass 来回转换。
+- Layer 2 智能层在内存中使用 **dict** 承载 **`tokens`**（JSON2 句面）、`comprehension`、`keep_mask` 等
+  （见 ``intelligence.run_intelligence_layer``），**不要求** dict 内带完整 JSON1 式 ``annotations[]``。
 - 本文件中的 dataclass 保留作 **schema 草图 / 完整版叙事对齐**；字段与 dict 不一致时，
   **以 ``intelligence-layer2-mvp.md`` 与 ``intelligence*.py`` 中的 dict 契约为准**。
-- 统一编排入口 ``runner.py`` 尚未接入上述 dict 全链路；检查点目录约定见 ``doc/AutoSmartCut-MVP.md``（规划中）。
+- 统一编排入口 ``runner.py``（``ascut run``）已接入 L1→L2→L3；**检查点目录**约定见 ``doc/AutoSmartCut-MVP.md``（仍规划中）。
 
 贯穿全管道的设计目标：各层只追加自己负责的字段、不覆写上游（append-only），
 清单可序列化为 JSON，供未来检查点与审计使用。

@@ -1,3 +1,5 @@
+"""Layer 1（识别层 / perception）单测。依赖 torch 等 L1 运行时。"""
+
 from pathlib import Path
 
 from autosmartcut.perception import (

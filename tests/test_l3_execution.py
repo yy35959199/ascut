@@ -1,6 +1,6 @@
-"""collect_kept_intervals：末句 t_end + min(gap_after, cap)"""
+"""Layer 3（执行层）单测：区间与 gap 等纯逻辑，不依赖 LLM。"""
 
-from autosmartcut.execution import collect_kept_intervals
+from autosmartcut.timeline_segments import collect_kept_intervals
 
 
 def test_collect_kept_intervals_caps_trailing_gap() -> None:
