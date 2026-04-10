@@ -9,7 +9,7 @@
 4. **程序**：按 `corrections` 在 **只读句面**（``tokens[].text``）上替换，生成稠密
    `cleaned_annotations[]`；**不**改写 ``tokens``（Append-only）。
 
-LLM 调用封装：`autosmartcut.intelligence_llm.call_llm_structured`。
+LLM 调用封装：R1 ``call_once_structured_with_raw_content``；R2 ``call_turn_structured``（真多轮，前缀与 R1 共享以利缓存）。
 
 ## 输入（manifest 片段）
 - `tokens[]`：句级句面（index、text）。
@@ -32,7 +32,12 @@ from collections import defaultdict
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from autosmartcut.intelligence_llm import call_llm_structured
+from autosmartcut.intelligence_llm import (
+    StructuredLLMResult,
+    call_once_structured_with_raw_content,
+    call_turn_structured,
+    prepare_next_turn_messages,
+)
 from autosmartcut.layer2_tokens import validate_tokens
 
 
@@ -40,8 +45,11 @@ from autosmartcut.layer2_tokens import validate_tokens
 # 模型参数（便于调试）
 # ============================================================================
 
-# 2a 两轮调用均使用普通 chat 模型（文本理解任务，不需要 reasoner）
-ENABLE_REASONING = False
+# R1：全局压缩 + 分段，默认非思考模式（见 doc/专家角色提示与模型性能关系.md）
+ENABLE_REASONING_R1 = False
+
+# R2：纠错 / 一致性，可按需单独开 reasoner
+ENABLE_REASONING_R2 = False
 
 # R1 温度：略高，允许一定创造性（主旨概括）
 R1_TEMPERATURE = 0.5
@@ -82,13 +90,16 @@ def run_2a_comprehension(manifest_dict: dict) -> dict:
     goal = manifest_dict.get("goal", "")
 
     # Round 1: 粗理解 + ASR 误识候选
-    purpose_rough, outline_blocks_rough, candidate_misrecognitions = _run_round1(
-        tokens, goal
+    purpose_rough, outline_blocks_rough, candidate_misrecognitions, r1_completion = (
+        _run_round1(tokens, goal)
     )
 
-    # Round 2: 精化主旨 + 分块 + 纠错列表（中间态，不持久化）
+    # Round 2: 精化主旨 + 分块 + 纠错列表（真多轮：承接 R1 assistant JSON）
     purpose, outline_blocks, raw_corrections = _run_round2(
-        tokens, goal, purpose_rough, outline_blocks_rough, candidate_misrecognitions
+        tokens,
+        goal,
+        candidate_misrecognitions,
+        r1_completion,
     )
 
     # 程序步骤：只读句面为 tokens[].text，不修改 tokens
@@ -123,23 +134,24 @@ def run_2a_comprehension(manifest_dict: dict) -> dict:
 def _run_round1(
     tokens: list[dict],
     goal: str,
-) -> tuple[str, list[dict], list[dict]]:
+) -> tuple[str, list[dict], list[dict], StructuredLLMResult]:
     """Round 1: 粗理解 + ASR 误识候选
 
     Returns:
-        (purpose_rough, outline_blocks_rough, candidate_misrecognitions)
+        (purpose_rough, outline_blocks_rough, candidate_misrecognitions, r1_completion)
     """
     print("[2a-R1] 粗理解与误识候选构建")
 
     prompt = _build_r1_prompt(tokens, goal)
     schema = _get_r1_schema()
 
-    response = call_llm_structured(
+    r1_completion = call_once_structured_with_raw_content(
         prompt=prompt,
         schema=schema,
         temperature=R1_TEMPERATURE,
-        enable_reasoning=ENABLE_REASONING,
+        enable_reasoning=ENABLE_REASONING_R1,
     )
+    response = r1_completion.data
 
     purpose_rough = response["purpose_rough"]
     outline_blocks_rough = response.get("outline_blocks_rough", [])
@@ -148,7 +160,7 @@ def _run_round1(
     print(f"[2a-R1] 粗糙主旨: {purpose_rough[:60]}...")
     print(f"[2a-R1] 误识候选: {len(candidate_misrecognitions)} 条")
 
-    return purpose_rough, outline_blocks_rough, candidate_misrecognitions
+    return purpose_rough, outline_blocks_rough, candidate_misrecognitions, r1_completion
 
 
 def _build_r1_prompt(tokens: list[dict], goal: str) -> str:
@@ -233,11 +245,10 @@ def _get_r1_schema() -> dict:
 def _run_round2(
     tokens: list[dict],
     goal: str,
-    purpose_rough: str,
-    outline_blocks_rough: list[dict],
     candidate_misrecognitions: list[dict],
+    r1_completion: StructuredLLMResult,
 ) -> tuple[str, list[dict], list[dict]]:
-    """Round 2: 精化主旨 + 分块 + 纠错列表
+    """Round 2: 精化主旨 + 分块 + 纠错列表（多轮第二跳）
 
     Returns:
         (purpose, outline_blocks, raw_corrections)
@@ -245,16 +256,20 @@ def _run_round2(
     """
     print("[2a-R2] 精化理解与纠错确定")
 
-    prompt = _build_r2_prompt(
-        tokens, goal, purpose_rough, outline_blocks_rough, candidate_misrecognitions
-    )
+    r2_user = _build_r2_user_followup(tokens, goal, candidate_misrecognitions)
     schema = _get_r2_schema()
 
-    response = call_llm_structured(
-        prompt=prompt,
-        schema=schema,
+    r2_messages = prepare_next_turn_messages(
+        r1_completion.request_messages,
+        assistant_content=r1_completion.assistant_content,
+        next_user_content=r2_user,
+    )
+
+    response = call_turn_structured(
+        r2_messages,
+        schema,
         temperature=R2_TEMPERATURE,
-        enable_reasoning=ENABLE_REASONING,
+        enable_reasoning=ENABLE_REASONING_R2,
     )
 
     purpose = response["purpose"]
@@ -267,33 +282,16 @@ def _run_round2(
     return purpose, outline_blocks, raw_corrections
 
 
-def _build_r2_prompt(
+def _build_r2_user_followup(
     tokens: list[dict],
     goal: str,
-    purpose_rough: str,
-    outline_blocks_rough: list[dict],
     candidate_misrecognitions: list[dict],
 ) -> str:
+    """R2 仅追加 user：主旨/粗分块/候选列表以 R1 assistant JSON 为准，此处只给任务与句面锚点。"""
     goal_line = f"用户目标：{goal}" if goal else "用户目标：无特定目标，提取核心内容"
-
-    # ── 开头区（primacy）：短小的全局语义锚点 ──
-
-    if outline_blocks_rough:
-        block_lines = [
-            f"  块 {i+1} [index {b['start_index']}-{b['end_index']}]: "
-            f"{b.get('topic', b.get('summary', ''))}"
-            for i, b in enumerate(outline_blocks_rough)
-        ]
-        blocks_section = "R1 初步分块（供参考）：\n" + "\n".join(block_lines)
-    else:
-        blocks_section = "R1 初步分块：无"
-
-    # ── 中间区：完整标注序列（长文本参考材料） ──
 
     lines = [f"[{t['index']}] {t['text']}" for t in tokens]
     text_block = "\n".join(lines)
-
-    # ── 近结尾区（recency）：候选列表，由代码查表内联原句 ──
 
     token_map = {t["index"]: t["text"] for t in tokens}
 
@@ -307,21 +305,17 @@ def _build_r2_prompt(
                 f"    错词：\"{c['wrong']}\" → 候选：{c['suggestions']}"
             )
         cand_section = (
-            "R1 识别出的 ASR 误识候选（每条附原句供核对）：\n"
+            "上一轮 JSON 中 candidate_misrecognitions 与下列原句核对（若不一致以原句为准）：\n"
             + "\n".join(cand_lines)
         )
     else:
-        cand_section = "R1 未识别到 ASR 误识候选。"
-
-    # ── 结尾区（recency）：任务指令 ──
+        cand_section = "上一轮未输出 candidate_misrecognitions 或为空。"
 
     return f"""{goal_line}
 
-粗糙主旨（供参考）：{purpose_rough}
+你上一轮已在 assistant 消息中输出 JSON（含 purpose_rough、outline_blocks_rough、candidate_misrecognitions）。请在保持与上一轮一致的前提下，完成本回合输出（字段名与语义见下方 JSON 格式说明）。
 
-{blocks_section}
-
-以下是完整标注序列（格式：[index] 文字内容）：
+以下是完整标注序列（格式：[index] 文字内容），用于核对纠错锚点：
 
 {text_block}
 
@@ -335,12 +329,12 @@ def _build_r2_prompt(
 
 2. 将内容按主题/段落划分为若干块（outline_blocks），每块给出 index 范围和摘要
 
-3. 对上方候选中确认存在误识的条目，给出唯一纠错规则（corrections）
+3. 对上一轮 candidate_misrecognitions 中确认存在误识的条目，给出唯一纠错规则（corrections）
    每条纠错包含：
    - index：发生误识的句子 index
    - old：原文中的错误子串（必须是该句子的真实子串）
    - nth：该子串在原句中从左到右第几次出现（1-based，第一次出现填 1）
-   - new：替换为的正确内容（必须来自 R1 候选，不得自造新词）
+   - new：替换为的正确内容（必须来自上一轮候选，不得自造新词）
 
    规则：
    - 若无法确定唯一正确词，宁可不输出该条

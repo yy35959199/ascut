@@ -113,7 +113,26 @@ R2 结束后丢弃上述中间结构；**不**持久化 `symbol_table` / `symbol
    再回填为**稠密全量** `**comprehension.cleaned_annotations[]`**；
    **不**改写磁盘 JSON1；**不**修改已载入的 **`tokens[]` 原文**（消歧结果仅存在于 `comprehension`）。
 
-LLM 调用统一走已封装的 `call_llm_structured`（见 `autosmartcut.intelligence_llm`）。
+LLM 调用走 `autosmartcut.intelligence_llm`（见 **§5.1.1**）。R1 为单轮；R2 与 R1 为**同一对话前缀上的第二跳**（真多轮，利于前缀缓存命中），而非两次互不关联的单轮请求。
+
+#### 5.1.1 LLM 封装与多轮契约（现行实现）
+
+| 能力 | 入口 | 说明 |
+|------|------|------|
+| 单轮结构化 | `call_llm_structured` / `call_once_structured` | `system` + `user`（含 JSON Schema 格式说明）；非流式 |
+| R1 单轮 + 原文快照 | `call_once_structured_with_raw_content` | 返回 `StructuredLLMResult`：`data`、`assistant_content`（模型返回的 JSON 字符串）、`usage`、`request_messages`（深拷贝，供 R2 前缀） |
+| 多轮下一跳 | `call_turn_structured(messages, schema, …)` | 对 `messages` 先 `sanitize_messages_for_api`（去掉 `reasoning_content`），再对**最后一条** `role=user` 追加 JSON 格式说明后请求 |
+| 拼接 R1→R2 | `prepare_next_turn_messages` | 在 `request_messages` 后追加 `assistant`（仅 `content`）与 R2 的 `user`（由 `intelligence_2a._build_r2_user_followup` 构造） |
+
+思考模式与采样：
+
+- 模块内常量 **`ENABLE_REASONING_R1`** / **`ENABLE_REASONING_R2`**（默认 `False`）分别控制 R1/R2 是否启用 reasoner。
+- 思考模式下 **`_call_api` 不传 `temperature`**（与 DeepSeek 文档一致）；若配置为 `deepseek-chat` 且开启思考，则通过 `extra_body={"thinking":{"type":"enabled"}}`。
+- 跨轮**不得**把历史轮的 `reasoning_content` 拼进 `messages`（由 `sanitize_messages_for_api` 保证）。
+
+2b 仍为**单轮**调用，使用 `call_llm_structured`（与 `call_once_structured` 等价）。
+
+输出校验使用 **`jsonschema.Draft202012Validator`**（实例与 schema 合法性）。
 
 ### 5.2 R1 输出（中间态，仅内存）
 
@@ -139,7 +158,8 @@ LLM 调用统一走已封装的 `call_llm_structured`（见 `autosmartcut.intell
 
 ### 5.5 输入与不变量
 
-- **R1/R2 的文本输入**：`manifest["tokens"]`（与 JSON2 一致）+ `goal`；R2 额外在 Prompt 中附带 R1 的 `purpose_rough`、`outline_blocks_rough`、`candidate_misrecognitions`。
+- **R1 文本输入**：`manifest["tokens"]`（与 JSON2 一致）+ `goal`。
+- **R2 文本输入**：在同一会话中，上一条 **`assistant`** 消息为 R1 的完整 JSON（含 `purpose_rough`、`outline_blocks_rough`、`candidate_misrecognitions`）；本回合 **`user`** 不再重复粘贴上述字段全文，而是显式引用「上一轮 JSON」，并仍附带**完整句面列表**（`[index] text`）及候选条目的**原句核对**（供 `corrections` 锚定）。语义与旧版「把 R1 输出塞进单条 Prompt」等价，但前缀与 R1 的 `system`+首条 `user` 一致，利于上下文缓存。
 - **JSON1 与 JSON2 句面原文不被覆盖**；消歧仅通过 `cleaned_annotations[]` 旁路表达（Append-only 语义）。
 
 ---
@@ -221,6 +241,7 @@ flowchart LR
 - **智能层（含 2d）对执行层的交付物是定稿 `keep_mask`**（与 JSON2 **`tokens`** 等长；全链与 JSON1 `annotations` 条数一致）；**不是** `edl[]`。
 - 识别层输出中带 `**index`、`t_start`、`t_end` 与 `gap_after`** 的句级序列，构成「时间–index 映射」；执行层用其与 `keep_mask` 合并后**在内部**得到连续时间上的 keep 区间，再**在执行层内部**合成 EDL 并驱动剪切。
 - Layer 2 语义决策主坐标为 `index`；**时间换算与 EDL 合成**属于执行层职责。
+- **执行层（MVP）**在合成浮点保留区间后，还可选用 **Silero VAD 切点吸附（Snap）** 微调入/出点（不写回源文件）；与 L2 契约无关，详见 [AutoSmartCut-MVP.md](AutoSmartCut-MVP.md) 中 `[execution]` 与 `--no-vad-snap`。
 
 ---
 
@@ -233,5 +254,5 @@ flowchart LR
 
 ---
 
-*文档版本：0.4.0*  
-*状态：MVP 现行实现依据（L2 入口 JSON2 / `tokens[]` 已与代码对齐）*  
+*文档版本：0.4.1*  
+*状态：MVP 现行实现依据（L2 入口 JSON2 / `tokens[]`；2a R1+R2 真多轮与 `intelligence_llm` API 已与代码对齐，2026-04-10）*  

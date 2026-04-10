@@ -33,7 +33,7 @@
 
 **P2：步骤函数各自独立，不共享基类**
 
-四个子阶段（2a/2b/2c/2d）共享同一外层契约 `f(manifest_state) → manifest_mutations`，但内部逻辑差异大：prompt 构造完全不同，2d 根本不调 LLM。共享的机械动作（HTTP 调用、JSON 解析、重试、token 计数）提取为 `llm_call()` 工具函数，不用基类。
+四个子阶段（2a/2b/2c/2d）共享同一外层契约 `f(manifest_state) → manifest_mutations`，但内部逻辑差异大：prompt 构造完全不同，2d 根本不调 LLM。共享的机械动作（HTTP 调用、JSON 解析、重试、schema 校验）集中在 **`autosmartcut.intelligence_llm`**：`call_llm_structured` / `call_turn_structured` 等，不用基类。
 
 **P3：状态机控制流程，显式优于表驱动**
 

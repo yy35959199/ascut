@@ -108,7 +108,11 @@
 【L3 剪切调参（任意会跑 L3 的阶段均生效）】
 
   --pre-pad / --post-pad / --min-duration
-      见 ``execution.keep_mask_to_positive_segments``：段前/后伸展、过短段合并。
+      见 ``execution.keep_mask_to_positive_segments`` / ``timeline_segments``：段前/后伸展、过短段合并。
+
+  --no-vad-snap
+      关闭 Layer 3 **切点吸附**（Silero VAD）；指定后**忽略** ``config.toml`` 中 ``[execution]`` 下 VAD 相关项。
+      默认开启（当配置 ``vad_snap_enabled`` 且 ``vad_snap_radius > 0`` 且本 flag 未出现时）。
 
 【日志】
 
@@ -318,6 +322,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 		help="L3 过短区间合并阈值（秒）",
 	)
 	pr.add_argument(
+		"--no-vad-snap",
+		action="store_true",
+		help="关闭 L3 切点吸附（Silero VAD）；指定后忽略 config 中 VAD 相关项",
+	)
+	pr.add_argument(
 		"--verbose",
 		action="store_true",
 		help="DEBUG 级日志",
@@ -410,6 +419,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 			post_pad=args.post_pad,
 			min_duration=args.min_duration,
 			gap_after_cap=None,
+			vad_snap_disabled_by_cli=args.no_vad_snap,
 		)
 
 		elapsed = time.perf_counter() - t0

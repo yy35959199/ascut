@@ -49,6 +49,8 @@ def positive_segments_from_mask_files(
     post_pad: float = 0.25,
     min_duration: float = 1.0,
     gap_after_cap: float | None = None,
+    config: AppConfig | None = None,
+    vad_snap_disabled_by_cli: bool = False,
 ):
     """
     从 layer1_annotations.json 与 layer2 输出 JSON 生成 positive_segments。
@@ -68,8 +70,33 @@ def positive_segments_from_mask_files(
     finally:
         media.close()
 
+    cfg = config if config is not None else load_config()
     if gap_after_cap is None:
-        gap_after_cap = load_config().execution.gap_after_cap
+        gap_after_cap = cfg.execution.gap_after_cap
+
+    silence_intervals: list[tuple[float, float]] | None = None
+    snap_radius = 0.0
+    if (
+        not vad_snap_disabled_by_cli
+        and cfg.execution.vad_snap_enabled
+        and cfg.execution.vad_snap_radius > 0
+    ):
+        try:
+            from autosmartcut.vad_silence import silence_intervals_for_video
+
+            silence_intervals = silence_intervals_for_video(
+                video, duration, cfg.execution
+            )
+            snap_radius = cfg.execution.vad_snap_radius
+            logger.info(
+                "[L3] VAD 静音区间 %d 条，snap_radius=%.3fs",
+                len(silence_intervals),
+                snap_radius,
+            )
+        except Exception as exc:
+            logger.warning("[L3] VAD 静音构建失败，跳过切点吸附: %s", exc)
+            silence_intervals = None
+            snap_radius = 0.0
 
     positive: list[tuple[Fraction, Fraction]] = keep_mask_to_positive_segments(
         annotations,
@@ -79,6 +106,8 @@ def positive_segments_from_mask_files(
         post_pad=post_pad,
         min_duration=min_duration,
         gap_after_cap=gap_after_cap,
+        silence_intervals=silence_intervals,
+        snap_radius=snap_radius,
     )
     return positive, video, duration
 
@@ -91,6 +120,7 @@ def run_execution_layer(
     post_pad: float = 0.25,
     min_duration: float = 1.0,
     gap_after_cap: float | None = None,
+    vad_snap_disabled_by_cli: bool = False,
 ) -> Path:
     """L3 端到端：JSON1 + JSON3 → 输出视频，返回输出路径。"""
     from autosmartcut.log import ensure_autosmartcut_logging
@@ -113,6 +143,8 @@ def run_execution_layer(
         post_pad=post_pad,
         min_duration=min_duration,
         gap_after_cap=gap_after_cap,
+        config=config,
+        vad_snap_disabled_by_cli=vad_snap_disabled_by_cli,
     )
     if not positive:
         raise ValueError("keep_mask 解析后无保留区间")

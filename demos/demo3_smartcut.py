@@ -12,6 +12,8 @@ JSON3：仅要求顶层 keep_mask[]，可为真实智能层输出（layer2_outpu
   python demos/demo3_smartcut.py dense --input samples/alxe_01.mp4
   python demos/demo3_smartcut.py json --layer1 outputs/layer1_annotations.json --mask outputs/layer2_output.json
   python demos/demo3_smartcut.py json --layer1 outputs/layer1_annotations.json --mask outputs/layer2_output_mock.json
+  python demos/demo3_smartcut.py json ... --no-vad-snap          # 关闭 VAD 切点吸附
+  python demos/demo3_smartcut.py json ... --config config.toml  # 指定配置（含 VAD 参数）
 """
 
 import argparse
@@ -28,6 +30,7 @@ from smartcut.media_container import MediaContainer
 from smartcut.misc_data import AudioExportInfo, AudioExportSettings
 from smartcut.smart_cut import smart_cut
 
+from autosmartcut.config import load_config
 from autosmartcut.execution import positive_segments_from_mask_files
 
 
@@ -109,12 +112,16 @@ def run_json(args: argparse.Namespace) -> None:
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    cfg = load_config(args.config) if args.config else load_config()
+
     positive, video, duration = positive_segments_from_mask_files(
         Path(args.layer1),
         Path(args.mask),
         pre_pad=args.pre_pad,
         post_pad=args.post_pad,
         min_duration=args.min_duration,
+        config=cfg,
+        vad_snap_disabled_by_cli=args.no_vad_snap,
     )
     if not positive:
         raise SystemExit("keep_mask 解析后无保留区间（请检查 cut 比例或源标注）")
@@ -171,6 +178,17 @@ def main() -> None:
     p_json.add_argument("--pre-pad", type=float, default=0.15, help="区间前 padding（秒）")
     p_json.add_argument("--post-pad", type=float, default=0.25, help="区间后 padding（秒）")
     p_json.add_argument("--min-duration", type=float, default=1.0, help="过短区间合并阈值（秒）")
+    p_json.add_argument(
+        "--no-vad-snap",
+        action="store_true",
+        help="关闭 VAD 切点吸附；忽略 config 中 VAD 项",
+    )
+    p_json.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="config.toml；省略则用包默认路径（与 ascut 一致）",
+    )
     p_json.set_defaults(func=run_json)
 
     args = parser.parse_args()

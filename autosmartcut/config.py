@@ -31,6 +31,12 @@ class PerceptionConfig:
 class ExecutionConfig:
 	# 保留段右边界：最后一句 t_end 后再纳入 min(gap_after, 本值) 秒；0 表示不延伸
 	gap_after_cap: float = 0.6
+	# L3 切点吸附（Silero VAD）：CLI --no-vad-snap 时忽略以下项
+	vad_snap_enabled: bool = True
+	vad_snap_radius: float = 0.12
+	vad_threshold: float = 0.35
+	vad_min_silence_ms: int = 80
+	vad_speech_pad_ms: int = 10
 
 
 @dataclass
@@ -73,6 +79,25 @@ def load_config(path: Path | None = None) -> AppConfig:
 	config.execution = ExecutionConfig(
 		gap_after_cap=float(
 			execution.get("gap_after_cap", config.execution.gap_after_cap)
+		),
+		vad_snap_enabled=bool(
+			execution.get("vad_snap_enabled", config.execution.vad_snap_enabled)
+		),
+		vad_snap_radius=float(
+			execution.get("vad_snap_radius", config.execution.vad_snap_radius)
+		),
+		vad_threshold=float(
+			execution.get("vad_threshold", config.execution.vad_threshold)
+		),
+		vad_min_silence_ms=int(
+			execution.get(
+				"vad_min_silence_ms", config.execution.vad_min_silence_ms
+			)
+		),
+		vad_speech_pad_ms=int(
+			execution.get(
+				"vad_speech_pad_ms", config.execution.vad_speech_pad_ms
+			)
 		),
 	)
 

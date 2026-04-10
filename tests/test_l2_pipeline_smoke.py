@@ -1,5 +1,6 @@
 """Layer 2 窄端到端冒烟：2a → 2b（mock LLM）。导入链含 perception → torch。"""
 
+import json
 import sys
 import types
 
@@ -9,6 +10,7 @@ sys.modules.setdefault("av", types.ModuleType("av"))
 
 from autosmartcut.intelligence_2a import run_2a_comprehension
 from autosmartcut.intelligence_2b import run_2b_decision
+from autosmartcut.intelligence_llm import StructuredLLMResult
 
 
 def test_run_2a_and_2b_with_mocked_llm(monkeypatch):
@@ -22,33 +24,48 @@ def test_run_2a_and_2b_with_mocked_llm(monkeypatch):
         ],
     }
 
-    responses = iter(
-        [
-            {
-                "purpose_rough": "介绍自动剪辑流程。",
-                "outline_blocks_rough": [{"start_index": 0, "end_index": 2, "topic": "流程"}],
-                "candidate_misrecognitions": [],
-            },
-            {
-                "purpose": "讲解自动剪辑的核心步骤与决策思路。",
-                "outline_blocks": [{"start_index": 0, "end_index": 2, "summary": "自动剪辑流程总览"}],
-                "corrections": [],
-            },
-            {
-                "decisions": [
-                    {"index": 0, "keep": True},
-                    {"index": 1, "keep": True},
-                    {"index": 2, "keep": False},
-                ]
-            },
+    r1_data = {
+        "purpose_rough": "介绍自动剪辑流程。",
+        "outline_blocks_rough": [{"start_index": 0, "end_index": 2, "topic": "流程"}],
+        "candidate_misrecognitions": [],
+    }
+    r2_data = {
+        "purpose": "讲解自动剪辑的核心步骤与决策思路。",
+        "outline_blocks": [{"start_index": 0, "end_index": 2, "summary": "自动剪辑流程总览"}],
+        "corrections": [],
+    }
+    decision_data = {
+        "decisions": [
+            {"index": 0, "keep": True},
+            {"index": 1, "keep": True},
+            {"index": 2, "keep": False},
         ]
+    }
+    step = iter([r2_data, decision_data])
+
+    def _fake_once_raw(*args, **kwargs):
+        return StructuredLLMResult(
+            data=r1_data,
+            assistant_content=json.dumps(r1_data, ensure_ascii=False),
+            usage={},
+            request_messages=[
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u1"},
+            ],
+        )
+
+    def _fake_turn(*args, **kwargs):
+        return next(step)
+
+    def _fake_2b_llm(*args, **kwargs):
+        return next(step)
+
+    monkeypatch.setattr(
+        "autosmartcut.intelligence_2a.call_once_structured_with_raw_content",
+        _fake_once_raw,
     )
-
-    def _fake_call_llm_structured(*args, **kwargs):
-        return next(responses)
-
-    monkeypatch.setattr("autosmartcut.intelligence_2a.call_llm_structured", _fake_call_llm_structured)
-    monkeypatch.setattr("autosmartcut.intelligence_2b.call_llm_structured", _fake_call_llm_structured)
+    monkeypatch.setattr("autosmartcut.intelligence_2a.call_turn_structured", _fake_turn)
+    monkeypatch.setattr("autosmartcut.intelligence_2b.call_llm_structured", _fake_2b_llm)
 
     out_2a = run_2a_comprehension(manifest)
     assert out_2a["comprehension"]["purpose"] == "讲解自动剪辑的核心步骤与决策思路。"

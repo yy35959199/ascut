@@ -1,5 +1,6 @@
 """Layer 2 / 2a 理解子阶段单测。导入链含 perception → torch。"""
 
+import json
 import sys
 import types
 
@@ -8,6 +9,7 @@ import pytest
 sys.modules.setdefault("av", types.ModuleType("av"))
 
 from autosmartcut.intelligence_2a import run_2a_comprehension
+from autosmartcut.intelligence_llm import StructuredLLMResult
 
 
 def test_run_2a_outputs_dense_cleaned_annotations_with_corrections(monkeypatch):
@@ -20,25 +22,36 @@ def test_run_2a_outputs_dense_cleaned_annotations_with_corrections(monkeypatch):
         ],
     }
 
-    responses = iter(
-        [
-            {
-                "purpose_rough": "介绍自动剪辑流程。",
-                "outline_blocks_rough": [{"start_index": 0, "end_index": 1, "topic": "流程"}],
-                "candidate_misrecognitions": [],
-            },
-            {
-                "purpose": "讲解自动剪辑流程。",
-                "outline_blocks": [{"start_index": 0, "end_index": 1, "summary": "流程总览"}],
-                "corrections": [{"index": 0, "old": "减辑", "nth": 1, "new": "剪辑"}],
-            },
-        ]
+    r1_data = {
+        "purpose_rough": "介绍自动剪辑流程。",
+        "outline_blocks_rough": [{"start_index": 0, "end_index": 1, "topic": "流程"}],
+        "candidate_misrecognitions": [],
+    }
+    r2_data = {
+        "purpose": "讲解自动剪辑流程。",
+        "outline_blocks": [{"start_index": 0, "end_index": 1, "summary": "流程总览"}],
+        "corrections": [{"index": 0, "old": "减辑", "nth": 1, "new": "剪辑"}],
+    }
+
+    def _fake_once_raw(*args, **kwargs):
+        return StructuredLLMResult(
+            data=r1_data,
+            assistant_content=json.dumps(r1_data, ensure_ascii=False),
+            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            request_messages=[
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u1"},
+            ],
+        )
+
+    def _fake_turn(*args, **kwargs):
+        return r2_data
+
+    monkeypatch.setattr(
+        "autosmartcut.intelligence_2a.call_once_structured_with_raw_content",
+        _fake_once_raw,
     )
-
-    def _fake_call_llm_structured(*args, **kwargs):
-        return next(responses)
-
-    monkeypatch.setattr("autosmartcut.intelligence_2a.call_llm_structured", _fake_call_llm_structured)
+    monkeypatch.setattr("autosmartcut.intelligence_2a.call_turn_structured", _fake_turn)
 
     out_2a = run_2a_comprehension(manifest)
     cleaned = out_2a["comprehension"]["cleaned_annotations"]

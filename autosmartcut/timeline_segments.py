@@ -17,6 +17,7 @@ __all__ = [
     "collect_kept_intervals",
     "intervals_to_fraction_segments",
     "keep_mask_to_positive_segments",
+    "merge_overlapping_intervals",
     "merge_short_intervals",
     "resolve_keep_flags",
 ]
@@ -113,6 +114,13 @@ def _merge_overlapping(intervals: list[tuple[float, float]]) -> list[tuple[float
     return merged
 
 
+def merge_overlapping_intervals(
+    intervals: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """合并重叠区间（与 apply_padding 内逻辑相同，供 snap 后复用）。"""
+    return _merge_overlapping(intervals)
+
+
 def apply_padding(
     intervals: list[tuple[float, float]],
     *,
@@ -190,6 +198,8 @@ def keep_mask_to_positive_segments(
     post_pad: float = 0.25,
     min_duration: float = 1.0,
     gap_after_cap: float = 0.6,
+    silence_intervals: list[tuple[float, float]] | None = None,
+    snap_radius: float = 0.0,
 ) -> list[tuple[Fraction, Fraction]]:
     """
     layer1 句级时间轴（index / t_start / t_end / gap_after 等）+ layer2 keep_mask ->
@@ -197,6 +207,9 @@ def keep_mask_to_positive_segments(
 
     gap_after_cap：每段末尾在 ``t_end`` 基础上最多再纳入 ``min(gap_after, cap)`` 秒静音尾；
     设为 0 则退化为仅用句末 ``t_end`` 作为段尾（旧行为）。
+
+    silence_intervals + snap_radius：在 padding 之后将各段入/出点吸附到最近静音（L3 VAD）；
+    二者缺一则跳过吸附。
     """
     anns = _ensure_indices(annotations)
     keep_by = _keep_map_from_mask(keep_mask)
@@ -208,5 +221,20 @@ def keep_mask_to_positive_segments(
     resolved = resolve_keep_flags(anns, keep_by)
     intervals = collect_kept_intervals(anns, resolved, gap_after_cap=gap_after_cap)
     intervals = apply_padding(intervals, duration=video_duration, pre=pre_pad, post=post_pad)
+    if silence_intervals and snap_radius > 0:
+        from autosmartcut.vad_silence import snap_interval_edges_to_silence
+
+        intervals = snap_interval_edges_to_silence(
+            intervals,
+            silence_intervals,
+            duration=video_duration,
+            radius=snap_radius,
+        )
+        intervals = merge_overlapping_intervals(intervals)
+        intervals = [
+            (max(0.0, a), min(video_duration, b))
+            for a, b in intervals
+            if min(video_duration, b) > max(0.0, a)
+        ]
     intervals = merge_short_intervals(intervals, min_duration)
     return intervals_to_fraction_segments(intervals)
