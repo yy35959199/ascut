@@ -6,7 +6,7 @@ from __future__ import annotations
 模式 json：读取 JSON1 + 任意含 keep_mask 的 JSON3，走 execution.positive_segments_from_mask_files（与 Layer 3 一致）。
 
 JSON1：layer1_annotations.json（source + annotations，含 index / t_start / t_end / gap_after）。
-JSON3：仅要求顶层 keep_mask[]，可为真实智能层输出（layer2_output.json）或 gen_demo_jsons 的 mock。
+JSON3：仅要求顶层 keep_mask[]，可为真实智能层输出（layer2_output.json）或 ``demos/tools/gen_demo_jsons.py`` 生成的 mock。
 
 示例（在仓库 ascut 目录下）：
   python demos/demo3_smartcut.py dense --input samples/alxe_01.mp4

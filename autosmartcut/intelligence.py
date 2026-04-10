@@ -3,58 +3,36 @@
 ## 职责
 - 提供统一入口 run_intelligence_layer()
 - 按顺序调用 2a → 2b → 2c → 2d
-- 文件交接模式（读取 layer1.json，输出 layer2.json）
-- 不包含具体业务逻辑，只负责流程编排
+- 文件交接：读取 **JSON2**（句面 ``tokens[]``），输出 JSON3（``keep_mask``）
 
-## 输入 Schema (layer1.json)
+## 输入 Schema（JSON2，如 layer2_input.json）
 {
-    "source": str,              # 源视频路径
-    "language": str,            # 语言代码（如 "zh"）
-    "raw_text": str,            # 完整 ASR 原文
-    "annotations": [            # 标注列表
-        {
-            "index": int,       # 全局唯一序号（0-based）
-            "t_start": float,   # 开始时间（秒）
-            "t_end": float,     # 结束时间（秒）
-            "content": str,     # 转写文字
-            "gap_after": float, # 与下一条 speech 的间隔秒数
-            "confidence": float,# ASR 置信度
-            "metadata": dict    # 扩展字段（如 char_timestamps）
-        },
+    "source": str,              # 源视频路径（供流水线解析；智能层不剪片）
+    "tokens": [                 # 句级句面，稠密 index 0..n-1
+        {"index": int, "text": str},
         ...
     ]
 }
 
-## 输出 Schema (layer2.json)
+可选顶层字段（若存在则带入 manifest）：``language``、``raw_text``。
+
+``goal`` 由 CLI/API 参数传入，不来自 JSON2。
+
+## 输出 Schema (layer2.json / JSON3)
 {
-    "keep_mask": [              # 决策掩码列表
-        {
-            "index": int,       # 对应 annotations[].index
-            "keep": bool        # True=保留, False=删除
-        },
+    "keep_mask": [
+        {"index": int, "keep": bool},
         ...
     ]
 }
 
 ## 数据流
-layer1.json
-  ↓ 加载
-manifest_dict (内存对象)
-  ↓ 2a 理解子阶段
-manifest_dict["comprehension"]
-  ↓ 2b 决策子阶段
-manifest_dict["keep_mask"]
-  ↓ 2c 审核子阶段
-manifest_dict["review_report"]
-  ↓ 2d 人工子阶段
-manifest_dict["keep_mask"] (最终版)
-  ↓ 保存
-layer2.json
+JSON2 → manifest(tokens) → 2a → 2b → 2c → 2d → JSON3
+
+执行层（L3）仍使用 **JSON1 + JSON3** 合成时间区间；时间轴不经过 L2 入口。
 
 ## 核心不变量
-- index 序列是主坐标系，所有处理围绕它展开
-- keep_mask 长度必须等于 annotations 长度
-- keep_mask 与 annotations 通过 index 一一对应
+- ``tokens[i].index == i``；``keep_mask`` 与 ``tokens`` 等长且 index 对齐
 """
 
 import json
@@ -67,135 +45,67 @@ from autosmartcut.intelligence_2a import run_2a_comprehension
 from autosmartcut.intelligence_2b import run_2b_decision
 from autosmartcut.intelligence_2c import run_2c_review
 from autosmartcut.intelligence_2d import run_2d_human_review
+from autosmartcut.layer2_tokens import load_layer2_tokens_document
 
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# 文件 I/O
-# ============================================================================
-
-def load_layer1_json(path: Path) -> dict[str, Any]:
-    """加载 Layer 1 输出的 JSON 文件
-
-    Args:
-        path: layer1.json 文件路径
-
-    Returns:
-        包含 annotations、source、language、raw_text 的字典
-
-    Raises:
-        FileNotFoundError: 文件不存在
-        json.JSONDecodeError: JSON 格式错误
-    """
-    if not path.exists():
-        raise FileNotFoundError(f"Layer 1 输出文件不存在: {path}")
-
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 def save_layer2_json(keep_mask: list[dict], output_path: Path) -> None:
-    """保存 Layer 2 输出的 keep_mask JSON 文件
-
-    Args:
-        keep_mask: 决策掩码列表 [{"index": int, "keep": bool}, ...]
-        output_path: 输出文件路径
-
-    输出格式:
-        {
-            "keep_mask": [
-                {"index": 0, "keep": true},
-                {"index": 1, "keep": false},
-                ...
-            ]
-        }
-    """
+    """保存 Layer 2 输出的 keep_mask JSON 文件（JSON3）。"""
     output = {"keep_mask": keep_mask}
-
-    # 确保输出目录存在
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
 
 
-# ============================================================================
-# 主入口
-# ============================================================================
-
 def run_intelligence_layer(
-    layer1_path: Path,
+    layer2_input_path: Path,
     output_path: Path,
     goal: str = "",
     *,
     auto: bool = False,
     verbose_log: bool = False,
+    two_b_mode: str = "single",
 ) -> None:
-    """Layer 2 主入口（文件交接模式）
-
-    执行流程:
-        1. 加载 Layer 1 输出（annotations）
-        2. 验证输入格式
-        3. 依次执行 2a → 2b → 2c → 2d（auto=True 时跳过 2d）
-        4. 验证输出格式
-        5. 保存 keep_mask 到文件
+    """Layer 2 主入口（JSON2 → JSON3）
 
     Args:
-        layer1_path: Layer 1 输出的 JSON 文件路径
-        output_path: Layer 2 输出的 JSON 文件路径
-        goal: 用户指定的分析目标（如"提取核心观点"）
-        auto: True 时跳过 2d，直接使用 2b 的 keep_mask
-        verbose_log: 未配置流水线日志时，是否启用 DEBUG 级 stderr 日志
-
-    Raises:
-        ValueError: 输入格式错误或输出验证失败
-        FileNotFoundError: 输入文件不存在
+        layer2_input_path: JSON2 路径（``tokens[]`` + 可选 ``source``）
+        output_path: JSON3 输出路径
+        goal: 用户指定的分析/剪辑目标
+        auto: True 时跳过 2d
+        verbose_log: 是否启用 DEBUG 级 stderr 日志
+        two_b_mode: ``single`` | ``chunked``
     """
     from autosmartcut.log import ensure_autosmartcut_logging
 
     ensure_autosmartcut_logging(verbose=verbose_log)
 
-    logger.info("[L2] 智能层开始 输入=%s 输出=%s", layer1_path, output_path)
+    logger.info("[L2] 智能层开始 输入(JSON2)=%s 输出(JSON3)=%s", layer2_input_path, output_path)
     if goal:
         logger.info("[L2] 目标: %s", goal)
+    if two_b_mode not in ("single", "chunked"):
+        raise ValueError(f"two_b_mode 须为 'single' 或 'chunked'，实际: {two_b_mode!r}")
+    logger.info("[L2] 2b 模式: %s", two_b_mode)
 
-    # 1. 加载 Layer 1 输出
-    layer1_data = load_layer1_json(layer1_path)
-    annotations = layer1_data.get("annotations", [])
+    doc = load_layer2_tokens_document(layer2_input_path)
+    tokens = doc["tokens"]
 
-    # 验证输入
-    if not annotations:
-        raise ValueError("Layer 1 输出中没有 annotations")
+    logger.info("[L2] 加载 %d 条 tokens", len(tokens))
 
-    # 验证 index 连续性
-    for i, ann in enumerate(annotations):
-        if ann.get("index") != i:
-            raise ValueError(f"annotations[{i}] 的 index 不连续: 期望 {i}, 实际 {ann.get('index')}")
-
-    logger.info("[L2] 加载 %d 条标注", len(annotations))
-
-    # 2. 初始化工作数据（MVP 阶段直接用 dict，避免 dataclass 转换复杂度）
-    manifest_dict = {
-        "annotations": annotations,
+    manifest_dict: dict[str, Any] = {
+        "tokens": tokens,
         "goal": goal,
-        "source": layer1_data.get("source", ""),
-        "language": layer1_data.get("language", ""),
-        "raw_text": layer1_data.get("raw_text", ""),
+        "source": doc.get("source", ""),
+        "language": doc.get("language", ""),
+        "raw_text": doc.get("raw_text", ""),
     }
 
-    # 3. 执行各子阶段
     try:
-        # 2a 理解子阶段（固定两轮 LLM 调用）
         manifest_dict = run_2a_comprehension(manifest_dict)
-
-        # 2b 决策子阶段（固定一次 LLM 调用）
-        manifest_dict = run_2b_decision(manifest_dict)
-
-        # 2c 审核子阶段（MVP 占位，自动 pass）
+        manifest_dict = run_2b_decision(manifest_dict, mode=two_b_mode)
         manifest_dict = run_2c_review(manifest_dict)
 
-        # 2d 人工子阶段（CLI 交互；auto 时跳过）
         if auto:
             logger.info("[L2] auto 模式，跳过 2d 人工审阅")
             manifest_dict.setdefault("human_feedback_history", []).append(
@@ -217,18 +127,16 @@ def run_intelligence_layer(
         logger.error("[L2] 执行失败: %s", e)
         raise
 
-    # 4. 提取 keep_mask 并验证
     keep_mask = manifest_dict.get("keep_mask", [])
 
     if not keep_mask:
         raise ValueError("智能层未生成 keep_mask")
 
-    if len(keep_mask) != len(annotations):
+    if len(keep_mask) != len(tokens):
         raise ValueError(
-            f"keep_mask 长度不匹配: {len(keep_mask)} != {len(annotations)}"
+            f"keep_mask 长度不匹配: {len(keep_mask)} != {len(tokens)}"
         )
 
-    # 验证 keep_mask 格式
     for i, entry in enumerate(keep_mask):
         if "index" not in entry:
             raise ValueError(f"keep_mask[{i}] 缺少 index 字段")
@@ -237,42 +145,32 @@ def run_intelligence_layer(
         if entry["index"] != i:
             raise ValueError(f"keep_mask[{i}] 的 index 不匹配: 期望 {i}, 实际 {entry['index']}")
 
-    # 5. 保存输出
     save_layer2_json(keep_mask, output_path)
 
     keep_count = sum(1 for e in keep_mask if e["keep"] is True)
     logger.info(
-        "[L2] 完成 保留 %d/%d 片段 → %s",
+        "[L2] 完成 保留 %d/%d 句 → %s",
         keep_count,
         len(keep_mask),
         output_path,
     )
 
 
-# ============================================================================
-# 测试入口
-# ============================================================================
-
-def main():
-    """命令行测试入口
-
-    用法:
-        python -m autosmartcut.intelligence <layer1.json> <output.json> [--goal 目标]
-
-    示例:
-        python -m autosmartcut.intelligence layer1.json layer2.json --goal "提取核心观点"
-    """
+def main() -> None:
+    """命令行入口：``python -m autosmartcut.intelligence <JSON2> <JSON3> ...``"""
     import sys
 
     if len(sys.argv) < 3:
-        print("用法: python -m autosmartcut.intelligence <layer1.json> <output.json> [--goal 目标] [--auto] [--verbose]")
+        print(
+            "用法: python -m autosmartcut.intelligence <layer2_input.json> <output.json> "
+            "[--goal 目标] [--auto] [--verbose] [--two-b-mode single|chunked]"
+        )
         print("\n示例:")
-        print("  python -m autosmartcut.intelligence layer1.json layer2.json")
-        print("  python -m autosmartcut.intelligence layer1.json layer2.json --goal '提取核心观点'")
-        print("  python -m autosmartcut.intelligence layer1.json layer2.json --auto")
+        print("  python -m autosmartcut.intelligence output/layer2_input.json output/layer2_output.json")
+        print("  python -m autosmartcut.intelligence output/layer2_input.json out.json --goal '提取核心观点' --auto")
         sys.exit(1)
 
-    layer1_path = Path(sys.argv[1])
+    layer2_path = Path(sys.argv[1])
     output_path = Path(sys.argv[2])
 
     goal = ""
@@ -283,14 +181,20 @@ def main():
 
     auto = "--auto" in sys.argv
     verbose_log = "--verbose" in sys.argv
+    two_b_mode = "single"
+    if "--two-b-mode" in sys.argv:
+        i = sys.argv.index("--two-b-mode")
+        if i + 1 < len(sys.argv):
+            two_b_mode = sys.argv[i + 1]
 
     try:
         run_intelligence_layer(
-            layer1_path,
+            layer2_path,
             output_path,
             goal,
             auto=auto,
             verbose_log=verbose_log,
+            two_b_mode=two_b_mode,
         )
     except Exception as e:
         print(f"\n错误: {e}")

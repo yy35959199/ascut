@@ -23,7 +23,7 @@
   +=============+==========================================+================+
   | 1（默认）    | L1 识别 → L2 智能 → L3 执行               | 从原始视频全流程 |
   +-------------+------------------------------------------+----------------+
-  | 2           | 跳过 L1；L2 → L3                          | 已有 JSON1      |
+  | 2           | 跳过 L1；L2 → L3                          | 已有 **JSON2**（及 L3 所需的 JSON1） |
   +-------------+------------------------------------------+----------------+
   | 3           | 跳过 L1、L2；仅 L3                        | 已有 JSON1+JSON3|
   +-------------+------------------------------------------+----------------+
@@ -31,17 +31,16 @@
   阶段与代码对应：
 
   - **L1**：``run_perception_layer`` — ASR / 对齐 / 句级标注，写出 JSON1（及 JSON2 辅助文件）。
-  - **L2**：``run_intelligence_layer`` — LLM + 可选 2d；写出 JSON3（``keep_mask``）。
+  - **L2**：``run_intelligence_layer`` — 读 **JSON2**（``tokens[]``），LLM + 可选 2d；写出 JSON3。
   - **L3**：``run_execution_layer`` — 读 JSON1+JSON3，smartcut 出成片。
 
   **互斥约束（由 ``_validate_run_args`` 强制）：**
 
-  - ``from-stage 1``：必须 ``--input``；**不得**出现 ``--layer1-json`` / ``--layer3-json``。
-  - ``from-stage 2``：必须 ``--layer1-json``；**不得** ``--input``、``--layer3-json``。
+  - ``from-stage 1``：必须 ``--input``；**不得**出现 ``--layer1-json`` / ``--layer2-json`` / ``--layer3-json``。
+  - ``from-stage 2``：必须 ``--layer2-json``；**不得** ``--input``、``--layer3-json``；``--layer1-json`` **可选**（默认 JSON2 同目录下的 ``layer1_annotations.json``）。
   - ``from-stage 3``：必须 ``--layer1-json`` 与 ``--layer3-json``；**不得** ``--input``。
 
-  从 stage 2/3 开始时，**源视频路径**一律从 JSON1 字段 ``source`` 解析（与
-  ``execution.resolve_media_path`` 一致：绝对路径、相对 JSON1 目录、相对 CWD）。
+  **源视频路径：** ``from-stage 2`` 时从 **JSON2** 的 ``source`` 解析（见 ``layer2_tokens.video_path_from_tokens_json``，语义与执行层一致）；``from-stage 3`` 时从 **JSON1** 的 ``source`` 解析。
 
 ================================================================================
 各参数含义与约束（按类别）
@@ -55,9 +54,13 @@
   --input PATH
       **仅 from-stage 1**。输入视频文件；将用于 L1 解码与写入 JSON1 的 ``source``。
 
+  --layer2-json PATH
+      **仅 from-stage 2 必填**。智能层句面输入 JSON2（如 ``layer2_input.json``），须含
+      稠密 ``tokens[]``（``index`` + ``text``）及 ``source``（供解析视频路径）。
+
   --layer1-json PATH
-      **from-stage 2 或 3 必填**。Layer1 产出的 JSON1（如 ``layer1_annotations.json``），
-      须含 ``annotations[]``、``source`` 等契约字段。
+      **from-stage 3 必填**；**from-stage 2 可选**（省略则使用 ``<JSON2 所在目录>/layer1_annotations.json``）。
+      JSON1 须含 ``annotations[]``、``source`` 等契约字段，供 L3 时间轴。
 
   --layer3-json PATH
       **仅 from-stage 3 必填**。Layer2 产出 JSON3，顶层含 ``keep_mask[]``，与 JSON1
@@ -72,7 +75,8 @@
   --output-dir PATH
       产物目录（日志、可选 JSON、**最终成片**均相对此目录，除非 JSON 路径显式在外）。
       - stage 1 且省略：``<视频父目录>/ascut_out_<ULID 前 8 位>``。
-      - stage 2/3 且省略：**默认 JSON1 文件所在目录**。
+      - stage 2 且省略：**JSON2 文件所在目录**。
+      - stage 3 且省略：**JSON1 文件所在目录**。
 
   --output-name BASENAME
       仅最终**视频文件名**（须含扩展名，如 ``out.mp4``）；禁止路径分隔符（实现中会取
@@ -84,6 +88,10 @@
   --interactive-2d
       若指定：跑 2d CLI 人工改 ``keep_mask``；**默认不指定** = auto，跳过 2d，
       直接使用 2b 的 ``keep_mask``。
+
+  --two-b-mode {single,chunked}
+      **默认 single**。``single``：2b 单次全文结构化 LLM；``chunked``：按 2a
+      ``outline_blocks`` 分块多次 LLM，再合并 ``keep_mask``（便于与 single 对照）。
 
 【配置与 L1 模型（stage 1 才真正跑 L1；其它阶段可忽略但仍可出现在命令行）】
 
@@ -116,9 +124,9 @@
   ascut run --input samples\\alxe_01.mp4 --output-dir output --output-name final.mp4
   ascut run --input samples\\alxe_01.mp4 --goal "提取核心观点" --verbose
 
-  # --- Stage 2：已有 JSON1，只跑智能层 + 执行层 ---
-  ascut run --from-stage 2 --layer1-json output\\layer1_annotations.json --goal "精华剪辑"
-  ascut run --from-stage 2 --layer1-json D:\\data\\l1.json --output-dir D:\\out --output-name cut.mp4
+  # --- Stage 2：已有 JSON2（句面），只跑智能层 + 执行层（JSON1 同目录或 --layer1-json）---
+  ascut run --from-stage 2 --layer2-json output\\layer2_input.json --goal "精华剪辑"
+  ascut run --from-stage 2 --layer2-json D:\\out\\layer2_input.json --layer1-json D:\\out\\layer1_annotations.json
 
   # --- Stage 3：已有 JSON1 与 JSON3（keep_mask），只跑执行层 ---
   ascut run --from-stage 3 ^
@@ -155,15 +163,19 @@ def _validate_run_args(parser: argparse.ArgumentParser, args: argparse.Namespace
 	if stage == 1:
 		if args.input is None:
 			parser.error("--from-stage 1（默认）时必须提供 --input")
-		if args.layer1_json is not None or args.layer3_json is not None:
-			parser.error("--from-stage 1 时不要使用 --layer1-json / --layer3-json")
+		if (
+			args.layer1_json is not None
+			or args.layer2_json is not None
+			or args.layer3_json is not None
+		):
+			parser.error("--from-stage 1 时不要使用 --layer1-json / --layer2-json / --layer3-json")
 	elif stage == 2:
-		if args.layer1_json is None:
-			parser.error("--from-stage 2 时必须提供 --layer1-json")
+		if args.layer2_json is None:
+			parser.error("--from-stage 2 时必须提供 --layer2-json（JSON2 句面，L2 唯一输入）")
 		if args.layer3_json is not None:
 			parser.error("--from-stage 2 时不要提供 --layer3-json（由 L2 生成）")
 		if args.input is not None:
-			parser.error("--from-stage 2 时不要提供 --input（源视频从 JSON1 的 source 解析）")
+			parser.error("--from-stage 2 时不要提供 --input（源视频从 JSON2 的 source 解析）")
 	elif stage == 3:
 		if args.layer1_json is None or args.layer3_json is None:
 			parser.error("--from-stage 3 时必须同时提供 --layer1-json 与 --layer3-json")
@@ -187,7 +199,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 		type=int,
 		choices=[1, 2, 3],
 		default=1,
-		help="1=全流程 L1→L2→L3；2=从智能层起（需已有 JSON1）；3=从执行层起（需 JSON1+JSON3）",
+		help="1=全流程 L1→L2→L3；2=从智能层起（需 JSON2，L3 需 JSON1）；3=从执行层起（需 JSON1+JSON3）",
 	)
 	pr.add_argument(
 		"--input",
@@ -196,10 +208,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 		help="输入视频（仅 --from-stage 1 需要）",
 	)
 	pr.add_argument(
+		"--layer2-json",
+		type=Path,
+		default=None,
+		help="JSON2 句面路径 layer2_input.json（仅 --from-stage 2，智能层唯一输入）",
+	)
+	pr.add_argument(
 		"--layer1-json",
 		type=Path,
 		default=None,
-		help="Layer1 输出 JSON1 路径（--from-stage 2 或 3）",
+		help="JSON1 时间轴（--from-stage 2 可选，默认产物目录下 layer1_annotations.json；--from-stage 3 必填）",
 	)
 	pr.add_argument(
 		"--layer3-json",
@@ -224,6 +242,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 		"--interactive-2d",
 		action="store_true",
 		help="启用 2d CLI 人工审阅；默认跳过（auto）",
+	)
+	pr.add_argument(
+		"--two-b-mode",
+		type=str,
+		choices=["single", "chunked"],
+		default="single",
+		help="智能层 2b：single=单次全文 LLM；chunked=按 2a 分块多次 LLM 合并（对照实验）",
 	)
 	pr.add_argument(
 		"--config",
@@ -316,9 +341,10 @@ def _build_run(args: argparse.Namespace) -> PipelineRun:
 		)
 	if args.from_stage == 2:
 		return PipelineRun.from_stage2(
-			layer1_json=args.layer1_json,
+			layer2_tokens_json=args.layer2_json,
 			goal=args.goal,
 			output_dir=args.output_dir,
+			layer1_json=args.layer1_json,
 			output_video_name=args.output_name,
 		)
 	return PipelineRun.from_stage3(
@@ -369,11 +395,12 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 
 		if stage <= 2:
 			run_intelligence_layer(
-				run.json1_path,
+				run.tokens_json_path,
 				run.json3_path,
 				run.goal,
 				auto=auto,
 				verbose_log=args.verbose,
+				two_b_mode=args.two_b_mode,
 			)
 
 		run_execution_layer(

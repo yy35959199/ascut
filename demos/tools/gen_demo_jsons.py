@@ -1,7 +1,10 @@
-"""Generate demo JSON artifacts.
+"""从 Demo1 完整 JSON 生成 layer1 / layer2_input / mock JSON3。
 
-Production JSON1 / JSON2 generation reuses autosmartcut.perception.
-Only the mock JSON3 keep-mask generation remains in this demo helper.
+非 L1/L2/L3 演示环节本身，属辅助工具；与 ``demo1_asr.py`` / ``demo2_llm.py`` / ``demo3_smartcut.py`` 并列时放在 ``demos/tools/``。
+
+用法（在仓库根目录、已安装包）::
+
+    python demos/tools/gen_demo_jsons.py
 """
 from __future__ import annotations
 

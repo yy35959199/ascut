@@ -5,6 +5,7 @@
 > 设计演进过程和变更说明见 [intelligence-decisions.md](intelligence-decisions.md)。
 >
 > **说明（MVP）**：当前 MVP 的 Layer 2 实现与评审以 [intelligence-layer2-mvp.md](intelligence-layer2-mvp.md) 为准。本文保留为历史/完整版设计参考，不作为当前 MVP 的直接实现依据。  
+> **补充（工程现状）**：现行代码中 L2 **文件入口为 JSON2**（`manifest["tokens"]`），下文若写「`manifest.annotations[]` 进 2a/2b」请视为历史叙事；以 MVP 文档与 `intelligence_*.py` 为准。  
 > **冲突处理**：凡本文与 intelligence-layer2-mvp 不一致之处（例如状态机中的 **`symbol_table` 固化**、**2d 后编译 `edl[]`**、**`segments` 嵌套 `keep_mask`**、2a 直接 LLM 输出整表 `cleaned_annotations` 等），**均以 intelligence-layer2-mvp 与 [AutoSmartCut-MVP.md](AutoSmartCut-MVP.md) 修订版为准**；下文状态机与 §4 起可视为**完整版草图**。
 
 ---

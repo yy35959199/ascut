@@ -244,7 +244,7 @@ flowchart TD
 
 #### 2a — 理解子阶段（Comprehension）
 
-**MVP 现行：** LLM 输入统一为 `build_layer2_input_document` 产出的 **`tokens[]`（仅 `index` + `text`）** + `goal`。R1（内存）：`purpose_rough`、`outline_blocks_rough`、`candidate_misrecognitions`。R2（内存）：`purpose`、`outline_blocks`、`corrections`。随后**程序**按 `corrections` 生成持久化 **`cleaned_annotations[]`**，不改写 `annotations[].content`。中间结构不落盘。详见 [intelligence-layer2-mvp.md](intelligence-layer2-mvp.md) §5。
+**MVP 现行：** LLM 句面统一为 **JSON2**（或与 `build_layer2_input_document` 等价的 **`tokens[]`**，仅 `index` + `text`）+ `goal`。R1（内存）：`purpose_rough`、`outline_blocks_rough`、`candidate_misrecognitions`。R2（内存）：`purpose`、`outline_blocks`、`corrections`。随后**程序**按 `corrections` 在 **`tokens[].text`** 上生成稠密 **`cleaned_annotations[]`**，**不**改写磁盘 JSON1，**不**修改已加载的 `tokens[]` 原文。中间结构不落盘。详见 [intelligence-layer2-mvp.md](intelligence-layer2-mvp.md) §5。
 
 ---
 

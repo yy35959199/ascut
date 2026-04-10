@@ -1,22 +1,19 @@
 """Layer 2 / 2a 理解子阶段（MVP 契约见 doc/intelligence-layer2-mvp.md §5）
 
 ## 流程
-1. **tokens**：`build_layer2_input_document({"source", "annotations"})["tokens"]`，
-   每项仅 `index` + `text`，不含 t_start/t_end/gap_after 等执行层字段。
+1. **tokens**：manifest 中 ``tokens[]``，每项仅 ``index`` + ``text``（JSON2 句面）。
 2. **R1（LLM，仅内存）**：`purpose_rough`、`outline_blocks_rough`、
    `candidate_misrecognitions`。
 3. **R2（LLM，仅内存）**：`purpose`、`outline_blocks`、`corrections`
    （唯一替换列表，nth 1-based）。
-4. **程序**：按 `corrections` 先生成稀疏变化集，再回填为稠密
-   `cleaned_annotations[]`（全量 index），**不**改写 `annotations[].content`
-   （Append-only）。
+4. **程序**：按 `corrections` 在 **只读句面**（``tokens[].text``）上替换，生成稠密
+   `cleaned_annotations[]`；**不**改写 ``tokens``（Append-only）。
 
 LLM 调用封装：`autosmartcut.intelligence_llm.call_llm_structured`。
 
 ## 输入（manifest 片段）
-- `annotations[]`：句级语音（index、t_start、t_end、content、gap_after 等）。
+- `tokens[]`：句级句面（index、text）。
 - `goal`：可选。
-- `source`：可选，传入 `build_layer2_input_document`。
 
 ## 输出（写入 manifest）
 manifest_dict["comprehension"] = {
@@ -25,11 +22,10 @@ manifest_dict["comprehension"] = {
     "cleaned_annotations": [{"annotation_index", "cleaned_content"}, ...],  # 稠密；程序生成
 }
 
-不持久化 R1/R2 中间结构（candidate_misrecognitions、corrections、outline_blocks_rough）；
-不写入 symbol_table。
+不持久化 R1/R2 中间结构；不写入 symbol_table。
 
 ## 注意
-- cleaned_annotations 为稠密序列，长度与 annotations 一致。
+- cleaned_annotations 为稠密序列，长度与 tokens 一致（字段名沿用 MVP ``annotation_index``）。
 """
 
 from collections import defaultdict
@@ -37,7 +33,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from autosmartcut.intelligence_llm import call_llm_structured
-from autosmartcut.perception import build_layer2_input_document
+from autosmartcut.layer2_tokens import validate_tokens
 
 
 # ============================================================================
@@ -74,22 +70,16 @@ def run_2a_comprehension(manifest_dict: dict) -> dict:
     """2a 理解子阶段：两轮 LLM + 稀疏纠错 + 稠密回填
 
     Args:
-        manifest_dict: 包含 annotations、goal、source 的工作数据
+        manifest_dict: 包含 ``tokens``（JSON2 句面）、``goal``、可选 ``source`` 的工作数据
 
     Returns:
         追加了 comprehension 字段的 manifest_dict
     """
     print("[2a] 理解子阶段开始")
 
-    annotations = manifest_dict["annotations"]
+    tokens = manifest_dict["tokens"]
+    validate_tokens(tokens)
     goal = manifest_dict.get("goal", "")
-
-    # 构造 tokens（仅 index + text，不含时间戳等执行层字段）
-    layer2_doc = build_layer2_input_document({
-        "source": manifest_dict.get("source", ""),
-        "annotations": annotations,
-    })
-    tokens = layer2_doc["tokens"]
 
     # Round 1: 粗理解 + ASR 误识候选
     purpose_rough, outline_blocks_rough, candidate_misrecognitions = _run_round1(
@@ -101,19 +91,16 @@ def run_2a_comprehension(manifest_dict: dict) -> dict:
         tokens, goal, purpose_rough, outline_blocks_rough, candidate_misrecognitions
     )
 
-    # 程序步骤使用只读视图，防止误改上游原文。
-    # key=index, value=原始 content（immutable string）
-    annotation_content_view = MappingProxyType(
-        {ann["index"]: ann.get("content", "") for ann in annotations}
+    # 程序步骤：只读句面为 tokens[].text，不修改 tokens
+    token_text_view = MappingProxyType(
+        {int(t["index"]): str(t.get("text", "")) for t in tokens}
     )
 
-    # 程序步骤 1：按 corrections 在原文上锚定并一次性替换，生成稀疏变化集
     sparse_cleaned_annotations = _build_sparse_cleaned_annotations(
-        annotation_content_view, raw_corrections
+        token_text_view, raw_corrections
     )
-    # 程序步骤 2：将稀疏变化集回填为稠密 cleaned_annotations（全量 index）
-    cleaned_annotations = _densify_cleaned_annotations(
-        annotations, sparse_cleaned_annotations
+    cleaned_annotations = _densify_cleaned_annotations_from_tokens(
+        tokens, sparse_cleaned_annotations
     )
 
     manifest_dict["comprehension"] = {
@@ -490,13 +477,13 @@ def _apply_corrections_to_sentence(
 
 
 def _build_sparse_cleaned_annotations(
-    annotation_content_view: dict[int, str],
+    token_text_view: dict[int, str],
     raw_corrections: list[dict],
 ) -> list[dict]:
     """按 index 分组 corrections，逐句应用，生成稀疏 cleaned_annotations。
 
     Args:
-        annotation_content_view: 只读的 index->content 视图
+        token_text_view: 只读的 index -> 句面原文（来自 ``tokens[].text``）
         raw_corrections: R2 输出的纠错列表
                          [{"index": int, "old": str, "nth": int, "new": str}, ...]
 
@@ -513,9 +500,9 @@ def _build_sparse_cleaned_annotations(
 
     cleaned: list[dict] = []
     for ann_index, corrs in grouped.items():
-        original = annotation_content_view.get(ann_index)
+        original = token_text_view.get(ann_index)
         if original is None:
-            print(f"[2a] 警告: corrections 中 index={ann_index} 不存在于 annotations，跳过")
+            print(f"[2a] 警告: corrections 中 index={ann_index} 不存在于 tokens，跳过")
             continue
         try:
             result = _apply_corrections_to_sentence(original, corrs)
@@ -529,16 +516,16 @@ def _build_sparse_cleaned_annotations(
     return cleaned
 
 
-def _densify_cleaned_annotations(
-    annotations: list[dict],
+def _densify_cleaned_annotations_from_tokens(
+    tokens: list[dict],
     sparse_cleaned_annotations: list[dict],
 ) -> list[dict]:
-    """将稀疏 cleaned_annotations 回填为稠密全量序列。
+    """将稀疏 cleaned_annotations 回填为稠密全量序列（与 ``tokens`` 等长）。
 
     规则：
     - 若某 index 在 sparse_cleaned_annotations 中，使用对应 cleaned_content。
-    - 否则回填 annotations[].content 原文。
-    - 输出长度与 annotations 一致，且 annotation_index 与 annotations[].index 对齐。
+    - 否则回填 ``tokens[i].text``。
+    - ``annotation_index`` 字段名沿用 MVP 契约，与 ``tokens[].index`` 对齐。
     """
     sparse_map = {
         int(item["annotation_index"]): item["cleaned_content"]
@@ -546,16 +533,16 @@ def _densify_cleaned_annotations(
     }
 
     dense: list[dict] = []
-    for i, ann in enumerate(annotations):
-        ann_index = int(ann["index"])
+    for i, tok in enumerate(tokens):
+        ann_index = int(tok["index"])
         if ann_index != i:
             raise ValueError(
-                f"annotations index 不连续，无法构造稠密 cleaned_annotations: "
+                f"tokens index 不连续，无法构造稠密 cleaned_annotations: "
                 f"位置{i} 实际 index={ann_index}"
             )
         dense.append({
             "annotation_index": ann_index,
-            "cleaned_content": sparse_map.get(ann_index, ann.get("content", "")),
+            "cleaned_content": sparse_map.get(ann_index, str(tok.get("text", ""))),
         })
 
     return dense

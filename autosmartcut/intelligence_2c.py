@@ -30,13 +30,7 @@ manifest_dict = {
             "keep": bool
         }
     ],
-    "annotations": [            # 来自 Layer 1
-        {
-            "index": int,
-            "content": str,
-            ...
-        }
-    ]
+    "tokens": [ {"index": int, "text": str}, ... ]  # JSON2 句面
 }
 
 ## 输出 Schema
@@ -74,7 +68,7 @@ def run_2c_review(manifest_dict: dict) -> dict:
     """2c 审核子阶段：MVP 阶段自动生成 pass 占位报告
 
     Args:
-        manifest_dict: 包含 comprehension、keep_mask、annotations 的工作数据
+        manifest_dict: 包含 comprehension、keep_mask、tokens 的工作数据
 
     Returns:
         追加了 review_report 字段的 manifest_dict
@@ -115,7 +109,7 @@ def run_2c_review_full(manifest_dict: dict) -> dict:
     - fix_checklist: checklist 遗漏了重要内容维度
 
     Args:
-        manifest_dict: 包含 comprehension、keep_mask、annotations 的工作数据
+        manifest_dict: 包含 comprehension、keep_mask、tokens 的工作数据
 
     Returns:
         追加了 review_report 字段的 manifest_dict
@@ -152,7 +146,7 @@ def _extract_kept_annotations(manifest_dict: dict) -> list[dict]:
     """提取当前保留的 speech 片段（未来实现）
 
     Args:
-        manifest_dict: 包含 annotations 和 keep_mask
+        manifest_dict: 包含 tokens 和 keep_mask
 
     Returns:
         保留的 speech 标注列表
