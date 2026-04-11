@@ -48,10 +48,12 @@ from ulid import ULID
 from autosmartcut.config import load_config
 from autosmartcut.manifest_io import make_manifest_skeleton, save_manifest, touch_layer_status
 from autosmartcut.perception import (
+	AUDIO_16K_WAV_NAME,
 	build_layer1_document,
 	compact_annotations,
 	duration_seconds,
-	load_audio_mono,
+	extract_audio_16k_wav,
+	read_audio_16k_wav,
 )
 
 def parse_args() -> argparse.Namespace:
@@ -217,9 +219,11 @@ def main() -> None:
 		raise FileNotFoundError(f"Forced aligner model not found: {args.forced_aligner}")
 
 	model = _build_model(args)
-	print("[demo1] loading audio via PyAV...")
-	audio_arr, audio_sr = load_audio_mono(args.input)
-	print(f"[demo1] audio loaded: {audio_arr.shape[0]/audio_sr:.1f}s @ {audio_sr}Hz")
+	wav_path = args.output.parent / AUDIO_16K_WAV_NAME
+	print(f"[demo1] extracting 16k mono audio → {wav_path} ...")
+	extract_audio_16k_wav(args.input, wav_path)
+	audio_arr, audio_sr = read_audio_16k_wav(wav_path)
+	print(f"[demo1] audio ready: {audio_arr.shape[0]/audio_sr:.1f}s @ {audio_sr}Hz")
 	results = model.transcribe(
 		audio=(audio_arr, audio_sr),
 		language=args.language,
@@ -264,6 +268,9 @@ def main() -> None:
 	manifest["language"] = light_doc["language"]
 	manifest["raw_text"] = light_doc["raw_text"]
 	manifest["annotations"] = light_doc["annotations"]
+	sm0 = manifest.get("source_media")
+	if isinstance(sm0, dict):
+		sm0["audio_16k_path"] = AUDIO_16K_WAV_NAME
 	touch_layer_status(manifest, "l1")
 	manifest_path = args.output.parent / "timeline_manifest.json"
 	save_manifest(manifest_path, manifest, atomic=True)

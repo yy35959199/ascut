@@ -9,6 +9,7 @@ description = "Semantic video cutting pipeline"
 requires-python = ">=3.11"
 dependencies = [
     "python-ulid>=3.1.0",  # autosmartcut.pipeline_run (from ulid import ULID)
+    "soundfile>=0.12",
     "qwen-asr",
     "smartcut",
     "jsonschema>=4,<5",

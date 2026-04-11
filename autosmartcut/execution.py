@@ -42,6 +42,20 @@ def resolve_media_path(source: str, ref_json: Path) -> Path:
     raise FileNotFoundError(f"找不到源视频: {source}（相对 {ref_json.parent} 或当前工作目录）")
 
 
+def resolved_audio_16k_path(
+    manifest_data: dict[str, Any], manifest_path: Path
+) -> Path | None:
+    """若 ``source_media.audio_16k_path`` 存在且可读，返回绝对路径；否则 ``None``。"""
+    sm = manifest_data.get("source_media")
+    if not isinstance(sm, dict):
+        return None
+    rel = sm.get("audio_16k_path")
+    if not isinstance(rel, str) or not rel.strip():
+        return None
+    cand = (manifest_path.parent / rel.strip()).resolve()
+    return cand if cand.is_file() else None
+
+
 def positive_segments_from_annotations(
     annotations: list[dict[str, Any]],
     keep_mask: list[dict[str, Any]],
@@ -53,6 +67,7 @@ def positive_segments_from_annotations(
     gap_after_cap: float | None = None,
     config: AppConfig | None = None,
     vad_snap_disabled_by_cli: bool = False,
+    audio_16k_path: Path | None = None,
 ):
     """
     从句级 annotations 与 keep_mask 生成 positive_segments。
@@ -81,7 +96,10 @@ def positive_segments_from_annotations(
             from autosmartcut.vad_silence import silence_intervals_for_video
 
             silence_intervals = silence_intervals_for_video(
-                video, duration, cfg.execution
+                video,
+                duration,
+                cfg.execution,
+                audio_16k_path=audio_16k_path,
             )
             snap_radius = cfg.execution.vad_snap_radius
             logger.info(
@@ -144,6 +162,9 @@ def run_execution_layer(
         raise ValueError("清单缺少 current.keep_mask[]")
 
     video = video_path_from_manifest(data, mp)
+    audio_cache = resolved_audio_16k_path(data, mp)
+    if audio_cache is not None:
+        logger.info("[L3] 复用 L1 缓存音轨 %s", audio_cache.name)
 
     logger.info("[L3] 开始执行层")
     positive, video_resolved, duration = positive_segments_from_annotations(
@@ -156,6 +177,7 @@ def run_execution_layer(
         gap_after_cap=gap_after_cap,
         config=config,
         vad_snap_disabled_by_cli=vad_snap_disabled_by_cli,
+        audio_16k_path=audio_cache,
     )
     if not positive:
         raise ValueError("keep_mask 解析后无保留区间")

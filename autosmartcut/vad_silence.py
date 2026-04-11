@@ -1,6 +1,8 @@
-"""L3：从视频解码 16kHz 单声道波形，Silero VAD → 静音区间；供切点吸附（snap）使用。
+"""L3：16kHz 单声道波形 → Silero VAD → 静音区间；供切点吸附（snap）使用。
 
-不依赖 smartcut；解码逻辑与 perception.load_audio_mono 一致，避免修改 L1 源文件。
+优先读取清单 ``source_media.audio_16k_path`` 指向的 L1 缓存 WAV（与
+:func:`perception.extract_audio_16k_wav` 一致）；缺失时再 PyAV 解码。
+不依赖 smartcut。
 """
 
 from __future__ import annotations
@@ -173,9 +175,19 @@ def silence_intervals_for_video(
 	video_path: Path,
 	video_duration: float,
 	execution_cfg: ExecutionConfig,
+	*,
+	audio_16k_path: Path | None = None,
 ) -> list[tuple[float, float]]:
-	"""解码音轨 → VAD → 静音区间；时间轴以容器 ``video_duration`` 为准（尾静音自然补全）。"""
-	wav = decode_audio_mono_16k_for_vad(video_path, _VAD_SAMPLE_RATE)
+	"""解码音轨（或复用 L1 缓存 WAV）→ VAD → 静音区间；时间轴以 ``video_duration`` 为准。"""
+	if audio_16k_path is not None and audio_16k_path.is_file():
+		import soundfile as sf
+
+		wav, _sr = sf.read(str(audio_16k_path), dtype="float32", always_2d=False)
+		wav = np.asarray(wav, dtype=np.float32)
+		if wav.ndim > 1:
+			wav = np.mean(wav, axis=-1).astype(np.float32)
+	else:
+		wav = decode_audio_mono_16k_for_vad(video_path, _VAD_SAMPLE_RATE)
 	timeline_end = float(video_duration)
 	if timeline_end <= 0:
 		return []

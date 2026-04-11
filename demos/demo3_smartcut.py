@@ -28,7 +28,7 @@ from smartcut.smart_cut import smart_cut
 
 from autosmartcut.annotation_tokens import video_path_from_manifest
 from autosmartcut.config import load_config
-from autosmartcut.execution import positive_segments_from_annotations
+from autosmartcut.execution import positive_segments_from_annotations, resolved_audio_16k_path
 from autosmartcut.manifest_io import load_manifest
 
 
@@ -124,6 +124,7 @@ def run_json(args: argparse.Namespace) -> None:
     if not isinstance(keep_mask, list):
         raise SystemExit("清单缺少 current.keep_mask[]")
     video = video_path_from_manifest(data, mp)
+    audio_cache = resolved_audio_16k_path(data, mp)
 
     positive, video, duration = positive_segments_from_annotations(
         annotations,
@@ -134,6 +135,7 @@ def run_json(args: argparse.Namespace) -> None:
         min_duration=args.min_duration,
         config=cfg,
         vad_snap_disabled_by_cli=args.no_vad_snap,
+        audio_16k_path=audio_cache,
     )
     if not positive:
         raise SystemExit("keep_mask 解析后无保留区间（请检查 cut 比例或源标注）")

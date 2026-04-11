@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 _ASR_SAMPLE_RATE = 16000
 
+# L1 写出、L3 VAD 复用的 16kHz mono float32 WAV（相对 ``timeline_manifest.json`` 所在目录）
+AUDIO_16K_WAV_NAME = "audio_16k.wav"
+
 
 @dataclass(frozen=True)
 class CharItem:
@@ -42,7 +45,11 @@ class SpeechSegment:
 
 
 def load_audio_mono(path: Path, sample_rate: int = _ASR_SAMPLE_RATE) -> tuple[np.ndarray, int]:
-	"""Decode any supported media file into mono float32 PCM at the given rate."""
+	"""Decode any supported media file into mono float32 PCM at the given rate.
+
+	保留作 fallback；主路径使用 :func:`extract_audio_16k_wav` + :func:`read_audio_16k_wav`
+	以降低峰值内存。
+	"""
 	container = av.open(str(path))
 	resampler = av.AudioResampler(format="fltp", layout="mono", rate=sample_rate)
 	chunks: list[np.ndarray] = []
@@ -58,8 +65,50 @@ def load_audio_mono(path: Path, sample_rate: int = _ASR_SAMPLE_RATE) -> tuple[np
 		container.close()
 	if not chunks:
 		return np.zeros(0, dtype=np.float32), sample_rate
-	audio = np.concatenate(chunks).astype(np.float32)
-	return audio, sample_rate
+	# fltp 已是 float32，无需 astype 再拷贝一份
+	return np.concatenate(chunks), sample_rate
+
+
+def extract_audio_16k_wav(
+	media_path: Path,
+	wav_path: Path,
+	*,
+	sample_rate: int = _ASR_SAMPLE_RATE,
+	audio_stream_index: int = 0,
+) -> None:
+	"""PyAV 边解码边写 16kHz mono float32 WAV，避免在内存中堆积整条 PCM。"""
+	import soundfile as sf
+
+	wav_path.parent.mkdir(parents=True, exist_ok=True)
+	container = av.open(str(media_path))
+	resampler = av.AudioResampler(format="fltp", layout="mono", rate=sample_rate)
+	try:
+		with sf.SoundFile(
+			str(wav_path),
+			mode="w",
+			samplerate=sample_rate,
+			channels=1,
+			format="WAV",
+			subtype="FLOAT",
+		) as wav_out:
+			for frame in container.decode(audio=audio_stream_index):
+				for out_frame in resampler.resample(frame):
+					wav_out.write(out_frame.to_ndarray()[0])
+			for out_frame in resampler.resample(None):
+				wav_out.write(out_frame.to_ndarray()[0])
+	finally:
+		container.close()
+
+
+def read_audio_16k_wav(wav_path: Path) -> tuple[np.ndarray, int]:
+	"""读取 L1 产出的 16k mono float32 WAV，供 ASR 与本地校验。"""
+	import soundfile as sf
+
+	audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
+	audio = np.asarray(audio, dtype=np.float32)
+	if audio.ndim > 1:
+		audio = np.mean(audio, axis=-1).astype(np.float32)
+	return audio, int(sr)
 
 
 def duration_seconds(media_path: Path) -> float:
@@ -426,8 +475,10 @@ def run_perception_layer(
 		gpu_memory_utilization=gpu_memory_utilization,
 	)
 
-	logger.info("[L1] PyAV 解码音频…")
-	audio_arr, audio_sr = load_audio_mono(run.video_path)
+	wav_cache = run.output_dir / AUDIO_16K_WAV_NAME
+	logger.info("[L1] PyAV 解码音频 → %s", wav_cache)
+	extract_audio_16k_wav(run.video_path, wav_cache)
+	audio_arr, audio_sr = read_audio_16k_wav(wav_cache)
 	logger.info(
 		"[L1] 音频就绪 %.1fs @ %dHz", audio_arr.shape[0] / audio_sr, audio_sr
 	)
@@ -474,6 +525,8 @@ def run_perception_layer(
 	if isinstance(sm, dict):
 		sm["path"] = light_doc["source"]
 		sm["duration"] = float(duration)
+		# 相对 manifest 父目录，供 L3 VAD 复用，避免二次整轨解码
+		sm["audio_16k_path"] = AUDIO_16K_WAV_NAME
 	touch_layer_status(data, "l1")
 	save_manifest(run.manifest_path, data, atomic=True)
 
