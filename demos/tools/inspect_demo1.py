@@ -1,19 +1,31 @@
-"""快速查看 layer1 JSON 前后若干条与时长统计。
+"""快速查看 timeline_manifest.json 中 annotations 前后若干条与时长统计。
 
-辅助工具，非 L1/L2/L3 环节演示脚本。用法（仓库根目录）::
+辅助工具。用法（仓库根目录）::
 
     python demos/tools/inspect_demo1.py
 """
+import argparse
 import json
 from pathlib import Path
 
 
 def main() -> None:
-    path = Path("outputs/layer1_annotations.json")
+    p = argparse.ArgumentParser(description="查看清单 annotations 摘要")
+    p.add_argument(
+        "--manifest",
+        type=Path,
+        default=Path("outputs/timeline_manifest.json"),
+        help="timeline_manifest.json",
+    )
+    args = p.parse_args()
+    path = args.manifest
     data = json.loads(path.read_text(encoding="utf-8"))
     anns = data["annotations"]
 
-    print("source:", data.get("source", ""))
+    src = data.get("source", "")
+    if not src and isinstance(data.get("source_media"), dict):
+        src = data["source_media"].get("path", "")
+    print("source:", src)
     print("total annotations:", len(anns))
     print()
 

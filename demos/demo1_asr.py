@@ -3,15 +3,13 @@ from __future__ import annotations
 """
 Demo 1：Qwen3-ASR + ForcedAligner + 句级聚合 + gap_after（Layer 1）
 
-与三阶段 I/O 对齐说明：
-  - 写入 ``--output`` 父目录下的标准名（与 Layer 2/3 文档一致）：
-    * layer1_annotations.json — JSON1，供 ``python -m autosmartcut.intelligence`` 或 ``demos/demo2_llm.py``
-    * layer2_input.json — JSON2（tokens: index + text），供核对/外部工具；智能层运行时由内存 build_layer2_input_document 生成
-  - 另写用户指定的精简 JSON（--output）与完整档（*_full.json）、以及同目录 demo2_input.json（与 layer2_input 内容类同，历史文件名）
+输出：
+  - ``--output`` 父目录下 ``timeline_manifest.json``（MVP-mini 主清单，含 ``annotations[]``）
+  - 用户指定的精简 JSON（``--output``）与完整档（``*_full.json``），便于人工查看
 
-下游（默认路径）：
-  python demos/demo2_llm.py
-  python demos/demo3_smartcut.py json --layer1 outputs/layer1_annotations.json --mask outputs/layer2_output.json
+下游：
+  python demos/demo2_llm.py --manifest outputs/timeline_manifest.json
+  python demos/demo3_smartcut.py json --manifest outputs/timeline_manifest.json
 
 测试指令：
 	1. 使用默认配置运行：
@@ -45,15 +43,15 @@ from pathlib import Path
 
 import torch
 from qwen_asr.inference.qwen3_asr import Qwen3ASRModel
+from ulid import ULID
 
 from autosmartcut.config import load_config
+from autosmartcut.manifest_io import make_manifest_skeleton, save_manifest, touch_layer_status
 from autosmartcut.perception import (
 	build_layer1_document,
-	build_layer2_input_document,
 	compact_annotations,
 	duration_seconds,
 	load_audio_mono,
-	write_perception_outputs,
 )
 
 def parse_args() -> argparse.Namespace:
@@ -253,24 +251,22 @@ def main() -> None:
 		"raw_text": full_doc["raw_text"],
 		"annotations": compact_annotations(full_doc["annotations"]),
 	}
-	layer2_doc = build_layer2_input_document(light_doc)
-
 	args.output.parent.mkdir(parents=True, exist_ok=True)
 	full_output = args.output.with_name(f"{args.output.stem}_full{args.output.suffix}")
-	layer2_output = args.output.with_name("demo2_input.json")
 	with full_output.open("w", encoding="utf-8") as f:
 		json.dump(full_doc, f, ensure_ascii=False, indent=2)
 	with args.output.open("w", encoding="utf-8") as f:
 		json.dump(light_doc, f, ensure_ascii=False, indent=2)
-	with layer2_output.open("w", encoding="utf-8") as f:
-		json.dump(layer2_doc, f, ensure_ascii=False, indent=2)
-	std_layer1, std_layer2 = write_perception_outputs(
-		{"source": light_doc["source"], "annotations": light_doc["annotations"]},
-		layer2_doc,
-		args.output.parent,
-		layer1_filename="layer1_annotations.json",
-		layer2_filename="layer2_input.json",
-	)
+
+	run_id = str(ULID())
+	manifest = make_manifest_skeleton(run_id, "", str(args.input.resolve()), duration=float(duration))
+	manifest["source"] = light_doc["source"]
+	manifest["language"] = light_doc["language"]
+	manifest["raw_text"] = light_doc["raw_text"]
+	manifest["annotations"] = light_doc["annotations"]
+	touch_layer_status(manifest, "l1")
+	manifest_path = args.output.parent / "timeline_manifest.json"
+	save_manifest(manifest_path, manifest, atomic=True)
 
 	print(f"[demo1] backend={args.backend}")
 	print(f"[demo1] input={args.input}")
@@ -279,12 +275,9 @@ def main() -> None:
 	print(f"[demo1] silence_threshold={silence_threshold}")
 	print(f"[demo1] max_chars={max_chars}")
 	print(f"[demo1] annotations={len(light_doc['annotations'])}")
-	print(f"[demo1] layer2_tokens={len(layer2_doc['tokens'])}")
 	print(f"[demo1] full_output={full_output}")
 	print(f"[demo1] output={args.output}")
-	print(f"[demo1] layer2_input={layer2_output}")
-	print(f"[demo1] std_layer1={std_layer1}")
-	print(f"[demo1] std_layer2={std_layer2}")
+	print(f"[demo1] timeline_manifest={manifest_path}")
 
 
 if __name__ == "__main__":

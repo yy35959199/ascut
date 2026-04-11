@@ -3,107 +3,97 @@
 ## 职责
 - 提供统一入口 run_intelligence_layer()
 - 按顺序调用 2a → 2b → 2c → 2d
-- 文件交接：读取 **JSON2**（句面 ``tokens[]``），输出 JSON3（``keep_mask``）
-
-## 输入 Schema（JSON2，如 layer2_input.json）
-{
-    "source": str,              # 源视频路径（供流水线解析；智能层不剪片）
-    "tokens": [                 # 句级句面，稠密 index 0..n-1
-        {"index": int, "text": str},
-        ...
-    ]
-}
-
-可选顶层字段（若存在则带入 manifest）：``language``、``raw_text``。
-
-``goal`` 由 CLI/API 参数传入，不来自 JSON2。
-
-## 输出 Schema (layer2.json / JSON3)
-{
-    "keep_mask": [
-        {"index": int, "keep": bool},
-        ...
-    ]
-}
-
-## 数据流
-JSON2 → manifest(tokens) → 2a → 2b → 2c → 2d → JSON3
-
-执行层（L3）仍使用 **JSON1 + JSON3** 合成时间区间；时间轴不经过 L2 入口。
+- 读写 **timeline_manifest.json**：内存中组 ``tokens[]``，写回 ``current``
 
 ## 核心不变量
 - ``tokens[i].index == i``；``keep_mask`` 与 ``tokens`` 等长且 index 对齐
 """
 
-import json
+import copy
 import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from autosmartcut.annotation_tokens import tokens_from_annotations
 from autosmartcut.intelligence_2a import run_2a_comprehension
 from autosmartcut.intelligence_2b import run_2b_decision
 from autosmartcut.intelligence_2c import run_2c_review
 from autosmartcut.intelligence_2d import run_2d_human_review
-from autosmartcut.layer2_tokens import load_layer2_tokens_document
+from autosmartcut.manifest_io import (
+    load_manifest,
+    save_manifest,
+    strip_volatile_fields,
+    touch_layer_status,
+    write_l2_checkpoint,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def save_layer2_json(keep_mask: list[dict], output_path: Path) -> None:
-    """保存 Layer 2 输出的 keep_mask JSON 文件（JSON3）。"""
-    output = {"keep_mask": keep_mask}
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
-
-
 def run_intelligence_layer(
-    layer2_input_path: Path,
-    output_path: Path,
+    manifest_path: Path,
     goal: str = "",
     *,
     auto: bool = False,
     verbose_log: bool = False,
     two_b_mode: str = "single",
 ) -> None:
-    """Layer 2 主入口（JSON2 → JSON3）
-
-    Args:
-        layer2_input_path: JSON2 路径（``tokens[]`` + 可选 ``source``）
-        output_path: JSON3 输出路径
-        goal: 用户指定的分析/剪辑目标
-        auto: True 时跳过 2d
-        verbose_log: 是否启用 DEBUG 级 stderr 日志
-        two_b_mode: ``single`` | ``chunked``
-    """
+    """Layer 2 主入口：清单 → 更新 ``current``（comprehension + keep_mask）。"""
     from autosmartcut.log import ensure_autosmartcut_logging
 
     ensure_autosmartcut_logging(verbose=verbose_log)
 
-    logger.info("[L2] 智能层开始 输入(JSON2)=%s 输出(JSON3)=%s", layer2_input_path, output_path)
-    if goal:
-        logger.info("[L2] 目标: %s", goal)
+    mp = manifest_path.resolve()
+    logger.info("[L2] 智能层开始 清单=%s", mp)
     if two_b_mode not in ("single", "chunked"):
         raise ValueError(f"two_b_mode 须为 'single' 或 'chunked'，实际: {two_b_mode!r}")
     logger.info("[L2] 2b 模式: %s", two_b_mode)
 
-    doc = load_layer2_tokens_document(layer2_input_path)
-    tokens = doc["tokens"]
+    data = load_manifest(mp)
+    annotations = data.get("annotations")
+    if not isinstance(annotations, list) or len(annotations) == 0:
+        raise ValueError("清单缺少非空 annotations[]，无法运行 L2")
 
-    logger.info("[L2] 加载 %d 条 tokens", len(tokens))
+    goal_use = goal.strip() if goal.strip() else str(data.get("goal", ""))
+    if goal_use:
+        logger.info("[L2] 目标: %s", goal_use)
+
+    tokens = tokens_from_annotations(annotations)
 
     manifest_dict: dict[str, Any] = {
         "tokens": tokens,
-        "goal": goal,
-        "source": doc.get("source", ""),
-        "language": doc.get("language", ""),
-        "raw_text": doc.get("raw_text", ""),
+        "goal": goal_use,
+        "source": str(data.get("source", "")),
+        "language": str(data.get("language", "")),
+        "raw_text": str(data.get("raw_text", "")),
     }
 
+    def _on_2a_phase_save(phase: str, payload: dict[str, Any]) -> None:
+        write_l2_checkpoint(data, mp, phase, payload)
+
     try:
-        manifest_dict = run_2a_comprehension(manifest_dict)
+        manifest_dict = run_2a_comprehension(
+            manifest_dict, on_phase_save=_on_2a_phase_save
+        )
         manifest_dict = run_2b_decision(manifest_dict, mode=two_b_mode)
+
+        # 2b 完成后将 comprehension + keep_mask 写入清单（L3 续跑仅需磁盘态即可）
+        cur0 = data.setdefault("current", {})
+        if not isinstance(cur0, dict):
+            data["current"] = {}
+            cur0 = data["current"]
+        cur0["comprehension"] = copy.deepcopy(manifest_dict.get("comprehension", {}))
+        cur0["keep_mask"] = copy.deepcopy(manifest_dict.get("keep_mask", []))
+        km = cur0["keep_mask"]
+        n_keep = sum(1 for e in km if isinstance(e, dict) and e.get("keep") is True)
+        write_l2_checkpoint(
+            data,
+            mp,
+            "2b",
+            {"keep_true": n_keep, "keep_total": len(km)},
+        )
+
         manifest_dict = run_2c_review(manifest_dict)
 
         if auto:
@@ -128,73 +118,79 @@ def run_intelligence_layer(
         raise
 
     keep_mask = manifest_dict.get("keep_mask", [])
-
     if not keep_mask:
         raise ValueError("智能层未生成 keep_mask")
-
     if len(keep_mask) != len(tokens):
         raise ValueError(
             f"keep_mask 长度不匹配: {len(keep_mask)} != {len(tokens)}"
         )
-
     for i, entry in enumerate(keep_mask):
         if "index" not in entry:
             raise ValueError(f"keep_mask[{i}] 缺少 index 字段")
         if "keep" not in entry:
             raise ValueError(f"keep_mask[{i}] 缺少 keep 字段")
         if entry["index"] != i:
-            raise ValueError(f"keep_mask[{i}] 的 index 不匹配: 期望 {i}, 实际 {entry['index']}")
+            raise ValueError(
+                f"keep_mask[{i}] 的 index 不匹配: 期望 {i}, 实际 {entry['index']}"
+            )
 
-    save_layer2_json(keep_mask, output_path)
+    cur = data.setdefault("current", {})
+    if not isinstance(cur, dict):
+        data["current"] = {}
+        cur = data["current"]
+    cur["comprehension"] = manifest_dict.get("comprehension", {})
+    cur["keep_mask"] = keep_mask
+    if manifest_dict.get("human_feedback_history"):
+        cur["human_feedback_history"] = manifest_dict["human_feedback_history"]
+    data["goal"] = goal_use
+
+    strip_volatile_fields(data)
+    touch_layer_status(data, "l2")
+    save_manifest(mp, data, atomic=True)
 
     keep_count = sum(1 for e in keep_mask if e["keep"] is True)
     logger.info(
         "[L2] 完成 保留 %d/%d 句 → %s",
         keep_count,
         len(keep_mask),
-        output_path,
+        mp,
     )
 
 
 def main() -> None:
-    """命令行入口：``python -m autosmartcut.intelligence <JSON2> <JSON3> ...``"""
+    """命令行入口：``python -m autosmartcut.intelligence --manifest <path> [--goal ...]``"""
+    import argparse
     import sys
 
-    if len(sys.argv) < 3:
-        print(
-            "用法: python -m autosmartcut.intelligence <layer2_input.json> <output.json> "
-            "[--goal 目标] [--auto] [--verbose] [--two-b-mode single|chunked]"
-        )
-        print("\n示例:")
-        print("  python -m autosmartcut.intelligence output/layer2_input.json output/layer2_output.json")
-        print("  python -m autosmartcut.intelligence output/layer2_input.json out.json --goal '提取核心观点' --auto")
-        sys.exit(1)
-
-    layer2_path = Path(sys.argv[1])
-    output_path = Path(sys.argv[2])
-
-    goal = ""
-    if "--goal" in sys.argv:
-        goal_idx = sys.argv.index("--goal")
-        if goal_idx + 1 < len(sys.argv):
-            goal = sys.argv[goal_idx + 1]
-
-    auto = "--auto" in sys.argv
-    verbose_log = "--verbose" in sys.argv
-    two_b_mode = "single"
-    if "--two-b-mode" in sys.argv:
-        i = sys.argv.index("--two-b-mode")
-        if i + 1 < len(sys.argv):
-            two_b_mode = sys.argv[i + 1]
+    p = argparse.ArgumentParser(description="Layer 2：更新 timeline_manifest.json")
+    p.add_argument(
+        "--manifest",
+        type=Path,
+        required=True,
+        help="timeline_manifest.json（须含 annotations[]）",
+    )
+    p.add_argument("--goal", type=str, default="", help="智能层目标")
+    p.add_argument(
+        "--auto",
+        action="store_true",
+        help="跳过 2d 人工审阅",
+    )
+    p.add_argument("--verbose", action="store_true", help="DEBUG 日志")
+    p.add_argument(
+        "--two-b-mode",
+        type=str,
+        choices=["single", "chunked"],
+        default="single",
+    )
+    args = p.parse_args()
 
     try:
         run_intelligence_layer(
-            layer2_path,
-            output_path,
-            goal,
-            auto=auto,
-            verbose_log=verbose_log,
-            two_b_mode=two_b_mode,
+            args.manifest,
+            args.goal,
+            auto=args.auto,
+            verbose_log=args.verbose,
+            two_b_mode=args.two_b_mode,
         )
     except Exception as e:
         print(f"\n错误: {e}")

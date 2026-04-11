@@ -1,8 +1,8 @@
-"""从 Demo1 完整 JSON 生成 layer1 / layer2_input / mock JSON3。
+"""从 Demo1 完整 JSON 生成 timeline_manifest.json（含 mock keep_mask）。
 
-非 L1/L2/L3 演示环节本身，属辅助工具；与 ``demo1_asr.py`` / ``demo2_llm.py`` / ``demo3_smartcut.py`` 并列时放在 ``demos/tools/``。
+辅助工具；与 ``demo1_asr.py`` 产出的清单格式对齐。
 
-用法（在仓库根目录、已安装包）::
+用法（在仓库根目录）::
 
     python demos/tools/gen_demo_jsons.py
 """
@@ -15,7 +15,10 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from autosmartcut.perception import build_layer2_input_document, compact_annotations
+from ulid import ULID
+
+from autosmartcut.manifest_io import make_manifest_skeleton, save_manifest
+from autosmartcut.perception import compact_annotations
 
 
 def gen_mock_keep_mask(
@@ -51,7 +54,7 @@ def gen_mock_keep_mask(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="从 demo1 完整 JSON 生成 layer1/layer2/mock mask")
+    p = argparse.ArgumentParser(description="从 demo1 完整 JSON 生成 timeline_manifest.json")
     p.add_argument(
         "--input",
         type=Path,
@@ -81,17 +84,6 @@ def main() -> None:
     shutil.copyfile(args.input, full_path)
 
     layer1 = compact_annotations(annotations)
-    (out_dir / "layer1_annotations.json").write_text(
-        json.dumps({"source": source, "annotations": layer1}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    tokens = build_layer2_input_document({"source": source, "annotations": layer1})
-    (out_dir / "layer2_input.json").write_text(
-        json.dumps(tokens, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
     keep_mask = gen_mock_keep_mask(
         layer1,
         cut_ratio=args.cut_ratio,
@@ -99,19 +91,20 @@ def main() -> None:
         max_run=args.max_run,
         seed=args.seed,
     )
-    (out_dir / "layer2_output_mock.json").write_text(
-        json.dumps({"source": source, "keep_mask": keep_mask}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+
+    rid = str(ULID())
+    m = make_manifest_skeleton(rid, "", str(source))
+    m["annotations"] = layer1
+    m["current"] = {"keep_mask": keep_mask}
+    mp = out_dir / "timeline_manifest.json"
+    save_manifest(mp, m, atomic=True)
 
     n_speech = len(layer1)
-    n_keep = sum(1 for m in keep_mask if m["keep"] is True)
-    n_cut = sum(1 for m in keep_mask if m["keep"] is False)
+    n_keep = sum(1 for x in keep_mask if x["keep"] is True)
+    n_cut = sum(1 for x in keep_mask if x["keep"] is False)
     print(f"总 annotations: {len(layer1)} (speech={n_speech})")
     print(f"mock keep_mask: keep={n_keep}, cut={n_cut}")
-    print(
-        f"已写入: {full_path.name}, layer1_annotations.json, layer2_input.json, layer2_output_mock.json -> {out_dir}"
-    )
+    print(f"已写入: {full_path.name}, timeline_manifest.json -> {out_dir}")
 
 
 if __name__ == "__main__":

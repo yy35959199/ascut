@@ -1,7 +1,7 @@
 # After MVP TODO
 
 > 本文档仅记录“已确认不在 MVP 内”的后续能力清单。  
-> MVP 当前实现以 `doc/intelligence-layer2-mvp.md` 为准。
+> MVP 当前实现以 `doc/intelligence-layer2-mvp.md` 与 `doc/AutoSmartCut-MVP-Mini.md`（单清单）为准。
 
 ---
 
@@ -29,7 +29,7 @@
 
 ### 1. R1 结束后：程序校验（软引导 → R2）
 
-**输入**：`outline_blocks_rough`，`n = len(tokens)`（或与 JSON1 `len(annotations)` 一致；与 Layer1 连续 `index` 约定一致）。
+**输入**：`outline_blocks_rough`，`n = len(tokens)`（与清单 `len(annotations)` 一致；与 Layer1 连续 `index` 约定一致）。
 
 **检查项（建议分层）**：
 
@@ -113,7 +113,7 @@
 
 ### 4. 无句面 / 空 `tokens` 禁止进入 2b
 
-- 在 `run_2b_decision` 入口（或更早在 `run_intelligence_layer`）：**`tokens` 缺失、类型非法或 `len(tokens)==0`** 须在进 2a/2b 前 **直接拒绝**（`raise`），不调用 LLM、不写 `keep_mask`。（现行实现以 JSON2 → `manifest["tokens"]` 为准，不再依赖 manifest 内 `annotations[]`。）
+- 在 `run_2b_decision` 入口（或更早在 `run_intelligence_layer`）：**`tokens` 缺失、类型非法或 `len(tokens)==0`** 须在进 2a/2b 前 **直接拒绝**（`raise`），不调用 LLM、不写 `keep_mask`。（现行实现从清单 **`annotations[]`** 派生 `manifest["tokens"]`。）
 
 ### 5. 运行日志：推荐方案与记录内容
 
@@ -145,7 +145,6 @@
 
 ## 文档对齐任务
 
-- `doc/AutoSmartCut-MVP.md`、`doc/intelligence-layer2-mvp.md`、`doc/AutoSmartCut.md` 等与当前 Layer1（speech + `gap_after`）及 JSON2（`index`+`text`）契约对齐。
-- `demos/demo2_llm.py` 已与 JSON2 契约对齐；后续若改 CLI 参数，同步 README 与 `AutoSmartCut-MVP.md` Demo 2 小节。
-- 统一仓库文档命名：`outline_blocks`（理解分块）与 `**keep_mask`**（MVP 多为 manifest/JSON3 顶层；历史文档或曾用 `segments.keep_mask` 嵌套）的术语使用。
+- 主路径文档已与 **单清单 `timeline_manifest.json`**、内存 **`tokens[]`**（`index`+`text`）及 **`current.keep_mask`** 对齐；后续若 CLI 或字段变更，同步 README 与 MVP 文档族。
+- 统一仓库文档命名：`outline_blocks`（理解分块）与 **`current.keep_mask`**（及历史文档中的 `segments.keep_mask` 嵌套表述）的术语使用。
 

@@ -93,15 +93,20 @@ def run_2b_decision(manifest_dict: dict, *, mode: TwoBMode = "single") -> dict:
     """
     print("[2b] 决策子阶段开始")
 
+    # 句面 JSON2：仅 index + text；决策语义以 comprehension 稠密文本为准
     tokens = manifest_dict["tokens"]
+    # 2a 产物：purpose / cleaned_annotations / outline_blocks 等
     comprehension = manifest_dict.get("comprehension", {})
+    # 用户剪辑意图，会写入 prompt 首行「用户目标」
     goal = manifest_dict.get("goal", "")
 
     if mode not in ("single", "chunked"):
         raise ValueError(f"mode 须为 'single' 或 'chunked'，实际: {mode!r}")
     if mode == "chunked":
+        # 每块独立 prompt + LLM，再按全文 index 合并（见 _generate_keep_mask_chunked）
         keep_mask = _generate_keep_mask_chunked(tokens, comprehension, goal)
     else:
+        # 单次全文 prompt（_build_prompt）+ 一次 call_llm_structured
         keep_mask = _generate_keep_mask(tokens, comprehension, goal)
 
     # 验证 keep_mask 格式
@@ -150,20 +155,26 @@ def _generate_keep_mask(
     """
     print("[2b] 调用 LLM 生成决策")
 
+    # 拼接 goal / purpose / 分块摘要 / 全量 [index] cleaned 句列 + JSON 输出约定
     prompt = _build_prompt(tokens, comprehension, goal)
+    # 与 intelligence_llm 联动：根对象含 decisions[]，每项 {index, keep}
     schema = _get_schema()
 
+    # intelligence_llm.call_llm_structured：
+    # - 内部 _build_messages：固定 system + 将本 prompt 作为单条 user，并按 schema 生成示例尾缀
+    # - _complete_structured：json_object、解析、按 schema 校验、失败重试
+    # - augment_last_user=False（与 2a 多轮不同，此处为单轮 system+user）
     response = call_llm_structured(
-        prompt=prompt,
-        schema=schema,
-        temperature=TEMPERATURE,
-        enable_reasoning=ENABLE_REASONING
+        prompt=prompt,  # 完整自然语言任务说明（见 _build_prompt 的 f-string 结构）
+        schema=schema,  # 约束顶层键 decisions 及元素形状
+        temperature=TEMPERATURE,  # 低温度，分类式 keep 决策偏稳定
+        enable_reasoning=ENABLE_REASONING,  # 2b 关闭推理链，走普通 chat
     )
 
-    # 解析 LLM 输出
+    # 顶层 decisions：可能缺键时用 []，后续 _build_keep_mask_from_llm_decisions 会补默认保留
     llm_decisions = response.get("decisions", [])
 
-    # 构造完整 keep_mask（speech-only）
+    # 按 tokens 顺序输出稠密 keep_mask；未出现的 index 默认 True
     keep_mask = _build_keep_mask_from_llm_decisions(tokens, llm_decisions)
 
     return keep_mask
@@ -255,7 +266,9 @@ def _generate_keep_mask_chunked(
     goal: str,
 ) -> list[dict]:
     """按分块多次调用 LLM，合并为完整 keep_mask。"""
+    # 2a 分块：用于划分子 prompt 的 index 区间；为空则无法 chunked
     outline_blocks = comprehension.get("outline_blocks", [])
+    # 与 tokens 等长的稠密消歧句面；chunked 每轮只展示当前块子集
     cleaned_annotations = comprehension.get("cleaned_annotations", [])
     _validate_dense_cleaned_vs_tokens(tokens, cleaned_annotations)
 
@@ -263,7 +276,9 @@ def _generate_keep_mask_chunked(
         print("[2b] chunked：outline_blocks 为空，回退为 single 单次调用")
         return _generate_keep_mask(tokens, comprehension, goal)
 
+    # (block_meta, positions) 列表；positions 为 tokens 列表下标（非 annotation index）
     partitions = _partition_token_indices_by_blocks(tokens, outline_blocks)
+    # 丢掉空块，避免无意义 LLM 调用
     work = [(b, pos) for b, pos in partitions if pos]
 
     if not work:
@@ -271,13 +286,17 @@ def _generate_keep_mask_chunked(
         return [{"index": int(tok["index"]), "keep": True} for tok in tokens]
 
     n_blocks = len(work)
+    # 注入各块摘要，让模型在子块调用时仍见「全文叙事弧」
     arc = _narrative_arc_section(work, tokens)
     purpose = comprehension.get("purpose", "")
+    # 每块复用同一 schema；与 single 模式一致，均为 decisions[]
     schema = _get_schema()
+    # 全文 annotation_index → keep；后写覆盖先写（跨块重复时以后块为准）
     merged: dict[int, bool] = {}
 
     for ord1, (block_meta, positions) in enumerate(work, start=1):
         print(f"[2b] chunked LLM 调用 {ord1}/{n_blocks}，本块 {len(positions)} 句")
+        # 当前块专用 user 文本：块序号、本块 index 范围、叙事弧、仅本块句列
         prompt = _build_prompt_chunked(
             purpose=purpose,
             goal=goal,
@@ -289,6 +308,7 @@ def _generate_keep_mask_chunked(
             block_positions=positions,
             block_meta=block_meta,
         )
+        # 与 single 相同 API：每块一次独立单轮对话（无跨块 message 历史）
         response = call_llm_structured(
             prompt=prompt,
             schema=schema,
@@ -296,6 +316,7 @@ def _generate_keep_mask_chunked(
             enable_reasoning=ENABLE_REASONING,
         )
         llm_decisions = response.get("decisions", [])
+        # 本块允许出现的全文 index 集合；_merge_chunk_decisions 过滤越界项
         allowed = {int(tokens[i]["index"]) for i in positions}
         chunk_map = _merge_chunk_decisions(llm_decisions, allowed)
         for idx, keep in chunk_map.items():
@@ -344,22 +365,29 @@ def _build_prompt_chunked(
     block_meta: dict,
 ) -> str:
     """分块模式下单次 LLM 的 prompt。"""
+    # 首行：与 single 模式一致，锚定用户剪辑意图
     goal_line = f"用户目标：{goal}" if goal else "用户目标：无特定目标，提取核心内容"
+    # 本块在全文坐标系下的闭区间端点（来自 tokens 首尾句的 index）
     lo = int(tokens[block_positions[0]]["index"])
     hi = int(tokens[block_positions[-1]]["index"])
     range_line = f"本块在全文中的 index 范围：{lo}–{hi}（共 {len(block_positions)} 句）"
 
+    # 仅列出 block_positions 对应句；[index] 仍为全文级，与 JSON2 对齐
     speech_lines = []
     for i in block_positions:
         idx = int(tokens[i]["index"])
         text = cleaned_annotations[i]["cleaned_content"]
         speech_lines.append(f"[{idx}] {text}")
 
+    # 来自 2a 块的 summary/topic；合成 gap 块有人工说明句
     block_summ = _block_summary(block_meta)
     extra = ""
     if block_meta.get("_synthetic_gap"):
         extra = "\n说明：本块为程序根据全文 index 补齐的分区，不在 2a 原始 outline_blocks 中。"
 
+    # 以下为单条 f-string 模板体（中间不可插 Python 注释）：
+    # 1 goal_line → 2 主旨 purpose → 3 当前块序号/范围/摘要 → 4 叙事弧 arc
+    # 5 本块句列 speech_lines → 6 保留/删除规则与 JSON 输出要求
     return f"""{goal_line}
 
 内容主旨：{purpose}
@@ -402,12 +430,15 @@ def _build_prompt(
     任务：
     对每个 speech 标注判断是否保留
     """
+    # 2a 精化主旨，写入 prompt「内容主旨」段
     purpose = comprehension.get("purpose", "")
+    # 与 tokens 等长；唯一给模型看的句面文本源（非原始 ASR tokens[].text）
     cleaned_annotations = comprehension.get("cleaned_annotations", [])
+    # 可选；有则生成「内容分块」多行摘要，帮助模型理解局部与整体关系
     outline_blocks = comprehension.get("outline_blocks", [])
     _validate_dense_cleaned_vs_tokens(tokens, cleaned_annotations)
 
-    # 构造分块摘要
+    # 将每块的 [start,end] 与摘要拼成可读小节；无分块时显式写「无」避免模型臆造结构
     if outline_blocks:
         block_lines = [
             f"  块 {i+1} [index {b['start_index']}-{b['end_index']}]: {_block_summary(b)}"
@@ -417,7 +448,7 @@ def _build_prompt(
     else:
         blocks_section = "内容分块：无"
 
-    # 构造句面列表（仅使用稠密消歧文本）
+    # 逐句 [全文 index] + cleaned_content；顺序与 tokens 严格一致
     speech_lines = []
     for i, tok in enumerate(tokens):
         idx = int(tok["index"])
@@ -428,6 +459,7 @@ def _build_prompt(
 
     goal_line = f"用户目标：{goal}" if goal else "用户目标：无特定目标，提取核心内容"
 
+    # f-string 模板：goal → purpose → blocks_section → 全量句列 → 决策规则 → 要求 JSON
     return f"""{goal_line}
 
 内容主旨：{purpose}
@@ -488,24 +520,30 @@ def _validate_dense_cleaned_vs_tokens(
 
 
 def _get_schema() -> dict:
-    """2b 决策的输出 JSON Schema"""
+    """2b 决策的输出 JSON Schema：供 intelligence_llm 生成示例尾缀 + 解析后校验。"""
     return {
-        "type": "object",
+        "type": "object",  # json_object 根必须为对象
         "properties": {
-            "decisions": {
+            "decisions": {  # 唯一顶层业务字段；与 prompt「decisions 数组」表述一致
                 "type": "array",
                 "description": "对每个 speech 标注的决策列表",
-                "items": {
+                "items": {  # 单条决策：全文句级 index + 布尔保留标志
                     "type": "object",
                     "properties": {
-                        "index": {"type": "integer", "description": "对应 tokens[].index"},
-                        "keep": {"type": "boolean", "description": "true=保留, false=删除"}
+                        "index": {
+                            "type": "integer",
+                            "description": "对应 tokens[].index",
+                        },
+                        "keep": {
+                            "type": "boolean",
+                            "description": "true=保留, false=删除",
+                        },
                     },
-                    "required": ["index", "keep"]
-                }
-            }
+                    "required": ["index", "keep"],
+                },
+            },
         },
-        "required": ["decisions"]
+        "required": ["decisions"],  # 不允许省略 decisions；可为空数组（理论上不应发生）
     }
 
 

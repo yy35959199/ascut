@@ -1,9 +1,7 @@
-# Demo：以 layer2_input.json（JSON2）为输入，仅跑 2a+2b，并对比 single / chunked 的 keep_mask
+# Demo：以 timeline_manifest.json 为输入，仅跑 2a+2b，并对比 single / chunked 的 keep_mask
 from __future__ import annotations
 
 """
-与主流程一致：manifest 仅含 ``tokens[]``（JSON2），不再合成 annotations。
-
 1. **只调用一次** ``run_2a_comprehension``
 2. 分别 ``run_2b_decision(..., mode="single")`` 与 ``mode="chunked"``
 3. 写出对比结果 JSON
@@ -25,17 +23,25 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
 	sys.path.insert(0, str(_ROOT))
 
-from autosmartcut.layer2_tokens import parse_layer2_tokens_document
+from autosmartcut.annotation_tokens import tokens_from_annotations, validate_tokens
+from autosmartcut.manifest_io import load_manifest
 
 
-def layer2_doc_to_manifest(doc: dict[str, Any], *, goal: str) -> dict[str, Any]:
-	parse_layer2_tokens_document(doc)
+def manifest_tokens_workspace(data: dict[str, Any], *, goal: str) -> dict[str, Any]:
+	anns = data.get("annotations")
+	if not isinstance(anns, list) or not anns:
+		raise ValueError("清单须含非空 annotations[]")
+	tokens = tokens_from_annotations(anns)
+	validate_tokens(tokens)
+	src = data.get("source", "")
+	if not src and isinstance(data.get("source_media"), dict):
+		src = str(data["source_media"].get("path", ""))
 	return {
-		"tokens": doc["tokens"],
+		"tokens": tokens,
 		"goal": goal,
-		"source": doc.get("source", ""),
-		"language": doc.get("language", ""),
-		"raw_text": doc.get("raw_text", ""),
+		"source": src,
+		"language": str(data.get("language", "")),
+		"raw_text": str(data.get("raw_text", "")),
 	}
 
 
@@ -61,8 +67,13 @@ def compare_keep_masks(
 
 
 def parse_args() -> argparse.Namespace:
-	p = argparse.ArgumentParser(description="JSON2 → 2a + 2b single/chunked 对比")
-	p.add_argument("--input", type=Path, default=Path("output/layer2_input.json"))
+	p = argparse.ArgumentParser(description="timeline_manifest → 2a + 2b single/chunked 对比")
+	p.add_argument(
+		"--manifest",
+		type=Path,
+		default=Path("outputs/timeline_manifest.json"),
+		help="须含 annotations[]",
+	)
 	p.add_argument("--output", type=Path, default=Path("output/layer2_ab_compare.json"))
 	p.add_argument("--goal", type=str, default="")
 	p.add_argument("--validate-only", action="store_true")
@@ -71,21 +82,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
 	args = parse_args()
-	in_path = args.input.resolve()
+	in_path = args.manifest.resolve()
 	if not in_path.is_file():
-		raise SystemExit(f"输入文件不存在: {in_path}")
+		raise SystemExit(f"清单不存在: {in_path}")
 
-	with in_path.open("r", encoding="utf-8") as f:
-		doc = json.load(f)
-
+	data = load_manifest(in_path)
 	try:
-		parse_layer2_tokens_document(doc)
+		_ = manifest_tokens_workspace(data, goal=args.goal)
 	except ValueError as e:
-		print(f"JSON2 校验失败: {e}")
+		print(f"清单校验失败: {e}")
 		raise SystemExit(1) from e
 
-	n = len(doc["tokens"])
-	print(f"[校验] OK: {n} 条 tokens，source={doc.get('source', '')!r}")
+	tokens = tokens_from_annotations(data["annotations"])
+	n = len(tokens)
+	print(f"[校验] OK: {n} 条 tokens（由 annotations 派生）")
 
 	if args.validate_only:
 		return
@@ -93,7 +103,7 @@ def main() -> None:
 	from autosmartcut.intelligence_2a import run_2a_comprehension
 	from autosmartcut.intelligence_2b import run_2b_decision
 
-	manifest = layer2_doc_to_manifest(doc, goal=args.goal)
+	manifest = manifest_tokens_workspace(data, goal=args.goal)
 	manifest = run_2a_comprehension(manifest)
 
 	m_single = copy.deepcopy(manifest)
@@ -108,12 +118,12 @@ def main() -> None:
 
 	out_doc: dict[str, Any] = {
 		"meta": {
-			"input_path": str(in_path),
+			"manifest_path": str(in_path),
 			"output_path": str(args.output.resolve()),
 			"n_tokens": n,
 			"goal": args.goal,
 			"two_b_modes_compared": ["single", "chunked"],
-			"note": "智能层仅以 JSON2 tokens 为句面输入；时间轴见 JSON1。",
+			"note": "句面由清单 annotations 派生；时间轴在 annotations。",
 		},
 		"source": manifest.get("source", ""),
 		"comprehension": manifest["comprehension"],

@@ -3,15 +3,11 @@ from __future__ import annotations
 
 """
 模式 dense：不依赖 layer1，用合成密集 EDL 压测 smartcut。
-模式 json：读取 JSON1 + 任意含 keep_mask 的 JSON3，走 execution.positive_segments_from_mask_files（与 Layer 3 一致）。
-
-JSON1：layer1_annotations.json（source + annotations，含 index / t_start / t_end / gap_after）。
-JSON3：仅要求顶层 keep_mask[]，可为真实智能层输出（layer2_output.json）或 ``demos/tools/gen_demo_jsons.py`` 生成的 mock。
+模式 json：读取 **timeline_manifest.json**（``annotations[]`` + ``current.keep_mask``），走 ``positive_segments_from_annotations``（与 Layer 3 一致）。
 
 示例（在仓库 ascut 目录下）：
   python demos/demo3_smartcut.py dense --input samples/alxe_01.mp4
-  python demos/demo3_smartcut.py json --layer1 outputs/layer1_annotations.json --mask outputs/layer2_output.json
-  python demos/demo3_smartcut.py json --layer1 outputs/layer1_annotations.json --mask outputs/layer2_output_mock.json
+  python demos/demo3_smartcut.py json --manifest outputs/timeline_manifest.json
   python demos/demo3_smartcut.py json ... --no-vad-snap          # 关闭 VAD 切点吸附
   python demos/demo3_smartcut.py json ... --config config.toml  # 指定配置（含 VAD 参数）
 """
@@ -30,8 +26,10 @@ from smartcut.media_container import MediaContainer
 from smartcut.misc_data import AudioExportInfo, AudioExportSettings
 from smartcut.smart_cut import smart_cut
 
+from autosmartcut.annotation_tokens import video_path_from_manifest
 from autosmartcut.config import load_config
-from autosmartcut.execution import positive_segments_from_mask_files
+from autosmartcut.execution import positive_segments_from_annotations
+from autosmartcut.manifest_io import load_manifest
 
 
 @dataclass
@@ -114,9 +112,23 @@ def run_json(args: argparse.Namespace) -> None:
 
     cfg = load_config(args.config) if args.config else load_config()
 
-    positive, video, duration = positive_segments_from_mask_files(
-        Path(args.layer1),
-        Path(args.mask),
+    mp = Path(args.manifest).resolve()
+    data = load_manifest(mp)
+    annotations = data.get("annotations")
+    if not isinstance(annotations, list):
+        raise SystemExit("清单缺少 annotations[]")
+    cur = data.get("current")
+    if not isinstance(cur, dict):
+        raise SystemExit("清单缺少 current")
+    keep_mask = cur.get("keep_mask")
+    if not isinstance(keep_mask, list):
+        raise SystemExit("清单缺少 current.keep_mask[]")
+    video = video_path_from_manifest(data, mp)
+
+    positive, video, duration = positive_segments_from_annotations(
+        annotations,
+        keep_mask,
+        video,
         pre_pad=args.pre_pad,
         post_pad=args.post_pad,
         min_duration=args.min_duration,
@@ -162,13 +174,12 @@ def main() -> None:
     p_dense.add_argument("--target-keeps", type=int, default=52, help="目标 keep 段数上限")
     p_dense.set_defaults(func=run_dense)
 
-    p_json = sub.add_parser("json", help="JSON1 + JSON3（keep_mask）→ smartcut")
-    p_json.add_argument("--layer1", required=True, type=Path, help="Layer 1 输出 JSON1（如 layer1_annotations.json）")
+    p_json = sub.add_parser("json", help="timeline_manifest.json → smartcut")
     p_json.add_argument(
-        "--mask",
+        "--manifest",
         required=True,
         type=Path,
-        help="Layer 2 输出 JSON3：须含 keep_mask（如 layer2_output.json 或 layer2_output_mock.json）",
+        help="timeline_manifest.json（须含 annotations[] 与 current.keep_mask[]）",
     )
     p_json.add_argument(
         "--output",

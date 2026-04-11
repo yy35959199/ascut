@@ -1,7 +1,7 @@
 """Layer 1 perception helpers.
 
-This module contains the production logic for transforming ASR + alignment
-output into the JSON1/JSON2 documents used by later stages.
+ASR + alignment 产出句级 ``annotations[]``，由 ``run_perception_layer`` 写入
+``timeline_manifest.json``（MVP-mini）。
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import torch
 from qwen_asr.inference.qwen3_asr import Qwen3ASRModel
 
 from autosmartcut.config import AppConfig
+from autosmartcut.manifest_io import load_manifest, save_manifest, touch_layer_status
 from autosmartcut.pipeline_run import PipelineRun
 
 logger = logging.getLogger(__name__)
@@ -317,46 +318,6 @@ def compact_annotations(annotations: Sequence[Mapping[str, Any]]) -> list[dict[s
 	return result
 
 
-def build_layer2_input_document(layer1_document: Mapping[str, Any]) -> dict[str, Any]:
-	"""Convert layer1 annotations into the aligned layer2 input document."""
-	annotations = list(layer1_document.get("annotations", []))
-	tokens: list[dict[str, Any]] = []
-	for i, ann in enumerate(annotations):
-		tokens.append(
-			{
-				"index": int(ann.get("index", i)),
-				"text": ann.get("content", ""),
-			}
-		)
-	return {
-		"source": layer1_document.get("source", ""),
-		"tokens": tokens,
-	}
-
-
-def write_perception_outputs(
-	layer1_document: Mapping[str, Any],
-	layer2_document: Mapping[str, Any],
-	output_dir: Path,
-	*,
-	layer1_filename: str = "layer1_annotations.json",
-	layer2_filename: str = "layer2_input.json",
-) -> tuple[Path, Path]:
-	"""Write compact layer1 and layer2 input json into output folder."""
-	output_dir.mkdir(parents=True, exist_ok=True)
-	layer1_path = output_dir / layer1_filename
-	layer2_path = output_dir / layer2_filename
-	layer1_path.write_text(
-		json.dumps(layer1_document, ensure_ascii=False, indent=2),
-		encoding="utf-8",
-	)
-	layer2_path.write_text(
-		json.dumps(layer2_document, ensure_ascii=False, indent=2),
-		encoding="utf-8",
-	)
-	return layer1_path, layer2_path
-
-
 def _torch_dtype(dtype_name: str) -> torch.dtype:
 	mapping = {
 		"float16": torch.float16,
@@ -417,8 +378,8 @@ def run_perception_layer(
 	silence_threshold: float | None = None,
 	max_chars: int | None = None,
 	segmentation_mode: str | None = None,
-) -> Path:
-	"""L1 端到端：视频 → layer1_annotations.json + layer2_input.json，返回 JSON1 路径。"""
+) -> None:
+	"""L1 端到端：视频 ASR → 写入 ``timeline_manifest.json`` 的 ``annotations[]``。"""
 	from autosmartcut.log import ensure_autosmartcut_logging
 
 	ensure_autosmartcut_logging(verbose=False)
@@ -503,19 +464,18 @@ def run_perception_layer(
 		"raw_text": full_doc["raw_text"],
 		"annotations": compact_annotations(full_doc["annotations"]),
 	}
-	layer2_doc = build_layer2_input_document(light_doc)
 
-	write_perception_outputs(
-		{
-			"source": light_doc["source"],
-			"annotations": light_doc["annotations"],
-		},
-		layer2_doc,
-		run.output_dir,
-		layer1_filename=run.json1_path.name,
-		layer2_filename=run.json2_path.name,
-	)
+	data = load_manifest(run.manifest_path)
+	data["source"] = light_doc["source"]
+	data["language"] = light_doc["language"]
+	data["raw_text"] = light_doc["raw_text"]
+	data["annotations"] = light_doc["annotations"]
+	sm = data.setdefault("source_media", {})
+	if isinstance(sm, dict):
+		sm["path"] = light_doc["source"]
+		sm["duration"] = float(duration)
+	touch_layer_status(data, "l1")
+	save_manifest(run.manifest_path, data, atomic=True)
 
 	n = len(light_doc["annotations"])
-	logger.info("[L1] 完成 segmentation=%s 标注数=%d → %s", seg_mode, n, run.json1_path)
-	return run.json1_path
+	logger.info("[L1] 完成 segmentation=%s 标注数=%d → %s", seg_mode, n, run.manifest_path)

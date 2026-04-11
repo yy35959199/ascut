@@ -1,4 +1,4 @@
-# Layer 3：JSON 加载、媒体时长、smartcut 成片；时间轴合并逻辑见 timeline_segments
+# Layer 3：清单加载、媒体时长、smartcut 成片；时间轴合并逻辑见 timeline_segments
 from __future__ import annotations
 
 import json
@@ -7,9 +7,10 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from autosmartcut.annotation_tokens import video_path_from_manifest
 from autosmartcut.config import AppConfig, load_config
+from autosmartcut.manifest_io import load_manifest, save_manifest, touch_layer_status
 from autosmartcut.pipeline_run import PipelineRun
-# 向后兼容：原从 execution 导入的合并辅助函数仍可用；实现均在 timeline_segments
 from autosmartcut.timeline_segments import (  # noqa: F401
     apply_padding,
     collect_kept_intervals,
@@ -41,9 +42,10 @@ def resolve_media_path(source: str, ref_json: Path) -> Path:
     raise FileNotFoundError(f"找不到源视频: {source}（相对 {ref_json.parent} 或当前工作目录）")
 
 
-def positive_segments_from_mask_files(
-    layer1_path: Path,
-    mask_path: Path,
+def positive_segments_from_annotations(
+    annotations: list[dict[str, Any]],
+    keep_mask: list[dict[str, Any]],
+    video: Path,
     *,
     pre_pad: float = 0.15,
     post_pad: float = 0.25,
@@ -53,16 +55,10 @@ def positive_segments_from_mask_files(
     vad_snap_disabled_by_cli: bool = False,
 ):
     """
-    从 layer1_annotations.json 与 layer2 输出 JSON 生成 positive_segments。
+    从句级 annotations 与 keep_mask 生成 positive_segments。
     返回 (segments, video_path, duration)。
     """
     from smartcut.media_container import MediaContainer
-
-    layer1 = load_json(layer1_path)
-    mask_doc = load_json(mask_path)
-    annotations = layer1["annotations"]
-    keep_mask = mask_doc["keep_mask"]
-    video = resolve_media_path(layer1["source"], layer1_path)
 
     media = MediaContainer(str(video))
     try:
@@ -122,7 +118,7 @@ def run_execution_layer(
     gap_after_cap: float | None = None,
     vad_snap_disabled_by_cli: bool = False,
 ) -> Path:
-    """L3 端到端：JSON1 + JSON3 → 输出视频，返回输出路径。"""
+    """L3 端到端：清单 ``annotations`` + ``current.keep_mask`` → 输出视频。"""
     from autosmartcut.log import ensure_autosmartcut_logging
     from smartcut.media_container import MediaContainer
     from smartcut.misc_data import AudioExportInfo, AudioExportSettings
@@ -135,10 +131,25 @@ def run_execution_layer(
             config.execution.gap_after_cap if config is not None else load_config().execution.gap_after_cap
         )
 
+    mp = run.manifest_path
+    data = load_manifest(mp)
+    annotations = data.get("annotations")
+    if not isinstance(annotations, list):
+        raise ValueError("清单缺少 annotations[]")
+    cur = data.get("current")
+    if not isinstance(cur, dict):
+        raise ValueError("清单缺少 current")
+    keep_mask = cur.get("keep_mask")
+    if not isinstance(keep_mask, list):
+        raise ValueError("清单缺少 current.keep_mask[]")
+
+    video = video_path_from_manifest(data, mp)
+
     logger.info("[L3] 开始执行层")
-    positive, video, duration = positive_segments_from_mask_files(
-        run.json1_path,
-        run.json3_path,
+    positive, video_resolved, duration = positive_segments_from_annotations(
+        annotations,
+        keep_mask,
+        video,
         pre_pad=pre_pad,
         post_pad=post_pad,
         min_duration=min_duration,
@@ -150,17 +161,26 @@ def run_execution_layer(
         raise ValueError("keep_mask 解析后无保留区间")
 
     out = run.output_video
+    try:
+        if out.resolve() == video_resolved.resolve():
+            raise ValueError(
+                "输出视频路径与源视频解析为同一路径，已中止以免覆盖原始文件；"
+                "请使用默认 ascut_out_* 目录或指定与源文件不同的 --output-dir / --output-name。"
+            )
+    except OSError:
+        pass
+
     out.parent.mkdir(parents=True, exist_ok=True)
 
     logger.info(
         "[L3] 源视频 %s 时长 %.2fs keep 段数 %d → %s",
-        video,
+        video_resolved,
         duration,
         len(positive),
         out,
     )
 
-    media = MediaContainer(str(video))
+    media = MediaContainer(str(video_resolved))
     try:
         if not media.audio_tracks:
             raise ValueError("输入文件没有音轨")
@@ -179,6 +199,9 @@ def run_execution_layer(
             raise RuntimeError(f"smart_cut 失败: {err}")
     finally:
         media.close()
+
+    touch_layer_status(data, "l3")
+    save_manifest(mp, data, atomic=True)
 
     logger.info("[L3] 完成 → %s", out)
     return out

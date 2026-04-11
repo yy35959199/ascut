@@ -28,7 +28,11 @@ from openai import OpenAI
 # 系统提示词（所有调用共享，利用缓存）
 SYSTEM_PROMPT = """你是一位专业的视频内容分析专家。
 你的任务是根据用户提供的视频转写文本，进行语义理解和结构化分析。
-请严格按照用户要求的 JSON 格式输出结果。"""
+
+输出纪律（须遵守，与 DeepSeek JSON 模式一致）：
+- 只输出**一个** JSON 对象；不要 Markdown 围栏、不要 JSON 以外的说明文字。
+- 用户消息末尾会给出「示例 JSON」：**键名与嵌套层级必须与该示例完全一致**；禁止用同义键名替代（例如区间须用示例里的整数字段名，不得另造字段名表达同一含义）。
+- 若示例与 JSON Schema 有歧义，以能通过 Schema 校验为准，且键名仍须与示例一致。"""
 
 # 重试配置
 DEFAULT_MAX_RETRIES = 3
@@ -37,13 +41,12 @@ RETRY_DELAY_SECONDS = 1.0  # 重试间隔（指数退避）
 # JSON 格式说明模板
 JSON_FORMAT_INSTRUCTION = """
 
-请以 JSON 格式输出，格式如下：
+请**只**输出一个 JSON 对象，结构须与下方「示例 JSON」**键名一致、嵌套一致**（与 API 的 JSON 模式配合；不在此处输出除 JSON 外的任何字符）：
 {format_example}
 
 注意：
-- 必须输出合法的 JSON 对象
-- 字段名和类型必须严格匹配上述格式
-- 不要输出任何 JSON 之外的内容
+- 字段名、类型、数组元素形状必须与示例一致；**不得**用其它字段名表达同一信息。
+- 必须是可以被 `json.loads` 解析的合法 JSON。
 """
 
 # ============================================================================
@@ -205,34 +208,55 @@ def _build_messages(prompt: str, schema: dict) -> list[dict]:
     ]
 
 
-def _generate_json_example(schema: dict) -> str:
-    """根据 JSON Schema 生成格式样例
+def _schema_to_example(schema: dict[str, Any], *, field_hint: str = "") -> Any:
+    """由 JSON Schema 片段递归生成**一条**可展示的示例值（数组至少含一个元素）。"""
+    if not isinstance(schema, dict):
+        return None
+    if "const" in schema:
+        return schema["const"]
+    if "enum" in schema and isinstance(schema["enum"], list) and schema["enum"]:
+        return schema["enum"][0]
 
-    简化实现：直接将 schema 转为格式化的 JSON 字符串
-    """
-    # 从 schema 提取示例结构
+    t = schema.get("type")
+    if isinstance(t, list):
+        t = next((x for x in t if x != "null"), None)
+    if t is None and "properties" in schema:
+        t = "object"
+
+    if t == "array":
+        items = schema.get("items")
+        if isinstance(items, dict) and items:
+            return [_schema_to_example(items, field_hint=field_hint)]
+        return []
+
+    if t == "object" or "properties" in schema:
+        props = schema.get("properties")
+        if not isinstance(props, dict):
+            return {}
+        out: dict[str, Any] = {}
+        for key, sub in props.items():
+            out[key] = _schema_to_example(sub, field_hint=key)
+        return out
+
+    if t == "string":
+        return f"<{field_hint}>" if field_hint else "<string>"
+    if t == "integer":
+        return 0
+    if t == "number":
+        return 0.0
+    if t == "boolean":
+        return True
+    return None
+
+
+def _generate_json_example(schema: dict[str, Any]) -> str:
+    """根据 JSON Schema 生成格式样例（递归；数组含一条示例元素）。"""
     if "properties" in schema:
-        example = {}
-        for key, value in schema["properties"].items():
-            prop_type = value.get("type", "string")
-
-            if prop_type == "string":
-                example[key] = f"<{key}>"
-            elif prop_type == "number" or prop_type == "integer":
-                example[key] = 0
-            elif prop_type == "boolean":
-                example[key] = True
-            elif prop_type == "array":
-                example[key] = []
-            elif prop_type == "object":
-                example[key] = {}
-            else:
-                example[key] = None
-
-        return json.dumps(example, indent=2, ensure_ascii=False)
-    else:
-        # 如果没有 properties，直接返回 schema
-        return json.dumps(schema, indent=2, ensure_ascii=False)
+        example_obj = _schema_to_example(schema, field_hint="")
+        if not isinstance(example_obj, dict):
+            example_obj = {}
+        return json.dumps(example_obj, indent=2, ensure_ascii=False)
+    return json.dumps(schema, indent=2, ensure_ascii=False)
 
 
 # ============================================================================

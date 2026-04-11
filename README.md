@@ -20,34 +20,35 @@ conda activate ascut
 
 ## 演示命令
 
+主产物为输出目录下的 **`timeline_manifest.json`**（见 [doc/AutoSmartCut-MVP-Mini.md](doc/AutoSmartCut-MVP-Mini.md)）。
+
 ```powershell
-# Demo1：ASR（需模型与输入视频）
+# Demo1：ASR（需模型与输入视频）→ 写入 outputs/timeline_manifest.json 等
 python demos/demo1_asr.py
 
-# 由 Demo1 完整 JSON 生成 layer1 / layer2 / mock mask（辅助工具，非环节演示）
+# 由 Demo1 完整 JSON 生成带 mock keep_mask 的清单（辅助工具）
 python demos/tools/gen_demo_jsons.py
 
-# Demo2：智能层 JSON2 → JSON3（需配置 LLM；默认跳过 2d，加 --interactive-2d 可人工审阅）
-python demos/demo2_llm.py --layer2 output/layer2_input.json --output output/layer2_output.json --goal "提取核心观点"
-# 等价：python -m autosmartcut.intelligence output/layer2_input.json output/layer2_output.json --goal "..." --auto
+# Demo2：智能层更新清单（需配置 LLM；默认跳过 2d，加 --interactive-2d 可人工审阅）
+python demos/demo2_llm.py --manifest outputs/timeline_manifest.json --goal "提取核心观点"
+# 等价：python -m autosmartcut.intelligence --manifest outputs/timeline_manifest.json --goal "..." --auto
 
-# 三层编排（Windows 示例）
-# ascut run --input samples\alxe_01.mp4 --goal "提取核心观点"
-# ascut run --from-stage 2 --layer2-json output\layer2_input.json --goal "精华剪辑"
-# ascut run --from-stage 3 --layer1-json output\layer1_annotations.json --layer3-json output\layer2_output.json
-# ascut run --from-stage 3 ... --no-vad-snap   # 关闭 L3 VAD 切点吸附
+# 三层编排（默认 --stage 123 全流程）
+ascut run --input samples\alxe_01.mp4 --goal "提取核心观点"
+ascut run --stage 23 --manifest outputs\timeline_manifest.json --goal "精华剪辑"
+ascut run --stage 3 --manifest outputs\timeline_manifest.json --output-name only_l3.mp4
+ascut run --stage 3 ... --no-vad-snap   # 关闭 L3 VAD 切点吸附
 
-# Demo3：json 模式（JSON1 + JSON3 → smartcut；路径按本机产物目录填写 output/ 或 outputs/）
+# Demo3：json 模式（清单 → smartcut）
 python demos/demo3_smartcut.py json `
-  --layer1 output/layer1_annotations.json `
-  --mask output/layer2_output_mock.json `
-  --output output/demo3_from_mask.mp4
+  --manifest outputs/timeline_manifest.json `
+  --output outputs/demo3_from_mask.mp4
 
-# Demo3：dense 压测（不依赖 layer1）
+# Demo3：dense 压测（不依赖清单）
 python demos/demo3_smartcut.py dense --input samples\alxe_01.mp4
 ```
 
-`layer1_annotations.json` 中的 `source` 需能解析到真实视频文件（相对 JSON 所在目录或当前工作目录）。文档与示例中 **`output/`**、**`outputs/`** 均可能出现，以你本机实际产物路径为准。
+清单中 `source_media.path`（或顶层 `source`）须能解析到真实视频文件（相对清单所在目录或当前工作目录）。文档与示例中 **`output/`**、**`outputs/`** 均可能出现，以你本机实际产物路径为准。
 
 ### Layer 3：切点吸附（VAD Snap）
 
@@ -67,10 +68,11 @@ python demos/demo3_smartcut.py dense --input samples\alxe_01.mp4
 | `tests/test_l2_*.py`、`tests/test_intelligence_llm_multiturn.py` | Layer 2 | `test_l2_2b` / `test_l2_llm_schema` / `test_intelligence_llm_multiturn` 不经过 torch |
 | `tests/test_l3_*.py` | Layer 3 | 执行层区间逻辑 |
 | `tests/test_vad_silence.py` | Layer 3 | VAD 静音补集与切点吸附（snap）纯逻辑 |
+| `tests/test_manifest_*.py`、`tests/test_annotation_tokens.py` | 清单 / 句面 | 无 torch |
 
 ```powershell
 pytest tests/test_l2_2b.py tests/test_l2_llm_schema.py tests/test_intelligence_llm_multiturn.py tests/test_l3_execution.py tests/test_vad_silence.py -q
 pytest tests/ -q
 ```
 
-Layer 1 清单为**句级语音**：每条含 `index`、`t_start`、`t_end`、`content`、`gap_after`（无独立静音行）。`layer2_input.json` 中 `tokens[]` 仅 `index` 与 `text`。
+句级 **`annotations[]`**：每条含 `index`、`t_start`、`t_end`、`content`、`gap_after`（无独立静音行）。智能层运行时由 **`tokens[]`（仅 `index` + `text`）** 在内存中从 `annotations` 派生。
