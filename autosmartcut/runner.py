@@ -4,7 +4,7 @@
 
     ascut run [--stage SPEC] [--input|--manifest ...]
 
-``--stage``：``1`` | ``2`` | ``3`` | ``12`` | ``23`` | ``123``；省略且未指定 ``--from-stage`` 时等价全流程 ``123``。
+``--stage``：``1`` | ``2`` | ``3`` | ``12`` | ``23`` | ``123`` | ``1a`` | ``1b`` | ``1a2`` | ``1b2`` | ``1a23`` | ``1b23``；省略且未指定 ``--from-stage`` 时等价全流程 ``123``。
 ``--from-stage`` 已弃用，映射为等价 ``--stage``（见 doc/AutoSmartCut-MVP-Mini.md）。
 
 单一持久化文件：``timeline_manifest.json``（见 ``autosmartcut.manifest_io``）。
@@ -24,8 +24,12 @@ from autosmartcut.execution import run_execution_layer
 from autosmartcut.intelligence import run_intelligence_layer
 from autosmartcut.log import setup_logging
 from autosmartcut.manifest_io import load_manifest, validate_manifest_for_stages
-from autosmartcut.manifest_stages import resolve_stages, validate_cli_args
-from autosmartcut.perception import run_perception_layer
+from autosmartcut.manifest_stages import infer_l1_mode, resolve_stages, validate_cli_args
+from autosmartcut.perception import (
+	run_l1a_asr_only,
+	run_l1b_align_only,
+	run_perception_layer,
+)
 from autosmartcut.pipeline_run import PipelineRun
 
 logger = logging.getLogger(__name__)
@@ -44,7 +48,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         default=None,
         metavar="SPEC",
-        help="1|2|3|12|23|123；省略且未指定 --from-stage 时默认全流程 123",
+        help="1|2|3|12|23|123|1a|1b|1a2|1b2|1a23|1b23；省略且未指定 --from-stage 时默认全流程 123",
     )
     pr.add_argument(
         "--from-stage",
@@ -137,7 +141,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _build_run(args: argparse.Namespace) -> PipelineRun:
     stages: frozenset[int] = getattr(args, "_resolved_stages")
-    if 1 in stages:
+    l1_mode = infer_l1_mode(args, stages)
+    if 1 in stages or l1_mode in ("both", "a"):
         return PipelineRun.new(
             video_path=args.input,
             goal=args.goal or "",
@@ -196,10 +201,33 @@ def _run_pipeline(args: argparse.Namespace) -> int:
     auto = not args.interactive_2d
 
     try:
-        if 1 in stages:
+        l1_mode = infer_l1_mode(args, stages)
+        if l1_mode == "both" and 1 in stages:
             run_perception_layer(
                 run,
                 asr_model_path=asr_model,
+                forced_aligner_path=forced,
+                config=cfg,
+                backend=args.backend,
+                device=args.device,
+                dtype=args.dtype,
+                language=args.language,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+            )
+        elif l1_mode == "a" and 1 in stages:
+            run_l1a_asr_only(
+                run,
+                asr_model_path=asr_model,
+                config=cfg,
+                backend=args.backend,
+                device=args.device,
+                dtype=args.dtype,
+                language=args.language,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+            )
+        elif l1_mode == "b":
+            run_l1b_align_only(
+                run,
                 forced_aligner_path=forced,
                 config=cfg,
                 backend=args.backend,
@@ -219,6 +247,9 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             )
 
         if 3 in stages:
+            validate_manifest_for_stages(
+                frozenset({3}), load_manifest(run.manifest_path)
+            )
             run_execution_layer(
                 run,
                 config=cfg,

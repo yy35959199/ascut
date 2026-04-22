@@ -12,6 +12,7 @@ from autosmartcut.manifest_io import (
     save_manifest,
     strip_volatile_fields,
     touch_layer_status,
+    validate_manifest_for_l1b,
     validate_manifest_for_stages,
     write_l2_checkpoint,
 )
@@ -74,6 +75,28 @@ def test_validate_manifest_for_stages_l2_empty_anns() -> None:
     d = make_manifest_skeleton("r", "", "v.mp4")
     with pytest.raises(ValueError, match="annotations"):
         validate_manifest_for_stages(frozenset({2}), d)
+
+
+def test_validate_manifest_for_stages_l3_missing_times() -> None:
+    d = make_manifest_skeleton("r", "", "v.mp4")
+    d["annotations"] = [
+        {"index": 0, "t_start": None, "t_end": None, "content": "a", "gap_after": None},
+    ]
+    d["current"] = {"keep_mask": [{"index": 0, "keep": True}]}
+    with pytest.raises(ValueError, match="t_start"):
+        validate_manifest_for_stages(frozenset({3}), d)
+
+
+def test_validate_manifest_for_l1b_ok(tmp_path: Path) -> None:
+    p = tmp_path / MANIFEST_FILENAME
+    d = make_manifest_skeleton("r", "", "v.mp4")
+    d["raw_text"] = "你好。世界。"
+    d["annotations"] = [
+        {"index": 0, "content": "你好", "t_start": None, "t_end": None},
+        {"index": 1, "content": "世界", "t_start": None, "t_end": None},
+    ]
+    save_manifest(p, d, atomic=True)
+    validate_manifest_for_l1b(p)
 
 
 def test_validate_manifest_for_stages_l3_ok() -> None:

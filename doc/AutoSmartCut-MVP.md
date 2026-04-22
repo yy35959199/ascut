@@ -39,13 +39,13 @@ MVP 是三层语义管道的**最简可运行实现**：每层各有硬编码节
 
 | 层 | 节点 | 产出 |
 |----|------|------|
-| Layer 1 识别层 | Qwen3-ASR-1.7B 转写 + Qwen3-ForcedAligner-0.6B 字级对齐 + 句级聚合 + 每条 `gap_after`（句间间隔） | 句级标注列表（`annotations[]`）；**现行**写入 **`timeline_manifest.json`** |
-| Layer 2 智能层 | DeepSeek LLM（2a：两轮调用 + 程序替换；2b：一次调用）+ **2c 透传** + **2d 透传或默认跳过** | **`comprehension`**（主旨 + `outline_blocks` + 程序稠密 **`cleaned_annotations`**）+ **`keep_mask`**（及 MVP-mini 下与草案一致的 **`keep_mask_final`**）；**不**在智能层落盘 EDL（由执行层内部合成），详见 [intelligence-layer2-mvp.md](intelligence-layer2-mvp.md) §11 |
+| Layer 1 识别层 | **L1A**：Qwen3-ASR-1.7B 转写 + 纯文本分句（冻结 `index-text`）；**L1B**：Qwen3-ForcedAligner-0.6B 对齐并回填句级 `t_start`/`t_end`/`gap_after` | 句级标注列表（`annotations[]`）；**现行**写入 **`timeline_manifest.json`**，并记录 `layer_status.l1a_completed_at` / `layer_status.l1b_completed_at` / `layer_status.l1_completed_at` |
+| Layer 2 智能层 | DeepSeek LLM（2a：两轮调用 + 程序替换；2b：一次调用）+ **2c 透传** + **2d 透传或默认跳过** | **`comprehension`**（主旨 + `outline_blocks` + 程序稠密 **`cleaned_annotations`**）+ **`keep_mask`**（执行层以此为 SSOT）；**不**在智能层落盘 EDL（由执行层内部合成），详见 [intelligence-layer2-mvp.md](intelligence-layer2-mvp.md) §11 |
 | Layer 3 执行层 | 句级时间轴 + **定稿 mask** → 时间区间（含可选 **Silero VAD 切点吸附**）→ **smartcut**（帧精确剪切） | 最终视频文件；**现行**读清单内 **`annotations[]` + `current.keep_mask`** |
 
 ### 全链路 MVP（runner）与现行串接方式
 
-- **全链路编排（现行）**：`runner.py` + **`ascut run`** / `python -m autosmartcut.runner run`，**`--stage`**（`1|2|3|12|23|123`）；清单路径 **`--manifest`**；含 `1` 时 **`--input`** 新建/更新清单。
+- **全链路编排（现行）**：`runner.py` + **`ascut run`** / `python -m autosmartcut.runner run`，`--stage` 支持 `1|2|3|12|23|123|1a|1b|1a2|1b2|1a23|1b23`；其中 `1` 表示完整 L1（L1A+L1B），`1a` 仅 ASR 文本定稿，`1b` 仅对齐补时间。清单路径 **`--manifest`**；需创建清单（`1` 或 `1a*`）时使用 **`--input`**。
 - **断点续跑（规划）**：配合 **`checkpoint.py`** 与视频同目录下的 **`.autosmartcut_<视频主文件名>/`**（`manifest.json` 等）及 **`--resume`** —— **尚未实现**。
 - **现行可用路径（手工串联）**：
   1. Layer 1：`demos/demo1_asr.py`（或等价流程）在输出目录写入 **`timeline_manifest.json`**（含 `annotations[]`）；
@@ -77,7 +77,7 @@ MVP 是三层语义管道的**最简可运行实现**：每层各有硬编码节
 - 2d：手动切换 index 的 keep/cut、确认后定稿 **`keep_mask`** 写回清单 **`current`**（**不**在智能层落盘 EDL）
 
 **已实现（编排）：**
-- `runner.py`：**`ascut run`**；**`--stage`**；**`--manifest`** / **`--input`**；L3 读清单 **`annotations` + `current.keep_mask`**。
+- `runner.py`：**`ascut run`**；**`--stage`**（含 `1a/1b` 拆分模式）；**`--manifest`** / **`--input`**；L3 读清单 **`annotations` + `current.keep_mask`**。
 
 **规划中、尚未落地（仍属 MVP 文档目标，未删需求）：**
 - `checkpoint.py` 与 **`.autosmartcut_<视频名>/`** 检查点目录及 `--resume` 等（可与 §3「检查点目录结构」合并演进）
@@ -163,7 +163,7 @@ MVP 的 Layer 3（执行层）直接调用 smartcut 库，而非自行拼接 FFm
 |------|--------|--------|------|
 | 顶层 `source_media`、`annotations[]` | Layer 1 · `perception.py` | Layer 2 / Layer 3 | 时间轴与原始句级 `content`；L2 在内存中派生 **`tokens[]`** |
 | `current`（`comprehension`、`keep_mask` 等） | Layer 2 · `intelligence.py` | Layer 3 · `execution.py` | LLM + 程序产物；保存前 **`strip_volatile_fields`** 剥离不落盘项 |
-| `layer_status` | 各层 | 编排 / 校验 | 如 `l1_completed_at`、`l2_completed_at`、`l3_completed_at` |
+| `layer_status` | 各层 | 编排 / 校验 | 如 `l1a_completed_at`、`l1b_completed_at`、`l1_completed_at`、`l2_completed_at`、`l3_completed_at` |
 
 ### 历史三 JSON（仅迁移 / 文档对照）
 
@@ -575,7 +575,7 @@ ascut/  （或 AutoSmartCut/）
 
 - Layer 2：`python -m autosmartcut.intelligence --manifest <timeline_manifest.json> [--goal "..."] [--auto] [--verbose] [--two-b-mode single|chunked]`
 - 等价：`python demos/demo2_llm.py --manifest <path> ...`
-- 编排：`ascut run`（**`--stage`**；省略且未指定 **`--from-stage`** 时等价全流程 `123`；**`--manifest`** / **`--input`**）；**`--no-vad-snap`** 关闭 L3 VAD
+- 编排：`ascut run`（**`--stage`** 支持 `1a/1b`；省略且未指定 **`--from-stage`** 时等价全流程 `123`；**`--manifest`** / **`--input`**）；**`--no-vad-snap`** 关闭 L3 VAD
 - Layer 1 / 3：见 `demos/demo1_asr.py`、`demos/demo3_smartcut.py` 的参数说明（Demo3 json 模式：`--no-vad-snap`、`--config`）
 
 **规划中（未实现，需求保留）**
@@ -652,7 +652,7 @@ dev = ["pytest>=7"]
 | `source_media` | `path`、`duration` 等；不含二进制。 |
 | `annotations[]` | 与现行 **JSON1** 句级数组同构（含 `index`、`t_start`、`t_end`、`content`、`gap_after`、`confidence`、`metadata.char_timestamps` 等）。 |
 | `current` | 单轮快照对象（见 §10.2）。 |
-| `layer_status` | 可选：`l1_completed_at`、`l2_completed_at`、`l3_completed_at` 等 ISO8601 字符串。 |
+| `layer_status` | 可选：`l1a_completed_at`、`l1b_completed_at`、`l1_completed_at`、`l2_completed_at`、`l3_completed_at` 等 ISO8601 字符串。 |
 
 **MVP-mini 省略（完整版见 AutoSmartCut.md §11.2–§11.5）**：`previous`、`history_summary`（无智能层多轮闭环时不需）。
 

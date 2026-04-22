@@ -116,6 +116,24 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def validate_manifest_for_l1b(manifest_path: Path) -> None:
+    """L1B 前置：清单须含 L1A 产物与可续跑的句级文本。"""
+    data = load_manifest(manifest_path)
+    raw = data.get("raw_text")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("L1B 需要 manifest 含非空 raw_text（请先执行 L1A 或 --stage 1）")
+    anns = data.get("annotations")
+    if not isinstance(anns, list) or len(anns) == 0:
+        raise ValueError("L1B 需要非空 annotations[]")
+    for i, ann in enumerate(anns):
+        if not isinstance(ann, dict):
+            raise ValueError(f"annotations[{i}] 须为对象")
+        if int(ann.get("index", -1)) != i:
+            raise ValueError(f"annotations[{i}].index 须为 {i}，实际 {ann.get('index')!r}")
+        if "content" not in ann or str(ann.get("content", "")).strip() == "":
+            raise ValueError(f"annotations[{i}] 缺少有效 content")
+
+
 def validate_manifest_for_stages(stages: frozenset[int], data: dict[str, Any]) -> None:
     """按即将执行的阶段校验清单字段。"""
     if 2 in stages:
@@ -126,6 +144,14 @@ def validate_manifest_for_stages(stages: frozenset[int], data: dict[str, Any]) -
         anns = data.get("annotations")
         if not isinstance(anns, list) or len(anns) == 0:
             raise ValueError("执行 L3 需要非空 annotations[]")
+        for i, ann in enumerate(anns):
+            if not isinstance(ann, dict):
+                raise ValueError(f"annotations[{i}] 须为对象")
+            if ann.get("t_start") is None or ann.get("t_end") is None:
+                raise ValueError(
+                    "执行 L3 需要每条 annotation 含 t_start/t_end；"
+                    "若仅有 L1A 文本请先执行 --stage 1b 或完整 --stage 1"
+                )
         cur = data.get("current")
         if not isinstance(cur, dict):
             raise ValueError("执行 L3 需要 current 对象")
@@ -148,7 +174,7 @@ def validate_manifest_for_stages(stages: frozenset[int], data: dict[str, Any]) -
 
 
 def touch_layer_status(data: dict[str, Any], layer: str) -> None:
-    """写入 layer_status 完成时间戳（layer 为 l1|l2|l3）。"""
+    """写入 layer_status 完成时间戳（layer 为 l1|l1a|l1b|l2|l3）。"""
     ls = data.setdefault("layer_status", {})
     if not isinstance(ls, dict):
         data["layer_status"] = {}

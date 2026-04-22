@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from autosmartcut.manifest_stages import (
+    infer_l1_mode,
     parse_stage_spec,
     resolve_stages,
     validate_cli_args,
@@ -18,6 +19,21 @@ def test_parse_stage_spec() -> None:
     assert parse_stage_spec("12") == frozenset({1, 2})
     assert parse_stage_spec("23") == frozenset({2, 3})
     assert parse_stage_spec("1") == frozenset({1})
+    assert parse_stage_spec("1a2") == frozenset({1, 2})
+    assert parse_stage_spec("1b2") == frozenset({2})
+    assert parse_stage_spec("1b") == frozenset()
+
+
+def test_infer_l1_mode_fallback() -> None:
+    ns = argparse.Namespace()
+    assert infer_l1_mode(ns, frozenset({2, 3})) == "none"
+    assert infer_l1_mode(ns, frozenset({1})) == "both"
+
+
+def test_resolve_stages_1a_sets_l1_mode() -> None:
+    ns = argparse.Namespace(stage="1a2", from_stage=None)
+    assert resolve_stages(ns) == frozenset({1, 2})
+    assert getattr(ns, "_l1_mode") == "a"
 
 
 def test_parse_stage_spec_invalid() -> None:

@@ -5,6 +5,7 @@ from autosmartcut.perception import (
     SpeechSegment,
     compact_annotations,
     _annotations_from_segments,
+    segment_raw_text_only,
 )
 
 
@@ -37,6 +38,15 @@ def test_tokens_from_annotations_matches_layer1_shape() -> None:
     }
     out = tokens_from_annotations(layer1_doc["annotations"])
     assert out == [{"index": 0, "text": "A"}, {"index": 1, "text": "B"}]
+
+
+def test_segment_raw_text_only_punctuation() -> None:
+    spans = segment_raw_text_only("你好。世界！", set(), max_chars=200)
+    assert len(spans) == 2
+    assert spans[0].content == "你好"
+    assert spans[1].content == "世界"
+    assert spans[0].first_kept_ord == 0
+    assert spans[0].last_kept_ord == 1
 
 
 def test_compact_annotations_drops_char_metadata() -> None:

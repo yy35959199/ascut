@@ -177,6 +177,14 @@ def run_execution_layer(
     annotations = data.get("annotations")
     if not isinstance(annotations, list):
         raise ValueError("清单缺少 annotations[]")
+    for i, ann in enumerate(annotations):
+        if not isinstance(ann, dict):
+            continue
+        if ann.get("t_start") is None or ann.get("t_end") is None:
+            raise ValueError(
+                "清单中 annotations 缺少 t_start/t_end，无法执行 L3；"
+                "请先运行 ascut run --stage 1b 或完整 --stage 1"
+            )
     cur = data.get("current")
     if not isinstance(cur, dict):
         raise ValueError("清单缺少 current")

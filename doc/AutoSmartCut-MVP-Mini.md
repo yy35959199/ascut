@@ -121,22 +121,29 @@
 
 ### 8.1 `--stage`（正式）
 
-合法 **`SPEC`**：`1`、`2`、`3`、`12`、`23`、`123`（有序、连续子集）。默认 **`123`**。
+合法 **`SPEC`**（有序子集）：`1`、`2`、`3`、`12`、`23`、`123`；以及 **L1 拆分**：`1a`、`1b`、`1a2`、`1b2`、`1a23`、`1b23`。默认 **`123`**。
 
-解析为集合 `stages ⊆ {1,2,3}` 后：
+- **`1`**：完整 L1（等价 **L1A + L1B**：先 ASR 定稿 `index-text`，再强制对齐补 `t_start`/`t_end`）。  
+- **`1a`**：仅 L1A（ASR + 纯文本分句，**无**句级时间；`layer_status.l1a_completed_at`）。  
+- **`1b`**：仅 L1B（读取已有 `raw_text`/`annotations`，**只补时间**；`layer_status.l1b_completed_at`；须先有 L1A 或等价清单）。  
+- **`1a2` / `1b2` / `1a23` / `1b23`**：在同一命令内组合 L2/L3；**`1a23` 不含 L1B 时 L3 会因缺少时间校验失败**，需另跑 `1b` 或改用 `123`/`1b23`。
+
+解析为集合 `stages`（实现上仍为 `⊆ {1,2,3}` 的整数阶段，外加 `args._l1_mode`：`both` | `a` | `b` | `none`）后：
 
 ```text
-if 1 in stages: run_perception_layer(...)
+if l1_mode == both 且 1 in stages: run_perception_layer(...)   # 内部 = L1A + L1B
+elif l1_mode == a 且 1 in stages: run_l1a_asr_only(...)
+elif l1_mode == b: run_l1b_align_only(...)
 if 2 in stages: run_intelligence_layer(...)
-if 3 in stages: run_execution_layer(...)
+if 3 in stages: run_execution_layer(...)   # 要求每条 annotation 含 t_start/t_end
 ```
 
-**与 `--manifest` / `--input` 的交叉约束**（与先前方案一致）：
+**与 `--manifest` / `--input` 的交叉约束**：
 
-- `SPEC` **以 `1` 开头**：必须 `--input`；**禁止** `--manifest`（本次创建清单）。  
-- **不以 `1` 开头**（`2` / `3` / `23`）：必须 **`--manifest`**；禁止 `--input`。  
+- **`1` / `12` / `123` 或含 `1a`**（需从视频创建清单）：必须 `--input`；**禁止** `--manifest`。  
+- **`2` / `3` / `23` 或含 `1b` 且不以 `1`/`1a` 起编排**（续跑已有清单）：必须 **`--manifest`**；禁止 `--input`。  
 - `2 ∈ stages`：`annotations` 非空。  
-- `3 ∈ stages`：存在 `current.keep_mask` 且与 `annotations` 等长。
+- `3 ∈ stages`：存在 `current.keep_mask` 且与 `annotations` 等长；且 **`annotations[]` 每条含有效 `t_start`/`t_end`**（L1B 或完整 `1` 之后）。
 
 ### 8.2 `--from-stage`（仅兼容别名）
 

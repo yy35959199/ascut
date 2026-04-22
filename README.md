@@ -28,7 +28,7 @@
 
 | 层 | 职责 | 核心产出 |
 |----|------|---------|
-| **L1 识别** | 解码音频 → ASR → 字级对齐 → 句级聚合 | `annotations[]`（含 `metadata.char_timestamps`、`gap_after` 等） |
+| **L1 识别** | 解码音频 → ASR →（可选拆分 **L1A** 仅文本 / **L1B** 仅对齐补时）→ 句级聚合 | `annotations[]`（`gap_after`；字级时间戳是否落盘以当前 `compact_annotations` 为准） |
 | **L2 智能** | 2a 理解 → 2b 决策 → 2c 占位 → 2d 可选人工 | `current.comprehension`、`current.keep_mask`（与句条数等长） |
 | **L3 执行** | mask + 时间轴 → 保留区间 → 可选 VAD 吸附 → smartcut | 成片视频 |
 
@@ -54,8 +54,8 @@
 
 **当前版本**
 
-- [x] `ascut run`，`--stage` 为 `1` / `2` / `3` / `12` / `23` / `123`（均未指定时默认 `123`）
-- [x] `--stage` 含 `1` 时使用 `--input`；不含 `1` 时使用 `--manifest`
+- [x] `ascut run`，`--stage` 为 `1` / `2` / `3` / `12` / `23` / `123`，以及 **`1a` / `1b` / `1a2` / `1b2` / `1a23` / `1b23`**（均未指定时默认 `123`）
+- [x] `--stage` 为完整 L1 或 **`1a*`** 时使用 `--input`；否则（续跑清单，含 **`1b*`**）使用 `--manifest`
 - [x] `--from-stage` 仅作为 `--stage` 的兼容别名（仍建议使用 `--stage`）
 
 **长期方向**
