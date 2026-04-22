@@ -16,6 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from autosmartcut.annotation_tokens import tokens_from_annotations
+from autosmartcut.log import (
+    log_lazy_json,
+    log_stage,
+    log_stage_result,
+    setup_logging_for_manifest,
+)
 from autosmartcut.intelligence_2a import run_2a_comprehension
 from autosmartcut.intelligence_2b import run_2b_decision
 from autosmartcut.intelligence_2c import run_2c_review
@@ -40,11 +46,8 @@ def run_intelligence_layer(
     two_b_mode: str = "single",
 ) -> None:
     """Layer 2 主入口：清单 → 更新 ``current``（comprehension + keep_mask）。"""
-    from autosmartcut.log import ensure_autosmartcut_logging
-
-    ensure_autosmartcut_logging(verbose=verbose_log)
-
     mp = manifest_path.resolve()
+    setup_logging_for_manifest(mp, verbose=verbose_log)
     logger.info("[L2] 智能层开始 清单=%s", mp)
     if two_b_mode not in ("single", "chunked"):
         raise ValueError(f"two_b_mode 须为 'single' 或 'chunked'，实际: {two_b_mode!r}")
@@ -59,7 +62,12 @@ def run_intelligence_layer(
     if goal_use:
         logger.info("[L2] 目标: %s", goal_use)
 
-    tokens = tokens_from_annotations(annotations)
+    with log_stage(
+        "l2.tokens_from_annotations",
+        manifest=str(mp),
+        annotation_count=len(annotations),
+    ):
+        tokens = tokens_from_annotations(annotations)
 
     manifest_dict: dict[str, Any] = {
         "tokens": tokens,
@@ -73,10 +81,12 @@ def run_intelligence_layer(
         write_l2_checkpoint(data, mp, phase, payload)
 
     try:
-        manifest_dict = run_2a_comprehension(
-            manifest_dict, on_phase_save=_on_2a_phase_save
-        )
-        manifest_dict = run_2b_decision(manifest_dict, mode=two_b_mode)
+        with log_stage("l2.2a_comprehension", token_count=len(tokens)):
+            manifest_dict = run_2a_comprehension(
+                manifest_dict, on_phase_save=_on_2a_phase_save
+            )
+        with log_stage("l2.2b_decision", mode=two_b_mode):
+            manifest_dict = run_2b_decision(manifest_dict, mode=two_b_mode)
 
         # 2b 完成后将 comprehension + keep_mask 写入清单（L3 续跑仅需磁盘态即可）
         cur0 = data.setdefault("current", {})
@@ -94,7 +104,8 @@ def run_intelligence_layer(
             {"keep_true": n_keep, "keep_total": len(km)},
         )
 
-        manifest_dict = run_2c_review(manifest_dict)
+        with log_stage("l2.2c_review"):
+            manifest_dict = run_2c_review(manifest_dict)
 
         if auto:
             logger.info("[L2] auto 模式，跳过 2d 人工审阅")
@@ -108,7 +119,8 @@ def run_intelligence_layer(
                 }
             )
         else:
-            manifest_dict = run_2d_human_review(manifest_dict)
+            with log_stage("l2.2d_human_review"):
+                manifest_dict = run_2d_human_review(manifest_dict)
 
     except KeyboardInterrupt:
         logger.warning("[L2] 用户中断")
@@ -149,6 +161,16 @@ def run_intelligence_layer(
     save_manifest(mp, data, atomic=True)
 
     keep_count = sum(1 for e in keep_mask if e["keep"] is True)
+    log_lazy_json("L2", "keep_mask 完整输出", lambda: keep_mask)
+    log_lazy_json(
+        "L2",
+        "comprehension 完整输出",
+        lambda: manifest_dict.get("comprehension", {}),
+    )
+    log_stage_result(
+        "l2.output",
+        summary=f"保留 {keep_count}/{len(keep_mask)} 句 manifest={mp}",
+    )
     logger.info(
         "[L2] 完成 保留 %d/%d 句 → %s",
         keep_count,
@@ -193,7 +215,7 @@ def main() -> None:
             two_b_mode=args.two_b_mode,
         )
     except Exception as e:
-        print(f"\n错误: {e}")
+        logger.exception("错误: %s", e)
         sys.exit(1)
 
 

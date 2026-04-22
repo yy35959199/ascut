@@ -26,3 +26,7 @@ model = "deepseek-chat"                     # 默认模型
 reasoner_model = "deepseek-reasoner"        # Reasoner 模型
 default_temperature = 0.3                   # 默认温度
 default_max_tokens = 8192                   # 默认最大 tokens
+
+# 智能层：2b chunked 模式下，单 outline 块内超过该句数则按此长度二次拆分子块再调 LLM
+[intelligence]
+two_b_block_size_limit = 50

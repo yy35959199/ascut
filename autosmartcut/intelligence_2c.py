@@ -48,6 +48,9 @@ manifest_dict["review_report"] = {
 - 保持 schema 与完整版一致，便于未来升级
 """
 
+import logging
+
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # 模型参数（未来实现时使用）
@@ -73,7 +76,7 @@ def run_2c_review(manifest_dict: dict) -> dict:
     Returns:
         追加了 review_report 字段的 manifest_dict
     """
-    print("[2c] 审核子阶段（占位模式）")
+    logger.info("[2c] 审核子阶段（占位模式）")
 
     # MVP 占位实现：自动通过
     review_report = {
@@ -86,7 +89,7 @@ def run_2c_review(manifest_dict: dict) -> dict:
 
     manifest_dict["review_report"] = review_report
 
-    print("[2c] 自动通过审核")
+    logger.info("[2c] 自动通过审核")
     return manifest_dict
 
 

@@ -87,13 +87,23 @@ def test_call_llm_structured_schema_error_fail_fast(monkeypatch: pytest.MonkeyPa
     )
     monkeypatch.setattr(
         "autosmartcut.intelligence_llm._call_api",
-        lambda *args, **kwargs: SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content='{"x": 1}'))],
-            usage=SimpleNamespace(
-                prompt_tokens=1,
-                completion_tokens=1,
-                total_tokens=2,
+        lambda *args, **kwargs: (
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(message=SimpleNamespace(content='{"x": 1}'))
+                ],
+                usage=SimpleNamespace(
+                    prompt_tokens=1,
+                    completion_tokens=1,
+                    total_tokens=2,
+                ),
             ),
+            {
+                "model": "deepseek-chat",
+                "messages": [],
+                "max_tokens": 1024,
+                "response_format": {"type": "json_object"},
+            },
         ),
     )
 
@@ -128,7 +138,7 @@ def test_call_llm_structured_instance_error_retries(monkeypatch: pytest.MonkeyPa
             content = '{"decisions":[{"index":0,"keep":"true"}]}'
         else:
             content = '{"decisions":[{"index":0,"keep":true}]}'
-        return SimpleNamespace(
+        resp = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
             usage=SimpleNamespace(
                 prompt_tokens=1,
@@ -136,6 +146,14 @@ def test_call_llm_structured_instance_error_retries(monkeypatch: pytest.MonkeyPa
                 total_tokens=2,
             ),
         )
+        _client, msgs, model, temp, max_tokens, _enable = args[:6]
+        api_kw = {
+            "model": model,
+            "messages": msgs,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        return resp, api_kw
 
     monkeypatch.setattr("autosmartcut.intelligence_llm._call_api", _fake_call_api)
 

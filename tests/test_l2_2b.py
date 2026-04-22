@@ -132,6 +132,44 @@ def test_run_2b_chunked_empty_outline_falls_back_to_single(monkeypatch):
     assert out["keep_mask"][0]["keep"] is False
 
 
+def test_run_2b_chunked_splits_outline_block_by_config_limit(monkeypatch):
+    """单 outline 块句数 > two_b_block_size_limit 时二次拆分为多子块调用。"""
+    manifest = {
+        "goal": "g",
+        "tokens": [
+            {"index": i, "text": f"t{i}"} for i in range(5)
+        ],
+        "comprehension": {
+            "purpose": "p",
+            "outline_blocks": [{"start_index": 0, "end_index": 4, "summary": "一整块"}],
+            "cleaned_annotations": [
+                {"annotation_index": i, "cleaned_content": f"句{i}"} for i in range(5)
+            ],
+        },
+    }
+    responses = iter(
+        [
+            {"decisions": [{"index": 0, "keep": True}, {"index": 1, "keep": False}]},
+            {"decisions": [{"index": 2, "keep": False}, {"index": 3, "keep": True}]},
+            {"decisions": [{"index": 4, "keep": False}]},
+        ]
+    )
+
+    def _fake_llm(**_kwargs):
+        return next(responses)
+
+    monkeypatch.setattr(
+        "autosmartcut.intelligence_2b._get_two_b_block_size_limit", lambda: 2
+    )
+    monkeypatch.setattr("autosmartcut.intelligence_2b.call_llm_structured", _fake_llm)
+    out = run_2b_decision(manifest, mode="chunked")
+    assert out["keep_mask"][0]["keep"] is True
+    assert out["keep_mask"][1]["keep"] is False
+    assert out["keep_mask"][2]["keep"] is False
+    assert out["keep_mask"][3]["keep"] is True
+    assert out["keep_mask"][4]["keep"] is False
+
+
 def test_run_2b_chunked_gap_block_for_uncovered_index(monkeypatch):
     manifest = {
         "goal": "g",

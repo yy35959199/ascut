@@ -46,10 +46,17 @@ class ModelConfig:
 
 
 @dataclass
+class IntelligenceConfig:
+	# 2b chunked：单 outline 块超过该句数时二次拆分子块
+	two_b_block_size_limit: int = 50
+
+
+@dataclass
 class AppConfig:
 	perception: PerceptionConfig = field(default_factory=PerceptionConfig)
 	execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 	models: ModelConfig = field(default_factory=ModelConfig)
+	intelligence: IntelligenceConfig = field(default_factory=IntelligenceConfig)
 
 
 def load_config(path: Path | None = None) -> AppConfig:
@@ -116,5 +123,17 @@ def load_config(path: Path | None = None) -> AppConfig:
 		sentence_endings=perception.get(
 			"sentence_endings", config.perception.sentence_endings
 		),
+	)
+
+	intel = raw.get("intelligence", {})
+	limit_raw = intel.get(
+		"two_b_block_size_limit", config.intelligence.two_b_block_size_limit
+	)
+	try:
+		limit = int(limit_raw)
+	except (TypeError, ValueError):
+		limit = config.intelligence.two_b_block_size_limit
+	config.intelligence = IntelligenceConfig(
+		two_b_block_size_limit=max(1, limit),
 	)
 	return config

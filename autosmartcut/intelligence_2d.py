@@ -33,7 +33,10 @@ manifest_dict["human_feedback_history"] = [...]
 - 不展示真实时间轴（时间由 Layer1 JSON1 供执行层）；仅 index + 文本预览
 """
 
+import logging
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 
 def run_2d_human_review(manifest_dict: dict) -> dict:
@@ -45,7 +48,7 @@ def run_2d_human_review(manifest_dict: dict) -> dict:
     Returns:
         追加了最终 keep_mask 和 human_feedback_history 的 manifest_dict
     """
-    print("[2d] 人工审阅开始")
+    logger.info("[2d] 人工审阅开始")
 
     tokens = manifest_dict["tokens"]
     keep_mask = manifest_dict.get("keep_mask", [])
@@ -61,7 +64,7 @@ def run_2d_human_review(manifest_dict: dict) -> dict:
         try:
             cmd = input("\n命令 [t <index>] [a] [q]: ").strip()
         except EOFError:
-            print("[2d] 非交互模式，自动确认")
+            logger.info("[2d] 非交互模式，自动确认")
             cmd = "a"
 
         if cmd.startswith("t "):
@@ -69,7 +72,7 @@ def run_2d_human_review(manifest_dict: dict) -> dict:
                 index = int(cmd.split()[1])
                 overrides = _toggle_keep(tokens, keep_mask, overrides, index)
             except (ValueError, IndexError):
-                print("❌ 无效命令，格式: t <index>")
+                logger.warning("无效命令，格式: t <index>")
 
         elif cmd == "a":
             final_keep_mask = _merge_keep_mask(keep_mask, overrides)
@@ -84,19 +87,15 @@ def run_2d_human_review(manifest_dict: dict) -> dict:
             }
             manifest_dict.setdefault("human_feedback_history", []).append(feedback_round)
 
-            print("[2d] 人工审阅完成")
+            logger.info("[2d] 人工审阅完成")
             break
 
         elif cmd == "q":
-            print("[2d] 退出不保存")
+            logger.info("[2d] 退出不保存")
             raise KeyboardInterrupt("用户取消")
 
         else:
-            print("❌ 无效命令")
-            print("可用命令:")
-            print("  t <index>  - 切换指定 index 的保留/删除状态")
-            print("  a          - 确认并输出")
-            print("  q          - 退出不保存")
+            logger.warning("无效命令；可用: t <index> | a | q")
 
     return manifest_dict
 
@@ -138,7 +137,7 @@ def _toggle_keep(
     index: int,
 ) -> list[dict]:
     if index < 0 or index >= len(tokens):
-        print(f"❌ index {index} 超出范围 [0, {len(tokens)-1}]")
+        logger.warning("index %s 超出范围 [0, %d]", index, len(tokens) - 1)
         return overrides
 
     effective_mask = _merge_keep_mask(keep_mask, overrides)
@@ -147,7 +146,11 @@ def _toggle_keep(
     new_keep = not current_keep
     overrides.append({"index": index, "keep": new_keep})
 
-    print(f"✓ index {index} 已切换为 {'[保留]' if new_keep else '[删除]'}")
+    logger.info(
+        "index %s 已切换为 %s",
+        index,
+        "[保留]" if new_keep else "[删除]",
+    )
     return overrides
 
 

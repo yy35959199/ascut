@@ -31,6 +31,7 @@ manifest_dict["comprehension"] = {
 """
 
 import copy
+import logging
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -44,6 +45,7 @@ from autosmartcut.intelligence_llm import (
 )
 from autosmartcut.annotation_tokens import validate_tokens
 
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # 模型参数（便于调试）
@@ -93,7 +95,7 @@ def run_2a_comprehension(
     Returns:
         追加了 comprehension 字段的 manifest_dict
     """
-    print("[2a] 理解子阶段开始")
+    logger.info("[2a] 理解子阶段开始")
 
     # 句面列表（内存稠密），与清单 annotations 等长；供 2a 提示词与 LLM 使用
     tokens = manifest_dict["tokens"]
@@ -149,9 +151,9 @@ def run_2a_comprehension(
             {"comprehension": copy.deepcopy(manifest_dict["comprehension"])},
         )
 
-    print(f"[2a] 完成 - 主旨: {purpose[:60]}...")
-    print(f"[2a] 消歧标注(稠密): {len(cleaned_annotations)} 条")
-    print(f"[2a] 分块: {len(outline_blocks)} 块")
+    logger.info("[2a] 完成 - 主旨: %s...", purpose[:60])
+    logger.info("[2a] 消歧标注(稠密): %d 条", len(cleaned_annotations))
+    logger.info("[2a] 分块: %d 块", len(outline_blocks))
 
     return manifest_dict
 
@@ -170,7 +172,7 @@ def _run_round1(
         (purpose_rough, outline_blocks_rough, candidate_misrecognitions, r1_completion)
     """
     # 控制台阶段标记，便于对照日志与 LLM 调用
-    print("[2a-R1] 粗理解与误识候选构建")
+    logger.info("[2a-R1] 粗理解与误识候选构建")
 
     # 纯文本 user 主体（不含 JSON Schema 示例；示例由 intelligence_llm._build_messages 追加）
     prompt = _build_r1_prompt(tokens, goal)
@@ -198,8 +200,8 @@ def _run_round1(
     candidate_misrecognitions = response.get("candidate_misrecognitions", [])
 
     # 日志截断显示，避免终端被长文本刷屏
-    print(f"[2a-R1] 粗糙主旨: {purpose_rough[:60]}...")
-    print(f"[2a-R1] 误识候选: {len(candidate_misrecognitions)} 条")
+    logger.info("[2a-R1] 粗糙主旨: %s...", purpose_rough[:60])
+    logger.info("[2a-R1] 误识候选: %d 条", len(candidate_misrecognitions))
 
     # r1_completion 整块交给 R2 以复用 OpenAI 式 messages 前缀
     return purpose_rough, outline_blocks_rough, candidate_misrecognitions, r1_completion
@@ -215,6 +217,8 @@ def _build_r1_prompt(tokens: list[dict], goal: str) -> str:
 
     # 以下为 R1 user 正文；末尾「请以 JSON…」之后 intelligence_llm 会再拼「示例 JSON + Schema 尾缀」
     return f"""{goal_line}
+
+【阶段定位】当前阶段：2a 理解层 · 第 1 轮（R1）。本轮任务：从原始 ASR 转写中提炼粗糙主旨（purpose_rough）、按主题初步分块（outline_blocks_rough）、列出可能被误识的专有名词/术语候选（candidate_misrecognitions）。纠错与精化主旨在下一轮 R2 完成；本轮不要输出 corrections。
 
 以下是视频 ASR 转写文本（格式：[index] 文字内容）：
 
@@ -301,7 +305,7 @@ def _run_round2(
         (purpose, outline_blocks, raw_corrections)
         raw_corrections: [{"index": int, "old": str, "nth": int, "new": str}, ...]
     """
-    print("[2a-R2] 精化理解与纠错确定")
+    logger.info("[2a-R2] 精化理解与纠错确定")
 
     # R2 的「新增 user」纯文本：承接 R1 JSON，不在此重复粘贴 R1 全文字段
     r2_user = _build_r2_user_followup(tokens, goal, candidate_misrecognitions)
@@ -334,8 +338,12 @@ def _run_round2(
     # 稀疏纠错规则；可为空数组表示模型未发现可确认误识
     raw_corrections = response.get("corrections", [])
 
-    print(f"[2a-R2] 精化主旨: {purpose[:60]}...")
-    print(f"[2a-R2] 分块: {len(outline_blocks)} 块，纠错: {len(raw_corrections)} 条")
+    logger.info("[2a-R2] 精化主旨: %s...", purpose[:60])
+    logger.info(
+        "[2a-R2] 分块: %d 块，纠错: %d 条",
+        len(outline_blocks),
+        len(raw_corrections),
+    )
 
     return purpose, outline_blocks, raw_corrections
 
@@ -377,6 +385,8 @@ def _build_r2_user_followup(
 
     # R2 user 正文：提醒「上一轮 JSON 在 assistant」+ 全量句面 + 核对段 + 三项任务；JSON 示例仍由 intelligence_llm 追加
     return f"""{goal_line}
+
+【阶段定位】当前阶段：2a 理解层 · 第 2 轮（R2）。本轮任务：在 R1 结果上精化主旨（purpose）、精化分块（outline_blocks）、输出可执行的稀疏纠错表（corrections）；程序将根据 corrections 在原文上替换生成消歧句面，你不得在 JSON 中改写整句原文，只能输出 index/old/nth/new 结构化纠错项。
 
 你上一轮已在 assistant 消息中输出 JSON（含 purpose_rough、outline_blocks_rough、candidate_misrecognitions）。请在保持与上一轮一致的前提下，完成本回合输出（字段名与语义见下方 JSON 格式说明）。
 
@@ -562,12 +572,16 @@ def _build_sparse_cleaned_annotations(
     for ann_index, corrs in grouped.items():
         original = token_text_view.get(ann_index)
         if original is None:
-            print(f"[2a] 警告: corrections 中 index={ann_index} 不存在于 tokens，跳过")
+            logger.warning(
+                "[2a] corrections 中 index=%s 不存在于 tokens，跳过", ann_index
+            )
             continue
         try:
             result = _apply_corrections_to_sentence(original, corrs)
         except ValueError as e:
-            print(f"[2a] 警告: index={ann_index} 纠错失败，跳过该句 ({e})")
+            logger.warning(
+                "[2a] index=%s 纠错失败，跳过该句 (%s)", ann_index, e
+            )
             continue
 
         if result != original:

@@ -21,15 +21,25 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from openai import OpenAI
 
+from autosmartcut.log import log_lazy_json
+
+logger = logging.getLogger(__name__)
+
 # ============================================================================
 # 模型参数配置（便于调试，修改后立即生效）
 # ============================================================================
 
 # 系统提示词（所有调用共享，利用缓存）
-SYSTEM_PROMPT = """输出纪律（须严格遵守，与 DeepSeek JSON 模式一致）：
+SYSTEM_PROMPT = """【系统背景·非指令，仅供定位】
+你是视频剪辑语义处理管道的一部分，整体管道含：理解层（2a，两轮 LLM：粗理解/误识候选 R1，精化主旨与纠错表 R2）→ 决策层（2b，逐句 keep/cut）→ 执行层（Layer 3，程序按 keep_mask 裁切视频，无需 LLM）。
+每次调用前，用户消息会写明当前阶段与本次任务；请严格按用户消息中的指令执行。本段仅为背景说明，不是本轮要执行的操作清单。
+【背景结束】
+
+【输出纪律·须严格遵守，与 DeepSeek JSON 模式一致】
 - 只输出**一个** JSON 对象；不要 Markdown 围栏、不要 JSON 以外的说明文字。
 - 用户消息末尾会给出「示例 JSON」：**键名与嵌套层级必须与该示例完全一致**；禁止用同义键名替代（例如区间须用示例里的整数字段名，不得另造字段名表达同一含义）。
-- 若示例与 JSON Schema 有歧义，以能通过 Schema 校验为准，且键名仍须与示例一致。"""
+- 若示例与 JSON Schema 有歧义，以能通过 Schema 校验为准，且键名仍须与示例一致。
+- **严禁修改原文任何字符**：句面在 JSON 中须与输入逐字一致；文字纠错只能通过理解层输出的结构化纠错表（corrections 等）由程序替换完成，不得直接在输出中改写用户可见的转写句面。"""
 
 # 重试配置
 DEFAULT_MAX_RETRIES = 3
@@ -260,42 +270,58 @@ def _generate_json_example(schema: dict[str, Any]) -> str:
 # API 调用
 # ============================================================================
 
+def _build_chat_completion_kwargs(
+    messages: list[dict],
+    model: str,
+    temperature: float,
+    max_tokens: int,
+    enable_reasoning: bool,
+) -> dict[str, Any]:
+    """构造 ``chat.completions.create`` 的 kwargs（与真实请求一致，供日志落盘）。"""
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
+    if _is_thinking_request(enable_reasoning, model):
+        if _use_thinking_extra_body(model):
+            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+    else:
+        kwargs["temperature"] = temperature
+    return kwargs
+
+
 def _call_api(
     client: OpenAI,
     messages: list[dict],
     model: str,
     temperature: float,
     max_tokens: int,
-    enable_reasoning: bool
-) -> dict:
-    """实际调用 DeepSeek API（非流式）
-
-    思考模式下按文档屏蔽 temperature / top_p 等采样参数，避免误传无效字段。
-    """
+    enable_reasoning: bool,
+) -> tuple[Any, dict[str, Any]]:
+    """实际调用 DeepSeek API（非流式）；返回 ``(response, api_kwargs)``。"""
+    kwargs = _build_chat_completion_kwargs(
+        messages, model, temperature, max_tokens, enable_reasoning
+    )
     try:
-        kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
-        }
-
-        if _is_thinking_request(enable_reasoning, model):
-            if _use_thinking_extra_body(model):
-                kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-        else:
-            kwargs["temperature"] = temperature
-
         response = client.chat.completions.create(**kwargs)
-
-        return response
-
+        return response, kwargs
     except Exception as e:
-        # 捕获 API 错误
-        if hasattr(e, 'status_code'):
+        if hasattr(e, "status_code"):
             raise LLMAPIError(e.status_code, str(e))
-        else:
-            raise LLMAPIError(0, str(e))
+        raise LLMAPIError(0, str(e))
+
+
+def _response_to_log_dict(response: Any) -> dict[str, Any]:
+    """将 SDK 响应转为可 JSON 序列化的 dict（失败则降级为字符串）。"""
+    try:
+        if hasattr(response, "model_dump"):
+            raw = response.model_dump(mode="python")  # type: ignore[union-attr]
+            return json.loads(json.dumps(raw, default=str))
+    except Exception:
+        pass
+    return {"repr": str(response)[:8000]}
 
 
 # ============================================================================
@@ -390,8 +416,6 @@ def _extract_json(content: str) -> dict:
 
 def _validate_json(data: dict, schema: dict) -> None:
     """验证 JSON 是否符合 schema（Draft 2020-12）"""
-    logger = logging.getLogger(__name__)
-
     try:
         Draft202012Validator.check_schema(schema)
     except SchemaError as e:
@@ -434,37 +458,58 @@ def _validate_json(data: dict, schema: dict) -> None:
 # 日志记录
 # ============================================================================
 
-def _log_call(
-    prompt: str,
-    response_content: str,
-    usage: dict,
+def _log_llm_call(
+    hint: str,
+    api_kwargs: dict[str, Any],
+    response: Any,
+    parsed_content: str,
+    usage: dict[str, Any],
     enable_reasoning: bool,
-    reasoning_content: str | None = None
+    reasoning_content: str | None,
 ) -> None:
-    """记录 LLM 调用日志"""
-    logger = logging.getLogger(__name__)
-
-    # 截断 prompt 显示
-    prompt_preview = prompt[:500] + "..." if len(prompt) > 500 else prompt
-
-    logger.info("="*80)
-    logger.info("[LLM 调用]")
-    logger.info(f"Prompt (前500字符): {prompt_preview}")
-    logger.info(f"响应: {response_content[:500]}...")
-    logger.info(f"Token 使用: {usage}")
-
-    if enable_reasoning and reasoning_content:
-        logger.info(f"思考链 (前200字符): {reasoning_content[:200]}...")
-
-    # 缓存命中统计
+    """终端 INFO 摘要 + 文件 DEBUG 完整请求体/响应（lazy 序列化）。"""
+    logger.info(
+        "[LLM] %s | model=%s | prompt_tokens=%s completion_tokens=%s total=%s",
+        hint,
+        api_kwargs.get("model"),
+        usage.get("prompt_tokens"),
+        usage.get("completion_tokens"),
+        usage.get("total_tokens"),
+    )
     if "prompt_cache_hit_tokens" in usage:
         hit = usage["prompt_cache_hit_tokens"]
-        miss = usage["prompt_cache_miss_tokens"]
+        miss = usage.get("prompt_cache_miss_tokens", 0)
         total = hit + miss
-        hit_rate = (hit / total * 100) if total > 0 else 0
-        logger.info(f"缓存命中率: {hit_rate:.1f}% ({hit}/{total} tokens)")
+        hit_rate = (hit / total * 100) if total > 0 else 0.0
+        logger.info(
+            "[LLM] %s | 缓存命中: %.1f%% (%s/%s tokens)",
+            hint,
+            hit_rate,
+            hit,
+            total,
+        )
+    if enable_reasoning and reasoning_content:
+        logger.info(
+            "[LLM] %s | reasoning_content 长度=%d（全文见 DEBUG 日志）",
+            hint,
+            len(reasoning_content),
+        )
 
-    logger.info("="*80)
+    log_lazy_json(
+        "LLM",
+        f"{hint} 请求体(api_kwargs，含 messages)",
+        lambda: dict(api_kwargs),
+    )
+
+    def _resp_payload() -> dict[str, Any]:
+        body = _response_to_log_dict(response)
+        body["parsed_content"] = parsed_content
+        if reasoning_content is not None:
+            body["reasoning_content"] = reasoning_content
+        body["usage"] = usage
+        return body
+
+    log_lazy_json("LLM", f"{hint} 响应体", _resp_payload)
 
 
 # ============================================================================
@@ -499,7 +544,9 @@ def _complete_structured(
 
     for attempt in range(max_retries):
         try:
-            response = _call_api(client, msgs, model, temp, max_tokens, enable_reasoning)
+            response, api_kwargs = _call_api(
+                client, msgs, model, temp, max_tokens, enable_reasoning
+            )
 
             content, usage, reasoning_content = _parse_response(response, enable_reasoning)
 
@@ -509,7 +556,15 @@ def _complete_structured(
             data = _extract_json(content)
             _validate_json(data, schema)
 
-            _log_call(log_prompt_hint, content, usage, enable_reasoning, reasoning_content)
+            _log_llm_call(
+                log_prompt_hint,
+                api_kwargs,
+                response,
+                content,
+                usage,
+                enable_reasoning,
+                reasoning_content,
+            )
 
             return StructuredLLMResult(
                 data=data,
@@ -520,8 +575,10 @@ def _complete_structured(
 
         except LLMEmptyContentError:
             if attempt < max_retries - 1:
-                print(f"[LLM] 空 content，重试 {attempt+1}/{max_retries}")
-                time.sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
+                logger.warning(
+                    "[LLM] 空 content，重试 %d/%d", attempt + 1, max_retries
+                )
+                time.sleep(RETRY_DELAY_SECONDS * (2**attempt))
                 continue
             raise
 
@@ -529,8 +586,10 @@ def _complete_structured(
             if "SCHEMA_ERROR:" in str(e):
                 raise
             if attempt < max_retries - 1:
-                print(f"[LLM] JSON 解析失败，重试 {attempt+1}/{max_retries}")
-                time.sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
+                logger.warning(
+                    "[LLM] JSON 解析失败，重试 %d/%d", attempt + 1, max_retries
+                )
+                time.sleep(RETRY_DELAY_SECONDS * (2**attempt))
                 continue
             raise
 
@@ -636,11 +695,9 @@ def test_hello_world():
     print("测试 DeepSeek API 连接")
     print("="*80 + "\n")
 
-    # 配置日志
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
+    from autosmartcut.log import attach_stderr_if_unconfigured
+
+    attach_stderr_if_unconfigured(verbose=True)
 
     # 简单的测试 schema
     schema = {

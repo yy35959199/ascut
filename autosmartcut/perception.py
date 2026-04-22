@@ -18,6 +18,12 @@ import torch
 from qwen_asr.inference.qwen3_asr import Qwen3ASRModel
 
 from autosmartcut.config import AppConfig
+from autosmartcut.log import (
+	log_lazy_json,
+	log_stage,
+	log_stage_result,
+	setup_logging_for_manifest,
+)
 from autosmartcut.manifest_io import load_manifest, save_manifest, touch_layer_status
 from autosmartcut.pipeline_run import PipelineRun
 
@@ -429,9 +435,7 @@ def run_perception_layer(
 	segmentation_mode: str | None = None,
 ) -> None:
 	"""L1 端到端：视频 ASR → 写入 ``timeline_manifest.json`` 的 ``annotations[]``。"""
-	from autosmartcut.log import ensure_autosmartcut_logging
-
-	ensure_autosmartcut_logging(verbose=False)
+	setup_logging_for_manifest(run.manifest_path, verbose=False)
 
 	if config is None:
 		from autosmartcut.config import load_config
@@ -464,30 +468,47 @@ def run_perception_layer(
 	if not forced_aligner_path.exists():
 		raise FileNotFoundError(f"Forced aligner 目录不存在: {forced_aligner_path}")
 
-	logger.info("[L1] 开始识别层 backend=%s", backend)
 	torch_dtype = _torch_dtype(dtype)
-	model = _build_qwen3_asr_model(
-		asr_model_path=asr_model_path,
-		forced_aligner_path=forced_aligner_path,
+	with log_stage(
+		"l1.load_model",
 		backend=backend,
 		device=device,
-		dtype=torch_dtype,
-		gpu_memory_utilization=gpu_memory_utilization,
-	)
+		dtype=dtype,
+		asr_model_path=str(asr_model_path),
+		forced_aligner_path=str(forced_aligner_path),
+	):
+		model = _build_qwen3_asr_model(
+			asr_model_path=asr_model_path,
+			forced_aligner_path=forced_aligner_path,
+			backend=backend,
+			device=device,
+			dtype=torch_dtype,
+			gpu_memory_utilization=gpu_memory_utilization,
+		)
 
 	wav_cache = run.output_dir / AUDIO_16K_WAV_NAME
-	logger.info("[L1] PyAV 解码音频 → %s", wav_cache)
-	extract_audio_16k_wav(run.video_path, wav_cache)
-	audio_arr, audio_sr = read_audio_16k_wav(wav_cache)
+	with log_stage(
+		"l1.audio_transcode",
+		video=str(run.video_path),
+		wav_out=str(wav_cache),
+	):
+		extract_audio_16k_wav(run.video_path, wav_cache)
+		audio_arr, audio_sr = read_audio_16k_wav(wav_cache)
 	logger.info(
 		"[L1] 音频就绪 %.1fs @ %dHz", audio_arr.shape[0] / audio_sr, audio_sr
 	)
 
-	results = model.transcribe(
-		audio=(audio_arr, audio_sr),
+	with log_stage(
+		"l1.asr_transcribe",
 		language=language,
-		return_time_stamps=True,
-	)
+		audio_samples=int(audio_arr.shape[0]),
+		sample_rate=int(audio_sr),
+	):
+		results = model.transcribe(
+			audio=(audio_arr, audio_sr),
+			language=language,
+			return_time_stamps=True,
+		)
 	if not results:
 		raise RuntimeError("ASR 返回空结果")
 
@@ -496,19 +517,27 @@ def run_perception_layer(
 	lang_out = getattr(transcription, "language", "") or language
 	duration = duration_seconds(run.video_path)
 
-	full_doc = build_layer1_document(
-		source=str(run.video_path),
-		language=lang_out,
-		raw_text=raw_text,
-		transcription=transcription,
-		duration=duration,
+	with log_stage(
+		"l1.build_annotations",
 		segmentation_mode=seg_mode,
 		split_pause_threshold=split_pause,
 		silence_threshold=silence_thr,
 		max_chars=max_c,
-		sentence_endings=sentence_endings,
 		include_char_timestamps=include_char_timestamps,
-	)
+	):
+		full_doc = build_layer1_document(
+			source=str(run.video_path),
+			language=lang_out,
+			raw_text=raw_text,
+			transcription=transcription,
+			duration=duration,
+			segmentation_mode=seg_mode,
+			split_pause_threshold=split_pause,
+			silence_threshold=silence_thr,
+			max_chars=max_c,
+			sentence_endings=sentence_endings,
+			include_char_timestamps=include_char_timestamps,
+		)
 	light_doc = {
 		"source": full_doc["source"],
 		"language": full_doc["language"],
@@ -527,8 +556,18 @@ def run_perception_layer(
 		sm["duration"] = float(duration)
 		# 相对 manifest 父目录，供 L3 VAD 复用，避免二次整轨解码
 		sm["audio_16k_path"] = AUDIO_16K_WAV_NAME
-	touch_layer_status(data, "l1")
-	save_manifest(run.manifest_path, data, atomic=True)
+	with log_stage("l1.persist_manifest", manifest=str(run.manifest_path)):
+		touch_layer_status(data, "l1")
+		save_manifest(run.manifest_path, data, atomic=True)
 
 	n = len(light_doc["annotations"])
+	log_lazy_json(
+		"L1",
+		"annotations 完整输出",
+		lambda: light_doc["annotations"],
+	)
+	log_stage_result(
+		"l1.output",
+		summary=f"segmentation={seg_mode} annotations={n} manifest={run.manifest_path}",
+	)
 	logger.info("[L1] 完成 segmentation=%s 标注数=%d → %s", seg_mode, n, run.manifest_path)
