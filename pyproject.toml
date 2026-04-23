@@ -19,6 +19,7 @@ dependencies = [
     "torch>=2.0",
     "onnxruntime>=1.16",
     "loguru>=0.7",
+    "textual>=0.50",
 ]
 
 [project.optional-dependencies]

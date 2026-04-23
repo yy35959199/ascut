@@ -57,6 +57,8 @@ class IntelligenceConfig:
 	two_c_max_review_rounds: int = 1
 	# 2c 审核：must 项通过率阈值（1.0=全部 must 必须通过）
 	two_c_must_pass_rate: float = 1.0
+	# 2d 人工审阅：最大回流次数（0=禁用回流，仅手动 toggle + 确认）
+	two_d_max_reflows: int = 3
 
 
 @dataclass
@@ -163,5 +165,9 @@ def load_config(path: Path | None = None) -> AppConfig:
 			"two_c_must_pass_rate",
 			config.intelligence.two_c_must_pass_rate,
 		)),
+		two_d_max_reflows=max(0, int(intel.get(
+			"two_d_max_reflows",
+			config.intelligence.two_d_max_reflows,
+		))),
 	)
 	return config

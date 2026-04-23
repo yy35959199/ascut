@@ -23,10 +23,12 @@ from autosmartcut.log import (
     log_stage_result,
     setup_logging_for_manifest,
 )
-from autosmartcut.intelligence_2a import run_2a_comprehension
+from autosmartcut.intelligence_2a import run_2a_comprehension, run_2a_comprehension_reflow
 from autosmartcut.intelligence_2b import run_2b_decision
 from autosmartcut.intelligence_2c import run_2c_review
 from autosmartcut.intelligence_2d import run_2d_human_review
+from autosmartcut.intelligence_2d_core import Signal
+from autosmartcut.intelligence_llm import call_llm_structured
 from autosmartcut.manifest_io import (
     load_manifest,
     save_manifest,
@@ -38,6 +40,291 @@ from autosmartcut.manifest_io import (
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# 2d 回流辅助函数
+# ============================================================================
+
+def _check_correction_affects_purpose(
+    purpose: str,
+    old_word: str,
+    new_word: str,
+) -> bool:
+    """轻量 LLM 判断：F2 纠错是否影响 purpose 的准确性。
+
+    使用非 reasoner 模型（enable_reasoning=False, temperature=0.1），
+    单次调用，判断空间为 true/false。
+
+    Preconditions:
+        - purpose 非空
+        - old_word 和 new_word 非空
+
+    Postconditions:
+        - 返回 bool，True 表示需要重跑 R2 更新 purpose
+    """
+    prompt = (
+        f"当前内容主旨：{purpose}\n\n"
+        f"ASR 识别纠错：「{old_word}」→「{new_word}」\n\n"
+        f"请判断：这个纠错是否会影响上述主旨的准确性？\n"
+        f"仅回答 true 或 false，不需要解释。"
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "affects_purpose": {"type": "boolean"},
+            "reason": {"type": "string"},
+        },
+        "required": ["affects_purpose"],
+    }
+    result = call_llm_structured(
+        prompt=prompt,
+        schema=schema,
+        temperature=0.1,
+        enable_reasoning=False,
+    )
+    return bool(result.get("affects_purpose", False))
+
+
+def _run_2b_2c_cycle(
+    manifest_dict: dict[str, Any],
+    *,
+    two_b_mode: str = "single",
+    on_after_2b_round: Callable[[dict[str, Any], int], None] | None = None,
+) -> dict[str, Any]:
+    """封装 2b → 2c 审核循环（含修正重跑），供回流和主流程复用。
+
+    Preconditions:
+        - manifest_dict 包含 tokens、comprehension
+    Postconditions:
+        - manifest_dict 包含 keep_mask 和 review_report
+    """
+    from autosmartcut.config import load_config as _load_cfg
+
+    _intel_cfg = _load_cfg(None).intelligence
+    max_review_rounds = _intel_cfg.two_c_max_review_rounds
+    review_fixes: list[dict] | None = None
+
+    for review_round in range(max_review_rounds + 1):
+        is_fix_rerun = review_round > 0
+
+        with log_stage(
+            "l2.2b_decision",
+            mode=two_b_mode,
+            review_round=review_round,
+            is_fix_rerun=is_fix_rerun,
+        ):
+            manifest_dict = run_2b_decision(
+                manifest_dict,
+                mode=two_b_mode,
+                review_fixes=review_fixes if is_fix_rerun else None,
+            )
+
+        if on_after_2b_round is not None:
+            on_after_2b_round(manifest_dict, review_round)
+
+        with log_stage("l2.2c_review", review_round=review_round):
+            manifest_dict = run_2c_review(
+                manifest_dict, review_round=review_round,
+            )
+
+        report = manifest_dict.get("review_report", {})
+        verdict = report.get("verdict", "pass")
+
+        if verdict == "pass":
+            logger.info("[L2] 2c 审核通过（轮次 %d）", review_round)
+            break
+
+        if review_round < max_review_rounds:
+            review_fixes = report.get("fix_instructions", [])
+            logger.info(
+                "[L2] 2c 审核未通过，修正轮 %d/%d（%d 条修正指令）",
+                review_round + 1,
+                max_review_rounds,
+                len(review_fixes) if review_fixes else 0,
+            )
+        else:
+            logger.info(
+                "[L2] 达到最大审核轮次 %d，强制通过交给 2d 人工兜底",
+                max_review_rounds,
+            )
+            report["verdict"] = "pass"
+            manifest_dict["review_report"] = report
+
+    return manifest_dict
+
+
+def _reflow_through_2a(
+    manifest_dict: dict[str, Any],
+    feedback_type: str,
+    feedback_payload: dict[str, Any],
+    *,
+    two_b_mode: str = "single",
+    on_phase_save: Callable | None = None,
+    on_after_2b_round: Callable | None = None,
+) -> dict[str, Any]:
+    """F1/F2 回流：重跑 2a → 2b → 2c。
+
+    F1 (purpose_drift):
+        - 2a 进入 R2 refinement 模式，注入用户反馈更新 purpose + outline_blocks
+        - 然后 2b → 2c
+
+    F2 (keyword_error):
+        - 追加纠错到 cleaned_annotations（程序步骤，无 LLM）
+        - 轻量 LLM 判断纠错是否影响 purpose
+        - 若影响：追加 purpose_drift 模式重跑
+        - 然后 2b → 2c
+    """
+    if feedback_type == "f1_purpose_drift":
+        manifest_dict = run_2a_comprehension_reflow(
+            manifest_dict,
+            reflow_mode="purpose_drift",
+            feedback_text=feedback_payload["text"],
+            on_phase_save=on_phase_save,
+        )
+    elif feedback_type == "f2_keyword_error":
+        # Step 1: 追加纠错 + 重建 cleaned_annotations（程序步骤，无 LLM）
+        manifest_dict = run_2a_comprehension_reflow(
+            manifest_dict,
+            reflow_mode="keyword_correction",
+            correction=feedback_payload,  # {"index": int, "old": str, "new": str}
+            on_phase_save=on_phase_save,
+        )
+        # Step 2: 轻量 LLM 判断纠错是否影响 purpose
+        affects_purpose = _check_correction_affects_purpose(
+            purpose=manifest_dict["comprehension"]["purpose"],
+            old_word=feedback_payload["old"],
+            new_word=feedback_payload["new"],
+        )
+        # Step 3: 若影响 purpose，追加 R2 精化
+        if affects_purpose:
+            logger.info(
+                "[2d reflow] F2 纠错影响 purpose，追加 R2 精化：%s → %s",
+                feedback_payload["old"],
+                feedback_payload["new"],
+            )
+            manifest_dict = run_2a_comprehension_reflow(
+                manifest_dict,
+                reflow_mode="purpose_drift",
+                feedback_text=(
+                    f"关键词已纠正：「{feedback_payload['old']}」→「{feedback_payload['new']}」，"
+                    f"请基于纠正后的理解更新主旨。"
+                ),
+                on_phase_save=on_phase_save,
+            )
+
+    # 重跑 2b → 2c
+    manifest_dict = _run_2b_2c_cycle(
+        manifest_dict,
+        two_b_mode=two_b_mode,
+        on_after_2b_round=on_after_2b_round,
+    )
+
+    return manifest_dict
+
+
+def _reflow_through_2b(
+    manifest_dict: dict[str, Any],
+    feedback_type: str,
+    feedback_payload: dict[str, Any],
+    *,
+    two_b_mode: str = "single",
+    on_after_2b_round: Callable | None = None,
+) -> dict[str, Any]:
+    """F3 回流：跳过 2a，注入用户意见到 2b prompt，重跑 2b → 2c。
+
+    Preconditions:
+        - feedback_type 为 "f3_selection_opinion"
+        - manifest_dict 包含有效的 comprehension（不变）
+
+    Postconditions:
+        - comprehension 不变
+        - keep_mask 已由 2b 重新生成（注入了用户选择意见）
+        - review_report 已由 2c 重新生成
+    """
+    # 将用户意见注入 manifest 供 2b prompt 构造时读取
+    manifest_dict["_selection_opinion"] = feedback_payload["text"]
+
+    manifest_dict = _run_2b_2c_cycle(
+        manifest_dict,
+        two_b_mode=two_b_mode,
+        on_after_2b_round=on_after_2b_round,
+    )
+
+    # 清理临时字段
+    manifest_dict.pop("_selection_opinion", None)
+
+    return manifest_dict
+
+
+def _run_2d_with_reflow(
+    manifest_dict: dict[str, Any],
+    *,
+    max_2d_reflows: int = 3,
+    two_b_mode: str = "single",
+    on_phase_save: Callable | None = None,
+    on_after_2b_round: Callable | None = None,
+) -> dict[str, Any]:
+    """2d 交互 + 回流循环。
+
+    Preconditions:
+        - manifest_dict 已完成 2a → 2b → 2c
+        - max_2d_reflows >= 0
+
+    Postconditions:
+        - 返回的 manifest_dict 包含最终 keep_mask
+        - 回流次数 <= max_2d_reflows
+    """
+    # 延迟导入 run_2d_interactive：TUI shell 模块可能尚未实现
+    try:
+        from autosmartcut.intelligence_2d_shell import run_2d_interactive
+    except ImportError:
+        logger.info("[2d] TUI shell 不可用，回退到旧版 run_2d_human_review")
+
+        def run_2d_interactive(md: dict) -> tuple[dict, Signal]:
+            md = run_2d_human_review(md)
+            return md, Signal.DONE
+
+    reflow_count = 0
+
+    while True:
+        manifest_dict, signal = run_2d_interactive(manifest_dict)
+
+        if signal == Signal.DONE:
+            break
+
+        if signal == Signal.QUIT:
+            raise KeyboardInterrupt("用户取消")
+
+        if signal in (Signal.REFLOW_2A, Signal.REFLOW_2B):
+            if reflow_count >= max_2d_reflows:
+                logger.warning(
+                    "[L2] 2d 回流已达上限 %d，强制进入确认模式",
+                    max_2d_reflows,
+                )
+                # 达到上限后不执行回流，继续循环让用户确认
+                continue
+
+            reflow_count += 1
+            ctx = manifest_dict.pop("_reflow_context", {})
+            ft = ctx.get("feedback_type", "")
+            payload = ctx.get("feedback_payload", {})
+
+            if signal == Signal.REFLOW_2A:
+                manifest_dict = _reflow_through_2a(
+                    manifest_dict, ft, payload,
+                    two_b_mode=two_b_mode,
+                    on_phase_save=on_phase_save,
+                    on_after_2b_round=on_after_2b_round,
+                )
+            else:  # REFLOW_2B
+                manifest_dict = _reflow_through_2b(
+                    manifest_dict, ft, payload,
+                    two_b_mode=two_b_mode,
+                    on_after_2b_round=on_after_2b_round,
+                )
+
+    return manifest_dict
+
+
 def compute_l2_layer_result(
     data: dict[str, Any],
     goal: str,
@@ -45,6 +332,7 @@ def compute_l2_layer_result(
     auto: bool = False,
     verbose_log: bool = False,
     two_b_mode: str = "single",
+    max_2d_reflows: int | None = None,
     on_phase_save: Callable[[str, dict[str, Any]], None] | None = None,
     on_after_2b_round: Callable[[dict[str, Any], int], None] | None = None,
 ) -> dict[str, Any]:
@@ -52,6 +340,7 @@ def compute_l2_layer_result(
 
     ``on_phase_save``：与 ``run_2a_comprehension`` 一致；双轨并行时应传 ``None``，避免写主清单。
     ``on_after_2b_round``：每轮 2b 后回调 ``(manifest_dict, review_round)``；串行路径用于写检查点。
+    ``max_2d_reflows``：2d 回流上限；None 时从 IntelligenceConfig 读取默认值。
     """
     if two_b_mode not in ("single", "chunked"):
         raise ValueError(f"two_b_mode 须为 'single' 或 'chunked'，实际: {two_b_mode!r}")
@@ -79,6 +368,8 @@ def compute_l2_layer_result(
 
     _intel_cfg = _load_cfg(None).intelligence
     max_review_rounds = _intel_cfg.two_c_max_review_rounds
+    if max_2d_reflows is None:
+        max_2d_reflows = _intel_cfg.two_d_max_reflows
     review_fixes: list[dict] | None = None
 
     with log_stage("l2.2a_comprehension", token_count=len(tokens)):
@@ -145,7 +436,13 @@ def compute_l2_layer_result(
         )
     else:
         with log_stage("l2.2d_human_review"):
-            manifest_dict = run_2d_human_review(manifest_dict)
+            manifest_dict = _run_2d_with_reflow(
+                manifest_dict,
+                max_2d_reflows=max_2d_reflows,
+                two_b_mode=two_b_mode,
+                on_phase_save=on_phase_save,
+                on_after_2b_round=on_after_2b_round,
+            )
 
     keep_mask = manifest_dict.get("keep_mask", [])
     if not keep_mask:

@@ -39,6 +39,7 @@ from types import MappingProxyType
 
 from autosmartcut.intelligence_llm import (
     StructuredLLMResult,
+    call_llm_structured,
     call_once_structured_with_raw_content,
     call_turn_structured,
     prepare_next_turn_messages,
@@ -620,3 +621,196 @@ def _densify_cleaned_annotations_from_tokens(
         })
 
     return dense
+
+
+# ============================================================================
+# 回流支持：run_2a_comprehension_reflow
+# ============================================================================
+
+def _build_reflow_purpose_prompt(
+    tokens: list[dict],
+    goal: str,
+    current_purpose: str,
+    current_outline_blocks: list[dict],
+    feedback_text: str,
+) -> str:
+    """构造 purpose_drift 回流的 LLM prompt。
+
+    与 R2 类似的单轮精化调用，但注入了用户反馈文本作为主旨修正指导。
+    不要求输出 corrections（corrections 可为空数组）。
+
+    Args:
+        tokens: 句面列表（index + text）
+        goal: 用户剪辑目标
+        current_purpose: 当前 comprehension.purpose
+        current_outline_blocks: 当前 comprehension.outline_blocks
+        feedback_text: 用户提交的主旨修正反馈
+    """
+    goal_line = f"用户目标：{goal}" if goal else "用户目标：无特定目标，提取核心内容"
+
+    lines = [f"[{t['index']}] {t['text']}" for t in tokens if t.get("text", "").strip()]
+    text_block = "\n".join(lines)
+
+    # 序列化当前分块供模型参考
+    blocks_desc = ""
+    if current_outline_blocks:
+        block_lines = []
+        for b in current_outline_blocks:
+            block_lines.append(
+                f"  - [{b.get('start_index', '?')}–{b.get('end_index', '?')}] "
+                f"{b.get('summary', b.get('topic', ''))}"
+            )
+        blocks_desc = "当前分块：\n" + "\n".join(block_lines)
+    else:
+        blocks_desc = "当前分块：（无）"
+
+    return f"""{goal_line}
+
+【阶段定位】当前阶段：2a 理解层 · 主旨回流精化。用户对当前主旨提出了修正意见，请根据用户反馈重新精化主旨（purpose）和内容分块（outline_blocks）。本轮不需要输出纠错（corrections 输出空数组即可）。
+
+当前主旨：{current_purpose}
+
+{blocks_desc}
+
+【用户反馈】
+{feedback_text}
+
+以下是视频 ASR 转写文本（格式：[index] 文字内容）：
+
+{text_block}
+
+请完成以下任务：
+
+1. 根据用户反馈，精化核心论点与叙事意图（purpose）
+   - 充分考虑用户的修正意见
+   - 聚焦"说话者要论证/传达什么"，以及贯穿全文的核心结论
+
+2. 根据更新后的主旨，重新划分内容分块（outline_blocks）：**每个元素**必须包含整数 `start_index`、整数 `end_index`、字符串 `summary`。
+
+3. corrections 输出空数组（本轮不做纠错）。
+
+请以 JSON 格式输出。"""
+
+
+def run_2a_comprehension_reflow(
+    manifest_dict: dict,
+    *,
+    reflow_mode: str,  # "purpose_drift" or "keyword_correction"
+    feedback_text: str = "",
+    correction: dict | None = None,
+    on_phase_save: Callable[[str, dict], None] | None = None,
+) -> dict:
+    """2a 回流入口：根据 reflow_mode 更新 comprehension 的部分字段。
+
+    两种模式：
+
+    purpose_drift（F1）：
+        - 不重跑 R1，不重建 cleaned_annotations
+        - 单轮 LLM 调用（call_llm_structured），将用户反馈注入 prompt
+        - 仅更新 comprehension.purpose 和 comprehension.outline_blocks
+
+    keyword_correction（F2）：
+        - 不调用 LLM
+        - 将用户提供的 {index, old, new} 转为 Correction(nth=1)
+        - 在现有 cleaned_annotations 上直接替换（找到 annotation_index 匹配的条目，
+          将 old 替换为 new），避免从头重建整条 corrections 链
+        - 更新 comprehension.cleaned_annotations
+
+    Args:
+        manifest_dict: 包含 tokens、goal、comprehension 的工作数据
+        reflow_mode: "purpose_drift" 或 "keyword_correction"
+        feedback_text: purpose_drift 模式下的用户反馈文本
+        correction: keyword_correction 模式下的纠错字典 {"index": int, "old": str, "new": str}
+        on_phase_save: 可选回调，回流完成后调用
+
+    Returns:
+        更新了 comprehension 部分字段的 manifest_dict
+    """
+    logger.info("[2a-reflow] 模式: %s", reflow_mode)
+
+    comprehension = manifest_dict["comprehension"]
+    tokens = manifest_dict["tokens"]
+    goal = manifest_dict.get("goal", "")
+
+    if reflow_mode == "purpose_drift":
+        # ── F1: 单轮 LLM 精化 purpose + outline_blocks ──
+        prompt = _build_reflow_purpose_prompt(
+            tokens,
+            goal,
+            current_purpose=comprehension["purpose"],
+            current_outline_blocks=comprehension.get("outline_blocks", []),
+            feedback_text=feedback_text,
+        )
+        schema = _get_r2_schema()
+
+        response = call_llm_structured(
+            prompt=prompt,
+            schema=schema,
+            temperature=R2_TEMPERATURE,
+            enable_reasoning=ENABLE_REASONING_R2,
+        )
+
+        # 仅更新 purpose 和 outline_blocks；cleaned_annotations 不变
+        comprehension["purpose"] = response["purpose"]
+        comprehension["outline_blocks"] = response.get("outline_blocks", [])
+
+        logger.info("[2a-reflow] purpose_drift 完成 - 新主旨: %s...", comprehension["purpose"][:60])
+        logger.info("[2a-reflow] 新分块: %d 块", len(comprehension["outline_blocks"]))
+
+        if on_phase_save is not None:
+            on_phase_save(
+                "2a_reflow_purpose",
+                {"comprehension": copy.deepcopy(comprehension)},
+            )
+
+    elif reflow_mode == "keyword_correction":
+        # ── F2: 程序步骤，无 LLM ──
+        if correction is None:
+            raise ValueError("keyword_correction 模式需要提供 correction 参数")
+
+        corr_index = correction["index"]
+        corr_old = correction["old"]
+        corr_new = correction["new"]
+
+        cleaned_annotations = comprehension["cleaned_annotations"]
+
+        # 在现有 cleaned_annotations 中找到 annotation_index 匹配的条目，
+        # 直接在 cleaned_content 上替换 old → new
+        found = False
+        for entry in cleaned_annotations:
+            if int(entry["annotation_index"]) == corr_index:
+                if corr_old in entry["cleaned_content"]:
+                    entry["cleaned_content"] = entry["cleaned_content"].replace(
+                        corr_old, corr_new, 1
+                    )
+                    found = True
+                    logger.info(
+                        "[2a-reflow] keyword_correction: index=%d, '%s' → '%s'",
+                        corr_index, corr_old, corr_new,
+                    )
+                else:
+                    logger.warning(
+                        "[2a-reflow] keyword_correction: index=%d 的 cleaned_content 中"
+                        "找不到子串 '%s'",
+                        corr_index, corr_old,
+                    )
+                break
+
+        if not found:
+            logger.warning(
+                "[2a-reflow] keyword_correction: 未找到 annotation_index=%d 或子串不匹配",
+                corr_index,
+            )
+
+        logger.info("[2a-reflow] keyword_correction 完成")
+
+        if on_phase_save is not None:
+            on_phase_save(
+                "2a_reflow_keyword",
+                {"comprehension": copy.deepcopy(comprehension)},
+            )
+
+    else:
+        raise ValueError(f"未知 reflow_mode: {reflow_mode!r}，合法值: 'purpose_drift', 'keyword_correction'")
+
+    return manifest_dict

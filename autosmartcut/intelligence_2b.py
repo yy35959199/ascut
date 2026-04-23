@@ -156,16 +156,20 @@ def run_2b_decision(
     comprehension = manifest_dict.get("comprehension", {})
     # 用户剪辑意图，会写入 prompt 首行「用户目标」
     goal = manifest_dict.get("goal", "")
+    # F3 回流时编排器注入的用户选择意见（临时字段）
+    selection_opinion = str(manifest_dict.get("_selection_opinion", ""))
 
     if mode not in ("single", "chunked"):
         raise ValueError(f"mode 须为 'single' 或 'chunked'，实际: {mode!r}")
     if mode == "chunked":
         keep_mask = _generate_keep_mask_chunked(
-            tokens, comprehension, goal, review_fixes=review_fixes
+            tokens, comprehension, goal, review_fixes=review_fixes,
+            selection_opinion=selection_opinion,
         )
     else:
         keep_mask = _generate_keep_mask(
-            tokens, comprehension, goal, review_fixes=review_fixes
+            tokens, comprehension, goal, review_fixes=review_fixes,
+            selection_opinion=selection_opinion,
         )
 
     # 验证 keep_mask 格式
@@ -203,11 +207,12 @@ def _generate_keep_mask(
     goal: str,
     *,
     review_fixes: list[dict] | None = None,
+    selection_opinion: str = "",
 ) -> list[dict]:
     """调用 LLM 生成 keep_mask"""
     logger.info("[2b] 调用 LLM 生成决策")
 
-    prompt = _build_prompt(tokens, comprehension, goal, review_fixes=review_fixes)
+    prompt = _build_prompt(tokens, comprehension, goal, review_fixes=review_fixes, selection_opinion=selection_opinion)
     schema = _get_schema()
 
     response = call_llm_structured(
@@ -309,6 +314,7 @@ def _generate_keep_mask_chunked(
     goal: str,
     *,
     review_fixes: list[dict] | None = None,
+    selection_opinion: str = "",
 ) -> list[dict]:
     """按分块多次调用 LLM，合并为完整 keep_mask。"""
     outline_blocks = comprehension.get("outline_blocks", [])
@@ -318,7 +324,8 @@ def _generate_keep_mask_chunked(
     if not outline_blocks:
         logger.info("[2b] chunked：outline_blocks 为空，回退为 single 单次调用")
         return _generate_keep_mask(
-            tokens, comprehension, goal, review_fixes=review_fixes
+            tokens, comprehension, goal, review_fixes=review_fixes,
+            selection_opinion=selection_opinion,
         )
 
     partitions = _partition_token_indices_by_blocks(tokens, outline_blocks)
@@ -381,6 +388,7 @@ def _generate_keep_mask_chunked(
                 block_positions=sub_positions,
                 block_meta=block_meta,
                 review_fixes=chunk_fixes,
+                selection_opinion=selection_opinion,
             )
             response = call_llm_structured(
                 prompt=prompt,
@@ -483,6 +491,7 @@ def _build_prompt_chunked(
     block_positions: list[int],
     block_meta: dict,
     review_fixes: list[dict] | None = None,
+    selection_opinion: str = "",
 ) -> str:
     """分块模式下单次 LLM 的 prompt。"""
     goal_line = f"用户目标：{goal}" if goal else "用户目标：无特定目标，提取核心内容"
@@ -514,11 +523,18 @@ def _build_prompt_chunked(
 
     fixes_section = _build_review_fixes_section(review_fixes)
 
+    opinion_section = ""
+    if selection_opinion:
+        opinion_section = (
+            "【用户内容选择意见（F3 反馈，本轮须优先遵从）】\n"
+            f"用户要求：{selection_opinion}\n\n"
+        )
+
     shared = _two_b_shared_task_and_output_instructions()
 
     return f"""{goal_line}
 
-{stage}{sub_line}{fixes_section}内容主旨：{purpose}
+{stage}{sub_line}{fixes_section}{opinion_section}内容主旨：{purpose}
 
 {range_line}
 本 outline 块摘要：{block_summ if block_summ else "（无）"}{extra}
@@ -537,6 +553,7 @@ def _build_prompt(
     goal: str,
     *,
     review_fixes: list[dict] | None = None,
+    selection_opinion: str = "",
 ) -> str:
     """构造 2b 决策的 Prompt（single：全文一次）。"""
     purpose = comprehension.get("purpose", "")
@@ -571,11 +588,18 @@ def _build_prompt(
 
     fixes_section = _build_review_fixes_section(review_fixes)
 
+    opinion_section = ""
+    if selection_opinion:
+        opinion_section = (
+            "【用户内容选择意见（F3 反馈，本轮须优先遵从）】\n"
+            f"用户要求：{selection_opinion}\n\n"
+        )
+
     shared = _two_b_shared_task_and_output_instructions()
 
     return f"""{goal_line}
 
-{stage}{fixes_section}内容主旨：{purpose}
+{stage}{fixes_section}{opinion_section}内容主旨：{purpose}
 
 {blocks_section}
 
