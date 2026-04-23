@@ -20,6 +20,7 @@ import warnings
 from pathlib import Path
 
 from autosmartcut.config import load_config
+from autosmartcut.dual_track_orchestrator import run_dual_track_after_l1a
 from autosmartcut.execution import run_execution_layer
 from autosmartcut.intelligence import run_intelligence_layer
 from autosmartcut.log import setup_logging
@@ -120,6 +121,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="关闭 L3 VAD 切点吸附",
     )
+    pr.add_argument(
+        "--no-parallel-l1b-l2",
+        action="store_true",
+        help="关闭 L1A 后 L1B 与 L2 双轨并行（恢复为仅串行跑 L2）",
+    )
     pr.add_argument("--verbose", action="store_true", help="DEBUG 日志")
 
     # 占位：validate_cli_args 曾检查旧参数；runner 不再注册 layer*-json
@@ -202,6 +208,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 
     try:
         l1_mode = infer_l1_mode(args, stages)
+        dual_done = False
         if l1_mode == "both" and 1 in stages:
             run_perception_layer(
                 run,
@@ -225,6 +232,27 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 language=args.language,
                 gpu_memory_utilization=args.gpu_memory_utilization,
             )
+            if (
+                cfg.execution.parallel_l1b_l2_enabled
+                and not args.no_parallel_l1b_l2
+                and 2 in stages
+            ):
+                run_dual_track_after_l1a(
+                    run,
+                    forced_aligner_path=forced,
+                    config=cfg,
+                    auto=auto,
+                    two_b_mode=args.two_b_mode,
+                    backend=args.backend,
+                    device=args.device,
+                    dtype=args.dtype,
+                    language=args.language,
+                    gpu_memory_utilization=args.gpu_memory_utilization,
+                    post_merge_validate_stages=(
+                        frozenset({3}) if 3 in stages else frozenset({2})
+                    ),
+                )
+                dual_done = True
         elif l1_mode == "b":
             run_l1b_align_only(
                 run,
@@ -237,7 +265,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 gpu_memory_utilization=args.gpu_memory_utilization,
             )
 
-        if 2 in stages:
+        if 2 in stages and not dual_done:
             run_intelligence_layer(
                 run.manifest_path,
                 run.goal,

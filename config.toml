@@ -18,6 +18,10 @@ vad_snap_radius = 0.12
 vad_threshold = 0.35
 vad_min_silence_ms = 80
 vad_speech_pad_ms = 10
+# L1A 后 L1B 与 L2 双轨并行（false 时恢复为仅串行 L2；CLI 可用 --no-parallel-l1b-l2 覆盖）
+parallel_l1b_l2_enabled = true
+# L3 句级分片缓存快速拼接（需 PATH 中 ffmpeg；失败自动回退 smartcut）
+sentence_tile_cache_enabled = true
 
 [llm]
 api_key = "sk-f46d082357234fd2977e400835892f35"                       
@@ -30,3 +34,7 @@ default_max_tokens = 8192                   # 默认最大 tokens
 # 智能层：2b chunked 模式下，单 outline 块内超过该句数则按此长度二次拆分子块再调 LLM
 [intelligence]
 two_b_block_size_limit = 50
+# 2c 审核：最大修正轮次（0=占位透传，1=审核+最多1轮修正，2=最多2轮修正）
+two_c_max_review_rounds = 1
+# 2c 审核：must 项通过率阈值（1.0=全部 must 必须通过才 pass）
+two_c_must_pass_rate = 1.0

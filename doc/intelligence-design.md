@@ -346,18 +346,25 @@ ASR 原文（含误识）
 
 ## 5. 2c 审核层
 
-**完整版行为：**
-- 输入：`purpose + checklist[] + 当前 keep_mask`
-- LLM 逐项核查每条 must 项是否被实质覆盖
-- 输出 `verdict ∈ {pass, fix_decision, fix_checklist}`
+**现行实现（已上线）：**
+
+2c 是 2b 决策的结构化验证器。在单次 LLM 调用中，先将模糊的 goal 分解为一组可判真假的 checklist 条目（基于 goal + purpose + outline_blocks），再逐条对照 keep_mask 做布尔判断。verdict 由程序根据 must 项通过率计算，不由 LLM 直接输出。
+
+- 输入：`goal + purpose + outline_blocks + cleaned_annotations + keep_mask`
+- LLM 两阶段输出：`checklist[]`（审核条件）→ `judgments[]`（逐条判断 + evidence_indices）
+- 程序计算 verdict：`pass`（must 项全部通过）或 `fix_decision`（有 must 项未通过）
+- `fix_decision` 时提取 `fix_instructions`（含具体应保留的 index），注入 2b prompt 重跑
 
 | verdict | 含义 | 后续动作 |
 |---------|------|---------|
-| `pass` | must 项全覆盖，无明显噪声 | 流转 2d |
-| `fix_decision` | must 项未覆盖，但清单本身完整 | 回到 2b（内循环），携带 `coverage_issues[]` |
-| `fix_checklist` | 清单遗漏重要维度 | 回到 2a（外循环），携带 `completeness_issues[]` |
+| `pass` | must 项全覆盖 | 流转 2d |
+| `fix_decision` | must 项未覆盖，携带具体 index | 回到 2b（内循环），注入 `fix_instructions` |
 
-**MVP 行为：** 代码层自动写入 `verdict="pass"`，不调用 LLM。字段结构与完整版保持兼容，未来启用真实审核只需修改生成逻辑，不改 schema。
+**配置**：`two_c_max_review_rounds`（默认 1，`0`=占位透传）、`two_c_must_pass_rate`（默认 1.0）。
+
+**完整版扩展方向**：
+- `fix_checklist` → 回到 2a（外循环），携带 `completeness_issues[]`（当前未实现）。
+- Token 预算守卫控制循环上限。
 
 ---
 
@@ -394,15 +401,15 @@ effective_keep[i] = 最后一条覆盖 index i 的 override（若有）
 | 子阶段 | 完整版 | MVP 实现 |
 |--------|--------|---------|
 | 2a 冷启动 | 2次 LLM 调用（R1 bootstrap + R2 消歧+理解）| **相同，不简化** |
-| 2a 重跑 | 外循环（2c fix_checklist 驱动）+ 人工反馈 | **仅由 [r] 人工反馈触发**；completeness_issues 路径不存在（2c auto-pass） |
-| 2b 决策 | 1次 LLM 调用 | **相同** |
-| 2c 审核 | LLM 逐项核查，三种裁决 + 内/外循环 | **代码层 auto-pass**，直接写 `verdict="pass"` |
-| 内循环 | `fix_decision → 2b`，上限 `max_inner` | **禁用**（`max_inner=0`） |
-| 外循环 | `fix_checklist → 2a`，上限 `max_outer` | **禁用**（`max_outer=0`） |
-| Token 预算 | 按视频时长动态分配 | **固定 3 次 LLM 调用**（2a×2 + 2b×1），消耗可预测 |
+| 2a 重跑 | 外循环（2c fix_checklist 驱动）+ 人工反馈 | **仅由 [r] 人工反馈触发**；`fix_checklist` 路径不存在 |
+| 2b 决策 | 1次 LLM 调用 | **相同**；修正重跑时注入 2c 的 `review_fixes` |
+| 2c 审核 | LLM 逐项核查，三种裁决 + 内/外循环 | **已实现 LLM 审核**（`two_c_max_review_rounds >= 1`）；单次调用两阶段输出（checklist → judgments）；verdict 由程序计算；仅 `pass`/`fix_decision` 两种裁决（无 `fix_checklist`）；`= 0` 时退化为占位透传 |
+| 内循环 | `fix_decision → 2b`，上限 `max_inner` | **已实现**：`two_c_max_review_rounds`（默认 1）控制 2b↔2c 循环上限 |
+| 外循环 | `fix_checklist → 2a`，上限 `max_outer` | **禁用**（无 `fix_checklist` 路径） |
+| Token 预算 | 按视频时长动态分配 | **固定调用次数**：2a×2 + 2b×1 + 2c×1 = 4 次（一次通过）；修正 1 轮最多 6 次 |
 | 2d 人工层 | CLI 交互 | **相同** |
 
-MVP 中每次运行的 LLM 调用次数固定为 3（首轮）+ 每次 `[r]` 反馈额外 1 次（重跑 2a 重跑模式，仅 1 次调用）。
+MVP 中每次运行的 LLM 调用次数：首轮 4 次（2a×2 + 2b×1 + 2c×1）；2c 修正每轮额外 2 次（2b + 2c）；每次 `[r]` 反馈额外 1 次（重跑 2a 重跑模式）。
 
 ---
 

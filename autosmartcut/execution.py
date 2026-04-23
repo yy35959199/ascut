@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from autosmartcut.annotation_tokens import video_path_from_manifest
+from autosmartcut.backends.smartcut_backend import (
+    probe_duration_seconds as probe_duration_seconds_by_smartcut,
+)
 from autosmartcut.config import AppConfig, load_config
+from autosmartcut.l3_orchestrator import run_l3_orchestration
 from autosmartcut.log import log_stage, log_stage_result, setup_logging_for_manifest
 from autosmartcut.manifest_io import load_manifest, save_manifest, touch_layer_status
 from autosmartcut.pipeline_run import PipelineRun
@@ -42,13 +46,7 @@ def probe_video_duration_seconds(video_path: Path) -> float:
         "[L3] 容器头无 duration，回退 MediaContainer 扫描以获取时长: %s",
         video_path.name,
     )
-    from smartcut.media_container import MediaContainer
-
-    media = MediaContainer(str(video_path))
-    try:
-        return float(media.duration)
-    finally:
-        media.close()
+    return probe_duration_seconds_by_smartcut(video_path)
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -159,12 +157,6 @@ def run_execution_layer(
     vad_snap_disabled_by_cli: bool = False,
 ) -> Path:
     """L3 端到端：清单 ``annotations`` + ``current.keep_mask`` → 输出视频。"""
-    from smartcut.media_container import MediaContainer
-    from smartcut.media_utils import VideoExportMode, VideoExportQuality
-    from smartcut.misc_data import AudioExportInfo, AudioExportSettings
-    from smartcut.smart_cut import smart_cut
-    from smartcut.video_cutter import VideoSettings
-
     setup_logging_for_manifest(run.manifest_path, verbose=False)
 
     if gap_after_cap is None:
@@ -174,101 +166,25 @@ def run_execution_layer(
 
     mp = run.manifest_path
     data = load_manifest(mp)
-    annotations = data.get("annotations")
-    if not isinstance(annotations, list):
-        raise ValueError("清单缺少 annotations[]")
-    for i, ann in enumerate(annotations):
-        if not isinstance(ann, dict):
-            continue
-        if ann.get("t_start") is None or ann.get("t_end") is None:
-            raise ValueError(
-                "清单中 annotations 缺少 t_start/t_end，无法执行 L3；"
-                "请先运行 ascut run --stage 1b 或完整 --stage 1"
-            )
-    cur = data.get("current")
-    if not isinstance(cur, dict):
-        raise ValueError("清单缺少 current")
-    keep_mask = cur.get("keep_mask")
-    if not isinstance(keep_mask, list):
-        raise ValueError("清单缺少 current.keep_mask[]")
-
-    video = video_path_from_manifest(data, mp)
-    audio_cache = resolved_audio_16k_path(data, mp)
-    if audio_cache is not None:
-        logger.info("[L3] 复用 L1 缓存音轨 %s", audio_cache.name)
-
-    with log_stage(
-        "l3.positive_segments",
-        pre_pad=pre_pad,
-        post_pad=post_pad,
-        min_duration=min_duration,
-        gap_after_cap=gap_after_cap,
-        vad_snap_disabled=vad_snap_disabled_by_cli,
-    ):
-        positive, video_resolved, duration = positive_segments_from_annotations(
-            annotations,
-            keep_mask,
-            video,
+    out = run.output_video
+    with log_stage("l3.orchestrate", out_path=str(out)):
+        out, segment_count = run_l3_orchestration(
+            run_id=run.run_id,
+            manifest_data=data,
+            manifest_path=mp,
+            output_video=out,
+            config=config,
             pre_pad=pre_pad,
             post_pad=post_pad,
             min_duration=min_duration,
             gap_after_cap=gap_after_cap,
-            config=config,
             vad_snap_disabled_by_cli=vad_snap_disabled_by_cli,
-            audio_16k_path=audio_cache,
         )
-    if not positive:
-        raise ValueError("keep_mask 解析后无保留区间")
-
-    out = run.output_video
-    try:
-        if out.resolve() == video_resolved.resolve():
-            raise ValueError(
-                "输出视频路径与源视频解析为同一路径，已中止以免覆盖原始文件；"
-                "请使用默认 ascut_out_* 目录或指定与源文件不同的 --output-dir / --output-name。"
-            )
-    except OSError:
-        pass
-
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    logger.info(
-        "[L3] 源视频 %s 时长 %.2fs keep 段数 %d → %s",
-        video_resolved,
-        duration,
-        len(positive),
-        out,
-    )
-
-    with log_stage("l3.smart_cut", out_path=str(out), segment_count=len(positive)):
-        media = MediaContainer(str(video_resolved))
-        try:
-            if not media.audio_tracks:
-                raise ValueError("输入文件没有音轨")
-            audio_info = AudioExportInfo(
-                output_tracks=[
-                    AudioExportSettings(codec="passthru") for _ in media.audio_tracks
-                ]
-            )
-            err = smart_cut(
-                media_container=media,
-                positive_segments=positive,
-                out_path=str(out),
-                audio_export_info=audio_info,
-                video_settings=VideoSettings(
-                    VideoExportMode.SMARTCUT,
-                    VideoExportQuality.LOW,
-                ),
-            )
-            if err is not None:
-                raise RuntimeError(f"smart_cut 失败: {err}")
-        finally:
-            media.close()
 
     with log_stage("l3.persist_manifest", manifest=str(mp)):
         touch_layer_status(data, "l3")
         save_manifest(mp, data, atomic=True)
 
-    log_stage_result("l3.output", summary=f"video={out} segments={len(positive)}")
+    log_stage_result("l3.output", summary=f"video={out} segments={segment_count}")
     logger.info("[L3] 完成 → %s", out)
     return out

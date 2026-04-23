@@ -12,6 +12,7 @@
 import copy
 import logging
 from datetime import datetime
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -37,34 +38,31 @@ from autosmartcut.manifest_io import (
 logger = logging.getLogger(__name__)
 
 
-def run_intelligence_layer(
-    manifest_path: Path,
-    goal: str = "",
+def compute_l2_layer_result(
+    data: dict[str, Any],
+    goal: str,
     *,
     auto: bool = False,
     verbose_log: bool = False,
     two_b_mode: str = "single",
-) -> None:
-    """Layer 2 主入口：清单 → 更新 ``current``（comprehension + keep_mask）。"""
-    mp = manifest_path.resolve()
-    setup_logging_for_manifest(mp, verbose=verbose_log)
-    logger.info("[L2] 智能层开始 清单=%s", mp)
+    on_phase_save: Callable[[str, dict[str, Any]], None] | None = None,
+    on_after_2b_round: Callable[[dict[str, Any], int], None] | None = None,
+) -> dict[str, Any]:
+    """纯计算：跑完 2a→2b/2c 循环→2d，返回写入 ``current`` 所需字段；不写盘。
+
+    ``on_phase_save``：与 ``run_2a_comprehension`` 一致；双轨并行时应传 ``None``，避免写主清单。
+    ``on_after_2b_round``：每轮 2b 后回调 ``(manifest_dict, review_round)``；串行路径用于写检查点。
+    """
     if two_b_mode not in ("single", "chunked"):
         raise ValueError(f"two_b_mode 须为 'single' 或 'chunked'，实际: {two_b_mode!r}")
-    logger.info("[L2] 2b 模式: %s", two_b_mode)
-
-    data = load_manifest(mp)
     annotations = data.get("annotations")
     if not isinstance(annotations, list) or len(annotations) == 0:
         raise ValueError("清单缺少非空 annotations[]，无法运行 L2")
 
     goal_use = goal.strip() if goal.strip() else str(data.get("goal", ""))
-    if goal_use:
-        logger.info("[L2] 目标: %s", goal_use)
 
     with log_stage(
         "l2.tokens_from_annotations",
-        manifest=str(mp),
         annotation_count=len(annotations),
     ):
         tokens = tokens_from_annotations(annotations)
@@ -77,57 +75,77 @@ def run_intelligence_layer(
         "raw_text": str(data.get("raw_text", "")),
     }
 
-    def _on_2a_phase_save(phase: str, payload: dict[str, Any]) -> None:
-        write_l2_checkpoint(data, mp, phase, payload)
+    from autosmartcut.config import load_config as _load_cfg
 
-    try:
-        with log_stage("l2.2a_comprehension", token_count=len(tokens)):
-            manifest_dict = run_2a_comprehension(
-                manifest_dict, on_phase_save=_on_2a_phase_save
-            )
-        with log_stage("l2.2b_decision", mode=two_b_mode):
-            manifest_dict = run_2b_decision(manifest_dict, mode=two_b_mode)
+    _intel_cfg = _load_cfg(None).intelligence
+    max_review_rounds = _intel_cfg.two_c_max_review_rounds
+    review_fixes: list[dict] | None = None
 
-        # 2b 完成后将 comprehension + keep_mask 写入清单（L3 续跑仅需磁盘态即可）
-        cur0 = data.setdefault("current", {})
-        if not isinstance(cur0, dict):
-            data["current"] = {}
-            cur0 = data["current"]
-        cur0["comprehension"] = copy.deepcopy(manifest_dict.get("comprehension", {}))
-        cur0["keep_mask"] = copy.deepcopy(manifest_dict.get("keep_mask", []))
-        km = cur0["keep_mask"]
-        n_keep = sum(1 for e in km if isinstance(e, dict) and e.get("keep") is True)
-        write_l2_checkpoint(
-            data,
-            mp,
-            "2b",
-            {"keep_true": n_keep, "keep_total": len(km)},
+    with log_stage("l2.2a_comprehension", token_count=len(tokens)):
+        manifest_dict = run_2a_comprehension(
+            manifest_dict, on_phase_save=on_phase_save
         )
 
-        with log_stage("l2.2c_review"):
-            manifest_dict = run_2c_review(manifest_dict)
+    for review_round in range(max_review_rounds + 1):
+        is_fix_rerun = review_round > 0
 
-        if auto:
-            logger.info("[L2] auto 模式，跳过 2d 人工审阅")
-            manifest_dict.setdefault("human_feedback_history", []).append(
-                {
-                    "round": 0,
-                    "verdict": "confirm",
-                    "overrides": [],
-                    "feedback": "",
-                    "timestamp": datetime.now().isoformat(),
-                }
+        with log_stage(
+            "l2.2b_decision",
+            mode=two_b_mode,
+            review_round=review_round,
+            is_fix_rerun=is_fix_rerun,
+        ):
+            manifest_dict = run_2b_decision(
+                manifest_dict,
+                mode=two_b_mode,
+                review_fixes=review_fixes if is_fix_rerun else None,
+            )
+
+        if on_after_2b_round is not None:
+            on_after_2b_round(manifest_dict, review_round)
+
+        with log_stage("l2.2c_review", review_round=review_round):
+            manifest_dict = run_2c_review(
+                manifest_dict, review_round=review_round
+            )
+
+        report = manifest_dict.get("review_report", {})
+        verdict = report.get("verdict", "pass")
+
+        if verdict == "pass":
+            logger.info("[L2] 2c 审核通过（轮次 %d）", review_round)
+            break
+
+        if review_round < max_review_rounds:
+            review_fixes = report.get("fix_instructions", [])
+            logger.info(
+                "[L2] 2c 审核未通过，修正轮 %d/%d（%d 条修正指令）",
+                review_round + 1,
+                max_review_rounds,
+                len(review_fixes) if review_fixes else 0,
             )
         else:
-            with log_stage("l2.2d_human_review"):
-                manifest_dict = run_2d_human_review(manifest_dict)
+            logger.info(
+                "[L2] 达到最大审核轮次 %d，强制通过交给 2d 人工兜底",
+                max_review_rounds,
+            )
+            report["verdict"] = "pass"
+            manifest_dict["review_report"] = report
 
-    except KeyboardInterrupt:
-        logger.warning("[L2] 用户中断")
-        raise
-    except Exception as e:
-        logger.error("[L2] 执行失败: %s", e)
-        raise
+    if auto:
+        logger.info("[L2] auto 模式，跳过 2d 人工审阅")
+        manifest_dict.setdefault("human_feedback_history", []).append(
+            {
+                "round": 0,
+                "verdict": "confirm",
+                "overrides": [],
+                "feedback": "",
+                "timestamp": datetime.now().isoformat(),
+            }
+        )
+    else:
+        with log_stage("l2.2d_human_review"):
+            manifest_dict = run_2d_human_review(manifest_dict)
 
     keep_mask = manifest_dict.get("keep_mask", [])
     if not keep_mask:
@@ -146,15 +164,104 @@ def run_intelligence_layer(
                 f"keep_mask[{i}] 的 index 不匹配: 期望 {i}, 实际 {entry['index']}"
             )
 
+    out: dict[str, Any] = {
+        "comprehension": copy.deepcopy(manifest_dict.get("comprehension", {})),
+        "keep_mask": copy.deepcopy(keep_mask),
+        "goal": goal_use,
+    }
+    if manifest_dict.get("review_report"):
+        out["review_report"] = copy.deepcopy(manifest_dict["review_report"])
+    if manifest_dict.get("human_feedback_history"):
+        out["human_feedback_history"] = copy.deepcopy(
+            manifest_dict["human_feedback_history"]
+        )
+    return out
+
+
+def run_intelligence_layer(
+    manifest_path: Path,
+    goal: str = "",
+    *,
+    auto: bool = False,
+    verbose_log: bool = False,
+    two_b_mode: str = "single",
+) -> None:
+    """Layer 2 主入口：清单 → 更新 ``current``（comprehension + keep_mask）。"""
+    mp = manifest_path.resolve()
+    setup_logging_for_manifest(mp, verbose=verbose_log)
+    logger.info("[L2] 智能层开始 清单=%s", mp)
+    logger.info("[L2] 2b 模式: %s", two_b_mode)
+
+    data = load_manifest(mp)
+    annotations = data.get("annotations")
+    if not isinstance(annotations, list) or len(annotations) == 0:
+        raise ValueError("清单缺少非空 annotations[]，无法运行 L2")
+
+    goal_use = goal.strip() if goal.strip() else str(data.get("goal", ""))
+    if goal_use:
+        logger.info("[L2] 目标: %s", goal_use)
+
+    def _on_2a_phase_save(phase: str, payload: dict[str, Any]) -> None:
+        write_l2_checkpoint(data, mp, phase, payload)
+
+    def _on_after_2b_round(manifest_dict: dict[str, Any], review_round: int) -> None:
+        cur0 = data.setdefault("current", {})
+        if not isinstance(cur0, dict):
+            data["current"] = {}
+            cur0 = data["current"]
+        cur0["comprehension"] = copy.deepcopy(
+            manifest_dict.get("comprehension", {})
+        )
+        cur0["keep_mask"] = copy.deepcopy(manifest_dict.get("keep_mask", []))
+        km = cur0["keep_mask"]
+        n_keep = sum(
+            1 for e in km if isinstance(e, dict) and e.get("keep") is True
+        )
+        write_l2_checkpoint(
+            data,
+            mp,
+            f"2b_r{review_round}",
+            {"keep_true": n_keep, "keep_total": len(km)},
+        )
+
+    try:
+        result = compute_l2_layer_result(
+            data,
+            goal,
+            auto=auto,
+            two_b_mode=two_b_mode,
+            on_phase_save=_on_2a_phase_save,
+            on_after_2b_round=_on_after_2b_round,
+        )
+    except KeyboardInterrupt:
+        logger.warning("[L2] 用户中断")
+        raise
+    except Exception as e:
+        logger.error("[L2] 执行失败: %s", e)
+        raise
+
+    write_l2_checkpoint(
+        data,
+        mp,
+        "2c",
+        {
+            "verdict": result.get("review_report", {}).get("verdict", "pass"),
+        },
+    )
+
+    keep_mask = result["keep_mask"]
+
     cur = data.setdefault("current", {})
     if not isinstance(cur, dict):
         data["current"] = {}
         cur = data["current"]
-    cur["comprehension"] = manifest_dict.get("comprehension", {})
+    cur["comprehension"] = result.get("comprehension", {})
     cur["keep_mask"] = keep_mask
-    if manifest_dict.get("human_feedback_history"):
-        cur["human_feedback_history"] = manifest_dict["human_feedback_history"]
-    data["goal"] = goal_use
+    if result.get("review_report"):
+        cur["review_report"] = result["review_report"]
+    if result.get("human_feedback_history"):
+        cur["human_feedback_history"] = result["human_feedback_history"]
+    data["goal"] = result.get("goal", goal_use)
 
     strip_volatile_fields(data)
     touch_layer_status(data, "l2")

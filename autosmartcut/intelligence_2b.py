@@ -126,17 +126,29 @@ def _two_b_shared_task_and_output_instructions() -> str:
 # 主入口
 # ============================================================================
 
-def run_2b_decision(manifest_dict: dict, *, mode: TwoBMode = "single") -> dict:
+def run_2b_decision(
+    manifest_dict: dict,
+    *,
+    mode: TwoBMode = "single",
+    review_fixes: list[dict] | None = None,
+) -> dict:
     """2b 决策子阶段：输出 keep_mask
 
     Args:
         manifest_dict: 包含 tokens、comprehension、goal 的工作数据
         mode: ``single`` 单次全文调用；``chunked`` 按 2a 分块多次调用后合并。
+        review_fixes: 2c 审核返回的修正指令列表（修正重跑时由编排层传入）。
+            每项含 ``requirement``、``missing_indices``、``note``。
+            为 None 或空列表时表示首次调用，不注入审核反馈。
 
     Returns:
         追加了 keep_mask 字段的 manifest_dict
     """
-    logger.info("[2b] 决策子阶段开始")
+    is_fix_rerun = bool(review_fixes)
+    logger.info(
+        "[2b] 决策子阶段开始%s",
+        "（2c 审核修正重跑）" if is_fix_rerun else "",
+    )
 
     # 句面 JSON2：仅 index + text；决策语义以 comprehension 稠密文本为准
     tokens = manifest_dict["tokens"]
@@ -148,9 +160,13 @@ def run_2b_decision(manifest_dict: dict, *, mode: TwoBMode = "single") -> dict:
     if mode not in ("single", "chunked"):
         raise ValueError(f"mode 须为 'single' 或 'chunked'，实际: {mode!r}")
     if mode == "chunked":
-        keep_mask = _generate_keep_mask_chunked(tokens, comprehension, goal)
+        keep_mask = _generate_keep_mask_chunked(
+            tokens, comprehension, goal, review_fixes=review_fixes
+        )
     else:
-        keep_mask = _generate_keep_mask(tokens, comprehension, goal)
+        keep_mask = _generate_keep_mask(
+            tokens, comprehension, goal, review_fixes=review_fixes
+        )
 
     # 验证 keep_mask 格式
     if len(keep_mask) != len(tokens):
@@ -184,12 +200,14 @@ def run_2b_decision(manifest_dict: dict, *, mode: TwoBMode = "single") -> dict:
 def _generate_keep_mask(
     tokens: list[dict],
     comprehension: dict,
-    goal: str
+    goal: str,
+    *,
+    review_fixes: list[dict] | None = None,
 ) -> list[dict]:
     """调用 LLM 生成 keep_mask"""
     logger.info("[2b] 调用 LLM 生成决策")
 
-    prompt = _build_prompt(tokens, comprehension, goal)
+    prompt = _build_prompt(tokens, comprehension, goal, review_fixes=review_fixes)
     schema = _get_schema()
 
     response = call_llm_structured(
@@ -289,6 +307,8 @@ def _generate_keep_mask_chunked(
     tokens: list[dict],
     comprehension: dict,
     goal: str,
+    *,
+    review_fixes: list[dict] | None = None,
 ) -> list[dict]:
     """按分块多次调用 LLM，合并为完整 keep_mask。"""
     outline_blocks = comprehension.get("outline_blocks", [])
@@ -297,7 +317,9 @@ def _generate_keep_mask_chunked(
 
     if not outline_blocks:
         logger.info("[2b] chunked：outline_blocks 为空，回退为 single 单次调用")
-        return _generate_keep_mask(tokens, comprehension, goal)
+        return _generate_keep_mask(
+            tokens, comprehension, goal, review_fixes=review_fixes
+        )
 
     partitions = _partition_token_indices_by_blocks(tokens, outline_blocks)
     work = [(b, pos) for b, pos in partitions if pos]
@@ -342,6 +364,10 @@ def _generate_keep_mask_chunked(
                 n_subs,
                 len(sub_positions),
             )
+            # 过滤出与本子块相关的修正指令
+            chunk_fixes = _filter_fixes_for_chunk(
+                review_fixes, {int(tokens[i]["index"]) for i in sub_positions}
+            ) if review_fixes else None
             prompt = _build_prompt_chunked(
                 purpose=purpose,
                 goal=goal,
@@ -354,6 +380,7 @@ def _generate_keep_mask_chunked(
                 cleaned_annotations=cleaned_annotations,
                 block_positions=sub_positions,
                 block_meta=block_meta,
+                review_fixes=chunk_fixes,
             )
             response = call_llm_structured(
                 prompt=prompt,
@@ -376,6 +403,49 @@ def _generate_keep_mask_chunked(
         for tok in tokens
     ]
     return _build_keep_mask_from_llm_decisions(tokens, synthetic)
+
+
+def _filter_fixes_for_chunk(
+    review_fixes: list[dict] | None,
+    allowed_indices: set[int],
+) -> list[dict] | None:
+    """过滤出与本子块相关的修正项（missing_indices 与本块有交集的项）。
+
+    Returns:
+        过滤后的修正列表；若无相关项则返回 None。
+    """
+    if not review_fixes:
+        return None
+    result: list[dict] = []
+    for fix in review_fixes:
+        relevant = [i for i in fix.get("missing_indices", []) if i in allowed_indices]
+        if relevant:
+            result.append({
+                "requirement": fix["requirement"],
+                "missing_indices": relevant,
+                "note": fix.get("note", ""),
+            })
+    return result if result else None
+
+
+def _build_review_fixes_section(review_fixes: list[dict] | None) -> str:
+    """构造审核修正指令区段。无修正时返回空字符串。"""
+    if not review_fixes:
+        return ""
+    lines = [
+        "【审核修正指令（本次为 2c 审核后的修正重跑）】",
+        "上一轮决策存在以下问题，本轮须优先修正。对于下列指出应保留的 index，",
+        "除非该句是纯语气词或与前后句完全重复，否则必须改为 keep=true：",
+        "",
+    ]
+    for i, fix in enumerate(review_fixes, start=1):
+        indices_str = ", ".join(str(idx) for idx in fix["missing_indices"])
+        lines.append(f"{i}. 未满足条件：「{fix['requirement']}」")
+        lines.append(f"   应保留但被删除的句子：index {indices_str}")
+        if fix.get("note"):
+            lines.append(f"   说明：{fix['note']}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _merge_chunk_decisions(
@@ -412,6 +482,7 @@ def _build_prompt_chunked(
     cleaned_annotations: list[dict],
     block_positions: list[int],
     block_meta: dict,
+    review_fixes: list[dict] | None = None,
 ) -> str:
     """分块模式下单次 LLM 的 prompt。"""
     goal_line = f"用户目标：{goal}" if goal else "用户目标：无特定目标，提取核心内容"
@@ -441,11 +512,13 @@ def _build_prompt_chunked(
         "下游执行层将仅依据 keep_mask 与清单时间轴裁切视频。\n"
     )
 
+    fixes_section = _build_review_fixes_section(review_fixes)
+
     shared = _two_b_shared_task_and_output_instructions()
 
     return f"""{goal_line}
 
-{stage}{sub_line}内容主旨：{purpose}
+{stage}{sub_line}{fixes_section}内容主旨：{purpose}
 
 {range_line}
 本 outline 块摘要：{block_summ if block_summ else "（无）"}{extra}
@@ -461,7 +534,9 @@ def _build_prompt_chunked(
 def _build_prompt(
     tokens: list[dict],
     comprehension: dict,
-    goal: str
+    goal: str,
+    *,
+    review_fixes: list[dict] | None = None,
 ) -> str:
     """构造 2b 决策的 Prompt（single：全文一次）。"""
     purpose = comprehension.get("purpose", "")
@@ -493,11 +568,14 @@ def _build_prompt(
         "上游 2a 已产出主旨、分块摘要与稠密消歧句面；"
         "下游执行层将仅依据 keep_mask 裁切视频。\n"
     )
+
+    fixes_section = _build_review_fixes_section(review_fixes)
+
     shared = _two_b_shared_task_and_output_instructions()
 
     return f"""{goal_line}
 
-{stage}内容主旨：{purpose}
+{stage}{fixes_section}内容主旨：{purpose}
 
 {blocks_section}
 

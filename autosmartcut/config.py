@@ -37,6 +37,10 @@ class ExecutionConfig:
 	vad_threshold: float = 0.35
 	vad_min_silence_ms: int = 80
 	vad_speech_pad_ms: int = 10
+	# L1A 完成后 L1B 与 L2 是否并行（--stage 含 1a* 且含 2；可用 CLI 关闭）
+	parallel_l1b_l2_enabled: bool = True
+	# L3 是否尝试 seam_index + ffmpeg concat 快速成片（失败自动回退 smartcut）
+	sentence_tile_cache_enabled: bool = True
 
 
 @dataclass
@@ -49,6 +53,10 @@ class ModelConfig:
 class IntelligenceConfig:
 	# 2b chunked：单 outline 块超过该句数时二次拆分子块
 	two_b_block_size_limit: int = 50
+	# 2c 审核：最大修正轮次（0=占位透传，1=审核+最多1轮修正）
+	two_c_max_review_rounds: int = 1
+	# 2c 审核：must 项通过率阈值（1.0=全部 must 必须通过）
+	two_c_must_pass_rate: float = 1.0
 
 
 @dataclass
@@ -106,6 +114,18 @@ def load_config(path: Path | None = None) -> AppConfig:
 				"vad_speech_pad_ms", config.execution.vad_speech_pad_ms
 			)
 		),
+		parallel_l1b_l2_enabled=bool(
+			execution.get(
+				"parallel_l1b_l2_enabled",
+				config.execution.parallel_l1b_l2_enabled,
+			)
+		),
+		sentence_tile_cache_enabled=bool(
+			execution.get(
+				"sentence_tile_cache_enabled",
+				config.execution.sentence_tile_cache_enabled,
+			)
+		),
 	)
 
 	perception = raw.get("perception", {})
@@ -135,5 +155,13 @@ def load_config(path: Path | None = None) -> AppConfig:
 		limit = config.intelligence.two_b_block_size_limit
 	config.intelligence = IntelligenceConfig(
 		two_b_block_size_limit=max(1, limit),
+		two_c_max_review_rounds=max(0, int(intel.get(
+			"two_c_max_review_rounds",
+			config.intelligence.two_c_max_review_rounds,
+		))),
+		two_c_must_pass_rate=float(intel.get(
+			"two_c_must_pass_rate",
+			config.intelligence.two_c_must_pass_rate,
+		)),
 	)
 	return config
