@@ -744,7 +744,15 @@ def _build_forced_aligner_only(
 	forced_aligner_path: Path,
 	device: str,
 	dtype: torch.dtype,
+	backend: str = "transformers",
 ) -> Qwen3ForcedAligner:
+	# ForcedAligner 是 NAR 模型，qwen-asr 包只提供 from_pretrained 接口，无 vLLM 入口。
+	# Qwen3ASRModel.LLM() 里的 forced_aligner= 参数底层也是 transformers 加载的。
+	# 因此无论 backend 传什么，这里始终走 transformers。
+	if backend == "vllm":
+		logger.warning(
+			"[L1B] ForcedAligner 不支持 vLLM 后端（NAR 模型），自动降级为 transformers。"
+		)
 	return Qwen3ForcedAligner.from_pretrained(
 		str(forced_aligner_path),
 		dtype=dtype,
@@ -941,6 +949,7 @@ def compute_l1b_aligned_annotations(
 			forced_aligner_path=forced_aligner_path,
 			device=device,
 			dtype=torch_dtype,
+			backend=backend,
 		)
 
 	with log_stage("l1b.forced_align", language=language):

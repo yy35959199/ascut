@@ -47,12 +47,17 @@ class ExecutionConfig:
 class ModelConfig:
 	asr_model_path: Path = Path("models/Qwen3-ASR-1.7B")
 	forced_aligner_path: Path = Path("models/Qwen3-ForcedAligner-0.6B")
+	# ASR 推理后端："transformers" 或 "vllm"
+	# ForcedAligner 始终使用 transformers（NAR 模型，无 vLLM 接口）
+	backend: str = "transformers"
 
 
 @dataclass
 class IntelligenceConfig:
-	# 2b chunked：单 outline 块超过该句数时二次拆分子块
-	two_b_block_size_limit: int = 50
+	# 2b 模式："single"（全文一次调用）或 "block"（每个 outline 块一次调用）
+	two_b_mode: str = "single"
+	# 2b block 模式下，单块句数超过此值时记录警告（0 = 不限制/不警告）
+	two_b_block_size_limit: int = 0
 	# 2c 审核：最大修正轮次（0=占位透传，1=审核+最多1轮修正）
 	two_c_max_review_rounds: int = 1
 	# 2c 审核：must 项通过率阈值（1.0=全部 must 必须通过）
@@ -90,6 +95,7 @@ def load_config(path: Path | None = None) -> AppConfig:
 				"forced_aligner_path", str(config.models.forced_aligner_path)
 			)
 		),
+		backend=str(models.get("backend", config.models.backend)),
 	)
 
 	execution = raw.get("execution", {})
@@ -156,7 +162,8 @@ def load_config(path: Path | None = None) -> AppConfig:
 	except (TypeError, ValueError):
 		limit = config.intelligence.two_b_block_size_limit
 	config.intelligence = IntelligenceConfig(
-		two_b_block_size_limit=max(1, limit),
+		two_b_mode=str(intel.get("two_b_mode", config.intelligence.two_b_mode)),
+		two_b_block_size_limit=max(0, limit),
 		two_c_max_review_rounds=max(0, int(intel.get(
 			"two_c_max_review_rounds",
 			config.intelligence.two_c_max_review_rounds,

@@ -50,12 +50,13 @@ manifest_dict["keep_mask"] = [
 - keep_mask 与 tokens 通过 index 一一对应
 - 每条 keep 均为 bool，与 JSON3 / intelligence-layer2-mvp 一致
 
-## 2b 模式（对照实验）
+## 2b 模式
 - ``mode="single"``：单次 LLM，传入全文句列。
-- ``mode="chunked"``：按 ``outline_blocks`` 将句级 index 分区；每 outline 块内若句数
-  超过 ``config.toml`` 中 ``[intelligence].two_b_block_size_limit``（默认 50），
-  再按该上限二次拆分为子块，每子块一次 LLM；子块 prompt 仍含全文叙事弧。
+- ``mode="block"``：按 ``outline_blocks`` 将句级 index 分区；每个 outline 块整体一次
+  LLM 调用，不做子块拆分；prompt 仍含全文叙事弧。
   若 ``outline_blocks`` 为空则自动回退为 ``single``。
+  若 ``config.toml`` 中 ``[intelligence].two_b_block_size_limit`` 为正整数且块句数超过
+  该值，仅记录 WARNING，不拆分（chat 模型兜底阈值，reasoner 模型无需关注）。
 """
 
 from __future__ import annotations
@@ -66,7 +67,7 @@ from typing import Literal
 from autosmartcut.config import load_config
 from autosmartcut.intelligence_llm import call_llm_structured
 
-TwoBMode = Literal["single", "chunked"]
+TwoBMode = Literal["single", "block"]
 
 logger = logging.getLogger(__name__)
 
@@ -80,11 +81,6 @@ ENABLE_REASONING = True
 
 # 温度：偏低，决策需要确定性和稳定性（非 reasoner 路径下生效）
 TEMPERATURE = 0.2
-
-
-def _get_two_b_block_size_limit() -> int:
-    """从 config.toml [intelligence] 读取单 outline 块内二次拆分上限句数。"""
-    return max(1, load_config(None).intelligence.two_b_block_size_limit)
 
 
 def _two_b_shared_task_and_output_instructions() -> str:
@@ -136,7 +132,7 @@ def run_2b_decision(
 
     Args:
         manifest_dict: 包含 tokens、comprehension、goal 的工作数据
-        mode: ``single`` 单次全文调用；``chunked`` 按 2a 分块多次调用后合并。
+        mode: ``single`` 单次全文调用；``block`` 按 2a 分块每块一次调用后合并。
         review_fixes: 2c 审核返回的修正指令列表（修正重跑时由编排层传入）。
             每项含 ``requirement``、``missing_indices``、``note``。
             为 None 或空列表时表示首次调用，不注入审核反馈。
@@ -159,10 +155,10 @@ def run_2b_decision(
     # F3 回流时编排器注入的用户选择意见（临时字段）
     selection_opinion = str(manifest_dict.get("_selection_opinion", ""))
 
-    if mode not in ("single", "chunked"):
-        raise ValueError(f"mode 须为 'single' 或 'chunked'，实际: {mode!r}")
-    if mode == "chunked":
-        keep_mask = _generate_keep_mask_chunked(
+    if mode not in ("single", "block"):
+        raise ValueError(f"mode 须为 'single' 或 'block'，实际: {mode!r}")
+    if mode == "block":
+        keep_mask = _generate_keep_mask_block(
             tokens, comprehension, goal, review_fixes=review_fixes,
             selection_opinion=selection_opinion,
         )
@@ -209,10 +205,10 @@ def _generate_keep_mask(
     review_fixes: list[dict] | None = None,
     selection_opinion: str = "",
 ) -> list[dict]:
-    """调用 LLM 生成 keep_mask"""
-    logger.info("[2b] 调用 LLM 生成决策")
+    """调用 LLM 生成 keep_mask（single 模式：全文一次调用）"""
+    logger.info("[2b] 调用 LLM 生成决策（single 模式）")
 
-    prompt = _build_prompt(tokens, comprehension, goal, review_fixes=review_fixes, selection_opinion=selection_opinion)
+    prompt = _build_prompt_single(tokens, comprehension, goal, review_fixes=review_fixes, selection_opinion=selection_opinion)
     schema = _get_schema()
 
     response = call_llm_structured(
@@ -308,7 +304,7 @@ def _narrative_arc_section(
     return "叙事弧（各块主旨，理解整体结构）：\n" + "\n".join(lines)
 
 
-def _generate_keep_mask_chunked(
+def _generate_keep_mask_block(
     tokens: list[dict],
     comprehension: dict,
     goal: str,
@@ -316,13 +312,13 @@ def _generate_keep_mask_chunked(
     review_fixes: list[dict] | None = None,
     selection_opinion: str = "",
 ) -> list[dict]:
-    """按分块多次调用 LLM，合并为完整 keep_mask。"""
+    """按 outline_blocks 整块调用 LLM，每块一次，不做子块拆分，合并为完整 keep_mask。"""
     outline_blocks = comprehension.get("outline_blocks", [])
     cleaned_annotations = comprehension.get("cleaned_annotations", [])
     _validate_dense_cleaned_vs_tokens(tokens, cleaned_annotations)
 
     if not outline_blocks:
-        logger.info("[2b] chunked：outline_blocks 为空，回退为 single 单次调用")
+        logger.info("[2b] block：outline_blocks 为空，回退为 single 单次调用")
         return _generate_keep_mask(
             tokens, comprehension, goal, review_fixes=review_fixes,
             selection_opinion=selection_opinion,
@@ -341,99 +337,62 @@ def _generate_keep_mask_chunked(
     schema = _get_schema()
     merged: dict[int, bool] = {}
 
-    block_limit = _get_two_b_block_size_limit()
+    block_limit = load_config(None).intelligence.two_b_block_size_limit
 
     for ord1, (block_meta, positions) in enumerate(work, start=1):
         n_pos = len(positions)
-        if n_pos > block_limit:
-            sub_chunks = [
-                positions[i : i + block_limit]
-                for i in range(0, n_pos, block_limit)
-            ]
-            logger.info(
-                "[2b] outline 块 %d/%d 共 %d 句，按 limit=%d 拆为 %d 个子块",
+        if block_limit > 0 and n_pos > block_limit:
+            logger.warning(
+                "[2b] outline 块 %d/%d 共 %d 句，超过 two_b_block_size_limit=%d，"
+                "仍整块发送（block 模式不拆分）",
                 ord1,
                 n_blocks,
                 n_pos,
                 block_limit,
-                len(sub_chunks),
             )
-        else:
-            sub_chunks = [positions]
 
-        n_subs = len(sub_chunks)
-        for sub_ord, sub_positions in enumerate(sub_chunks, start=1):
-            logger.info(
-                "[2b] chunked LLM outline 块 %d/%d · 子块 %d/%d，本批 %d 句",
-                ord1,
-                n_blocks,
-                sub_ord,
-                n_subs,
-                len(sub_positions),
-            )
-            # 过滤出与本子块相关的修正指令
-            chunk_fixes = _filter_fixes_for_chunk(
-                review_fixes, {int(tokens[i]["index"]) for i in sub_positions}
-            ) if review_fixes else None
-            prompt = _build_prompt_chunked(
-                purpose=purpose,
-                goal=goal,
-                block_ordinal=ord1,
-                n_blocks=n_blocks,
-                sub_ordinal=sub_ord,
-                n_subs=n_subs,
-                narrative_arc_section=arc,
-                tokens=tokens,
-                cleaned_annotations=cleaned_annotations,
-                block_positions=sub_positions,
-                block_meta=block_meta,
-                review_fixes=chunk_fixes,
-                selection_opinion=selection_opinion,
-            )
-            response = call_llm_structured(
-                prompt=prompt,
-                schema=schema,
-                temperature=TEMPERATURE,
-                enable_reasoning=ENABLE_REASONING,
-            )
-            llm_decisions = response.get("decisions", [])
-            allowed = {int(tokens[i]["index"]) for i in sub_positions}
-            chunk_map = _merge_chunk_decisions(llm_decisions, allowed)
-            for idx, keep in chunk_map.items():
-                if idx in merged:
-                    logger.warning(
-                        "[2b] index %s 在多块中重复决策，以后块为准", idx
-                    )
-                merged[idx] = keep
+        logger.info(
+            "[2b] block LLM outline 块 %d/%d，本块 %d 句",
+            ord1,
+            n_blocks,
+            n_pos,
+        )
+        prompt = _build_prompt_block(
+            purpose=purpose,
+            goal=goal,
+            block_ordinal=ord1,
+            n_blocks=n_blocks,
+            sub_ordinal=1,
+            n_subs=1,
+            narrative_arc_section=arc,
+            tokens=tokens,
+            cleaned_annotations=cleaned_annotations,
+            block_positions=positions,
+            block_meta=block_meta,
+            review_fixes=review_fixes,
+            selection_opinion=selection_opinion,
+        )
+        response = call_llm_structured(
+            prompt=prompt,
+            schema=schema,
+            temperature=TEMPERATURE,
+            enable_reasoning=ENABLE_REASONING,
+        )
+        llm_decisions = response.get("decisions", [])
+        allowed = {int(tokens[i]["index"]) for i in positions}
+        chunk_map = _merge_chunk_decisions(llm_decisions, allowed)
+        for idx, keep in chunk_map.items():
+            if idx in merged:
+                logger.warning(
+                    "[2b] index %s 在多块中重复决策，以后块为准", idx
+                )
+            merged[idx] = keep
 
     synthetic = [
         {"index": int(tok["index"]), "keep": merged.get(int(tok["index"]), True)}
         for tok in tokens
     ]
     return _build_keep_mask_from_llm_decisions(tokens, synthetic)
-
-
-def _filter_fixes_for_chunk(
-    review_fixes: list[dict] | None,
-    allowed_indices: set[int],
-) -> list[dict] | None:
-    """过滤出与本子块相关的修正项（missing_indices 与本块有交集的项）。
-
-    Returns:
-        过滤后的修正列表；若无相关项则返回 None。
-    """
-    if not review_fixes:
-        return None
-    result: list[dict] = []
-    for fix in review_fixes:
-        relevant = [i for i in fix.get("missing_indices", []) if i in allowed_indices]
-        if relevant:
-            result.append({
-                "requirement": fix["requirement"],
-                "missing_indices": relevant,
-                "note": fix.get("note", ""),
-            })
-    return result if result else None
 
 
 def _build_review_fixes_section(review_fixes: list[dict] | None) -> str:
@@ -477,7 +436,7 @@ def _merge_chunk_decisions(
     return out
 
 
-def _build_prompt_chunked(
+def _build_prompt_block(
     *,
     purpose: str,
     goal: str,
@@ -493,11 +452,11 @@ def _build_prompt_chunked(
     review_fixes: list[dict] | None = None,
     selection_opinion: str = "",
 ) -> str:
-    """分块模式下单次 LLM 的 prompt。"""
+    """block 模式下单次 LLM 的 prompt（每个 outline 块整体一次调用）。"""
     goal_line = f"用户目标：{goal}" if goal else "用户目标：无特定目标，提取核心内容"
     lo = int(tokens[block_positions[0]]["index"])
     hi = int(tokens[block_positions[-1]]["index"])
-    range_line = f"本子块在全文中的 index 范围：{lo}–{hi}（共 {len(block_positions)} 句）"
+    range_line = f"本块在全文中的 index 范围：{lo}–{hi}（共 {len(block_positions)} 句）"
 
     speech_lines = []
     for i in block_positions:
@@ -510,10 +469,14 @@ def _build_prompt_chunked(
     if block_meta.get("_synthetic_gap"):
         extra = "\n说明：本块为程序根据全文 index 补齐的分区，不在 2a 原始 outline_blocks 中。"
 
-    sub_line = (
-        f"当前 outline 块：第 {block_ordinal}/{n_blocks} 块；"
-        f"本子块：第 {sub_ordinal}/{n_subs} 批（同一 outline 块内按句数上限切分）。\n"
-    )
+    # n_subs == 1 时（block 模式始终如此）省略子块行
+    if n_subs > 1:
+        sub_line = (
+            f"当前 outline 块：第 {block_ordinal}/{n_blocks} 块；"
+            f"本子块：第 {sub_ordinal}/{n_subs} 批（同一 outline 块内按句数上限切分）。\n"
+        )
+    else:
+        sub_line = f"当前 outline 块：第 {block_ordinal}/{n_blocks} 块。\n"
 
     stage = (
         "【阶段定位】当前阶段：2b 决策层（口语转录清洗 + 成片取舍）。"
@@ -547,7 +510,7 @@ def _build_prompt_chunked(
 {shared}"""
 
 
-def _build_prompt(
+def _build_prompt_single(
     tokens: list[dict],
     comprehension: dict,
     goal: str,
@@ -555,7 +518,7 @@ def _build_prompt(
     review_fixes: list[dict] | None = None,
     selection_opinion: str = "",
 ) -> str:
-    """构造 2b 决策的 Prompt（single：全文一次）。"""
+    """构造 2b 决策的 Prompt（single 模式：全文一次）。"""
     purpose = comprehension.get("purpose", "")
     cleaned_annotations = comprehension.get("cleaned_annotations", [])
     outline_blocks = comprehension.get("outline_blocks", [])

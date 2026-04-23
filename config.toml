@@ -1,6 +1,9 @@
 [models]
 asr_model_path = "models/Qwen3-ASR-1.7B"
 forced_aligner_path = "models/Qwen3-ForcedAligner-0.6B"
+# ASR 推理后端："transformers"（默认）或 "vllm"（需 pip install qwen-asr[vllm]）
+# 注意：强制对齐（ForcedAligner）始终使用 transformers，不受此项影响
+backend = "transformers"
 
 [perception]
 segmentation_mode = "punctuation"
@@ -31,9 +34,12 @@ reasoner_model = "deepseek-reasoner"        # Reasoner 模型
 default_temperature = 0.3                   # 默认温度
 default_max_tokens = 8192                   # 默认最大 tokens
 
-# 智能层：2b chunked 模式下，单 outline 块内超过该句数则按此长度二次拆分子块再调 LLM
+# 智能层
 [intelligence]
-two_b_block_size_limit = 50
+# 2b 模式："single"（全文一次调用）或 "block"（每个 outline 块一次调用，不二次拆分）
+two_b_mode = "single"
+# block 模式下，单块句数超过此值时记录警告（0 = 不限制/不警告；正整数 = chat 模型兜底阈值）
+two_b_block_size_limit = 0
 # 2c 审核：最大修正轮次（0=占位透传，1=审核+最多1轮修正，2=最多2轮修正）
 two_c_max_review_rounds = 1
 # 2c 审核：must 项通过率阈值（1.0=全部 must 必须通过才 pass）

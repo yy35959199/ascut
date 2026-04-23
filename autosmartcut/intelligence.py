@@ -342,8 +342,8 @@ def compute_l2_layer_result(
     ``on_after_2b_round``：每轮 2b 后回调 ``(manifest_dict, review_round)``；串行路径用于写检查点。
     ``max_2d_reflows``：2d 回流上限；None 时从 IntelligenceConfig 读取默认值。
     """
-    if two_b_mode not in ("single", "chunked"):
-        raise ValueError(f"two_b_mode 须为 'single' 或 'chunked'，实际: {two_b_mode!r}")
+    if two_b_mode not in ("single", "block"):
+        raise ValueError(f"two_b_mode 须为 'single' 或 'block'，实际: {two_b_mode!r}")
     annotations = data.get("annotations")
     if not isinstance(annotations, list) or len(annotations) == 0:
         raise ValueError("清单缺少非空 annotations[]，无法运行 L2")
@@ -605,7 +605,7 @@ def main() -> None:
     p.add_argument(
         "--two-b-mode",
         type=str,
-        choices=["single", "chunked"],
+        choices=["single", "block"],
         default="single",
     )
     args = p.parse_args()

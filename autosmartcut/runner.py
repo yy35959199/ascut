@@ -91,9 +91,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     pr.add_argument(
         "--two-b-mode",
         type=str,
-        choices=["single", "chunked"],
-        default="single",
-        help="2b：single 或 chunked",
+        choices=["single", "block"],
+        default=None,
+        help="2b：single 或 block；省略时使用 config.toml 中的 two_b_mode",
     )
     pr.add_argument("--config", type=Path, default=None, help="config.toml")
     pr.add_argument("--asr-model", type=Path, default=None, help="Qwen3-ASR 模型目录")
@@ -102,7 +102,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--backend",
         type=str,
         choices=["transformers", "vllm"],
-        default="transformers",
+        default=None,  # None → 由 config.models.backend 决定，默认 "transformers"
     )
     pr.add_argument("--device", type=str, default="cuda:0")
     pr.add_argument(
@@ -186,6 +186,14 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         if args.forced_aligner is not None
         else cfg.models.forced_aligner_path
     )
+    # CLI --backend 优先；未指定时从 config.models.backend 读取（默认 "transformers"）
+    backend = args.backend if args.backend is not None else cfg.models.backend
+    # CLI --two-b-mode 优先；未指定时从 config.intelligence.two_b_mode 读取（默认 "single"）
+    effective_two_b_mode = (
+        args.two_b_mode
+        if args.two_b_mode is not None
+        else cfg.intelligence.two_b_mode
+    )
 
     stages: frozenset[int] = getattr(args, "_resolved_stages")
 
@@ -215,7 +223,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 asr_model_path=asr_model,
                 forced_aligner_path=forced,
                 config=cfg,
-                backend=args.backend,
+                backend=backend,
                 device=args.device,
                 dtype=args.dtype,
                 language=args.language,
@@ -226,7 +234,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 run,
                 asr_model_path=asr_model,
                 config=cfg,
-                backend=args.backend,
+                backend=backend,
                 device=args.device,
                 dtype=args.dtype,
                 language=args.language,
@@ -242,8 +250,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                     forced_aligner_path=forced,
                     config=cfg,
                     auto=auto,
-                    two_b_mode=args.two_b_mode,
-                    backend=args.backend,
+                    two_b_mode=effective_two_b_mode,
+                    backend=backend,
                     device=args.device,
                     dtype=args.dtype,
                     language=args.language,
@@ -258,7 +266,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 run,
                 forced_aligner_path=forced,
                 config=cfg,
-                backend=args.backend,
+                backend=backend,
                 device=args.device,
                 dtype=args.dtype,
                 language=args.language,
@@ -271,7 +279,7 @@ def _run_pipeline(args: argparse.Namespace) -> int:
                 run.goal,
                 auto=auto,
                 verbose_log=args.verbose,
-                two_b_mode=args.two_b_mode,
+                two_b_mode=effective_two_b_mode,
             )
 
         if 3 in stages:
