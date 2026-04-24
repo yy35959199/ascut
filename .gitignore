@@ -1,6 +1,9 @@
 models/
+sample/
 samples/
 outputs/
+output/
+output/op
 pycache/
 *.egg-info/
 .eggs/
