@@ -240,8 +240,16 @@ class PipelineSession:
                     self._node_states[node_id] = NodeState(node_id=node_id, status="skipped")
 
     def _apply_resumable_skip(self, manifest: dict) -> None:
-        """resumable=True 且 layer_status 有完成标记时跳过节点。"""
+        """resumable=True 且 layer_status 有完成标记时跳过节点。
+
+        跳过节点时，将 manifest["current"] 中对应节点写出的字段回填到顶层，
+        确保后续节点能从内存 manifest 中读到这些字段（而不必重新执行）。
+        """
         layer_status = manifest.get("layer_status", {})
+        current = manifest.get("current", {})
+        if not isinstance(current, dict):
+            current = {}
+
         for node_id, node in self._nodes.items():
             # 只处理仍为 pending 的节点
             if self._node_states[node_id].status != "pending":
@@ -252,6 +260,11 @@ class PipelineSession:
                     status="skipped",
                     completed_at=datetime.now(),
                 )
+                # 将 current 中该节点写出的字段回填到顶层 manifest，
+                # 确保下游节点能从内存中读到（不依赖重新执行）
+                for field in self._L2_CURRENT_FIELDS:
+                    if field in current and field not in manifest:
+                        manifest[field] = current[field]
 
     @staticmethod
     def parse_stage_arg(stage_str: str) -> "tuple[frozenset[int], frozenset[str] | None]":
@@ -505,6 +518,7 @@ class PipelineSession:
         self._abort_flag = True
         if save and self._current_manifest:
             try:
+                self._sync_to_current(self._current_manifest)
                 save_manifest(self._manifest_path, self._current_manifest, atomic=True)
             except Exception as e:
                 logger.warning("abort 保存 manifest 失败: %s", e)
@@ -544,6 +558,7 @@ class PipelineSession:
             return
 
         # 保存回流前检查点
+        self._sync_to_current(manifest)
         save_manifest(self._manifest_path, manifest, atomic=True)
         self._reflow_count += 1
         self._review_round = 0
@@ -631,6 +646,31 @@ class PipelineSession:
     # 统一结果处理（任务 2.10）
     # -----------------------------------------------------------------------
 
+    # L2 节点写出的顶层字段 → 需要同步到 manifest["current"] 的键名映射
+    # 格式：顶层键 → current 子键（通常相同）
+    _L2_CURRENT_FIELDS: tuple[str, ...] = (
+        "keep_mask",
+        "comprehension",
+        "review_report",
+        "human_feedback_history",
+        "l2d_completed",
+    )
+
+    def _sync_to_current(self, manifest: dict) -> None:
+        """将 L2 节点写出的顶层字段同步到 manifest["current"]。
+
+        pipeline 内各节点直接写 manifest 顶层（如 manifest["keep_mask"]），
+        但 l3_planner / validate_manifest_for_stages 读的是 manifest["current"]["keep_mask"]。
+        每次保存前调用此方法确保两者一致。
+        """
+        cur = manifest.setdefault("current", {})
+        if not isinstance(cur, dict):
+            manifest["current"] = {}
+            cur = manifest["current"]
+        for key in self._L2_CURRENT_FIELDS:
+            if key in manifest:
+                cur[key] = manifest[key]
+
     async def _handle_result(
         self,
         node_id: str,
@@ -649,6 +689,8 @@ class PipelineSession:
                 report = manifest.get("review_report", {})
                 self._last_review_verdict = report.get("verdict", "")
                 self._review_round += 1
+            # 将 L2 节点写出的顶层字段同步到 current，确保磁盘上结构完整
+            self._sync_to_current(manifest)
             # 保存 manifest
             save_manifest(self._manifest_path, manifest, atomic=True)
             # 更新 node output

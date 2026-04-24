@@ -32,7 +32,7 @@ base_url = "https://api.deepseek.com/v1"    # API Base URL
 model = "deepseek-chat"                     # 默认模型
 reasoner_model = "deepseek-reasoner"        # Reasoner 模型
 default_temperature = 0.3                   # 默认温度
-default_max_tokens = 8192                   # 默认最大 tokens
+default_max_tokens = 65536                  # 默认最大 tokens（模型支持最大 384K 输出）
 
 # 智能层
 [intelligence]

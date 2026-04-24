@@ -79,13 +79,22 @@ def _build_tile_positive_segments(
         ts = float(ann["t_start"])
         te = float(ann["t_end"])
         idx = int(ann.get("index", i))
-        segs.append(
-            (
-                Fraction(ts).limit_denominator(1_000_000),
-                Fraction(te).limit_denominator(1_000_000),
+
+        # 跳过零时长或负时长句子（L1B 对齐偶尔产生 t_start == t_end）
+        # smart_cut 要求 start_time < end_time，否则触发 AssertionError
+        if te <= ts + _EPS:
+            logger.warning(
+                "[L3Precompute] 跳过零时长句子 index=%d (t_start=%.4f, t_end=%.4f)",
+                idx, ts, te,
             )
-        )
-        meta.append({"kind": "sentence", "index": idx})
+        else:
+            segs.append(
+                (
+                    Fraction(ts).limit_denominator(1_000_000),
+                    Fraction(te).limit_denominator(1_000_000),
+                )
+            )
+            meta.append({"kind": "sentence", "index": idx})
 
         if i + 1 < len(anns):
             ts_next = float(anns[i + 1]["t_start"])

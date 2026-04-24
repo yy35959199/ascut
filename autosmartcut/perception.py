@@ -529,6 +529,34 @@ def assign_times_to_spans(
 			raise ValueError(f"句 {sp.index} 时间逆序: t_start={ts} t_end={te}")
 		timings.append(SentenceTiming(sp.index, ts, te))
 
+	# 修正零时长句子：ForcedAligner 量化步长为 80ms，极短发音可能导致 t_start == t_end。
+	# 策略：向后借 0.01s（不超过后一句的 t_start）；末句向前借（不超过前一句的 t_end）。
+	# 这是 ascut 侧的防御性后处理，不修改 upstream 对齐器行为。
+	_MIN_DUR = 0.01
+	for i, t in enumerate(timings):
+		if t.t_start is None or t.t_end is None:
+			continue
+		if t.t_end > t.t_start:
+			continue
+		# t_start == t_end（或逆序，但逆序已在上面 raise 过，此处只剩相等情况）
+		if i + 1 < len(timings) and timings[i + 1].t_start is not None:
+			new_te = min(t.t_start + _MIN_DUR, timings[i + 1].t_start)
+		elif i > 0 and timings[i - 1].t_end is not None:
+			new_ts = max(t.t_end - _MIN_DUR, timings[i - 1].t_end)
+			timings[i] = SentenceTiming(t.index, new_ts, t.t_end)
+			logging.getLogger(__name__).warning(
+				"[L1B] 句 index=%d 零时长，向前借 %.3fs: t_start %.5f→%.5f",
+				t.index, _MIN_DUR, t.t_start, new_ts,
+			)
+			continue
+		else:
+			new_te = t.t_start + _MIN_DUR
+		timings[i] = SentenceTiming(t.index, t.t_start, new_te)
+		logging.getLogger(__name__).warning(
+			"[L1B] 句 index=%d 零时长，向后借 %.3fs: t_end %.5f→%.5f",
+			t.index, _MIN_DUR, t.t_end, new_te,
+		)
+
 	for a, b in zip(timings, timings[1:]):
 		if (
 			a.t_end is not None

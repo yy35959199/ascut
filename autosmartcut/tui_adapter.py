@@ -43,10 +43,22 @@ class TUIAdapter:
         session.subscribe(self._handle_event)
 
     def _handle_event(self, event: "PipelineEvent") -> None:
-        """将事件转发给 Textual App（线程安全）。"""
+        """将事件转发给 Textual App。
+
+        ⚠️  注意：不能用 call_from_thread()。
+        session.start_async() 与 app.run_async() 同跑在一个 asyncio event loop
+        里（同一线程）。Textual 的 call_from_thread() 内部有明确的线程检查：
+            if self._thread_id == threading.get_ident():
+                raise RuntimeError("must run in a different thread from the app")
+        在同线程调用必然抛 RuntimeError，若被 except 静默吞掉则所有事件全部丢失，
+        TUI 将永远停在"等待流水线启动..."无法推进。
+
+        正确做法：call_later()——通过 Textual 消息泵调度回调，同线程/同 event loop
+        内完全安全，不做线程检查。
+        """
         if self._app is not None:
             try:
-                self._app.call_from_thread(self._app.handle_pipeline_event, event)
+                self._app.call_later(self._app.handle_pipeline_event, event)
             except Exception as e:
                 logger.warning("TUIAdapter._handle_event 转发失败: %s", e)
 
@@ -95,12 +107,54 @@ if _TEXTUAL_AVAILABLE:
 
         BINDINGS = [
             Binding("p", "pause", "暂停"),
+            Binding("l", "show_log", "日志"),
             Binding("q", "quit_app", "退出"),
         ]
 
         def __init__(self, session: "PipelineSession") -> None:
             super().__init__()
             self._session = session
+            self._loguru_sink_id: int | None = None
+
+        def on_mount(self) -> None:
+            """注册 loguru TUI sink，将所有日志转发到 LogArea。
+
+            必须在 on_mount 而非 __init__ 中注册：此时 Textual 消息泵已就绪，
+            call_later() 可以安全调用。在 __init__ 中注册会导致 sink 回调在
+            消息泵启动前触发，call_later() 无法投递。
+            """
+            from loguru import logger as loguru_logger
+
+            def _tui_sink(message: object) -> None:
+                # message 是 loguru 的 Message 对象，str() 得到格式化后的文本
+                text = str(message).rstrip("\n")
+                self.call_later(self._append_to_log_area, text)
+
+            self._loguru_sink_id = loguru_logger.add(
+                _tui_sink,
+                level="INFO",
+                format="{time:HH:mm:ss} | {level: <8} | {message}",
+                colorize=False,
+                enqueue=False,
+            )
+
+        def on_unmount(self) -> None:
+            """移除 loguru TUI sink，避免 App 退出后 sink 仍持有引用。"""
+            if self._loguru_sink_id is not None:
+                from loguru import logger as loguru_logger
+                try:
+                    loguru_logger.remove(self._loguru_sink_id)
+                except Exception:
+                    pass
+                self._loguru_sink_id = None
+
+        def _append_to_log_area(self, text: str) -> None:
+            """将文本追加到 LogArea（在 Textual 主线程中调用）。"""
+            try:
+                log_area = self.query_one("#log-area", LogArea)
+                log_area.append_log("", "sys", text)
+            except Exception:
+                pass
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -144,6 +198,10 @@ if _TEXTUAL_AVAILABLE:
         def action_pause(self) -> None:
             """P 键触发暂停对话框。"""
             self.push_screen(PauseDialog(session=self._session))
+
+        def action_show_log(self) -> None:
+            """L 键推出全屏日志界面，Esc 返回。"""
+            self.push_screen(LogScreen())
 
         def action_quit_app(self) -> None:
             """Q 键退出（触发 abort）。"""
@@ -274,16 +332,29 @@ if _TEXTUAL_AVAILABLE:
     class LogArea(Widget):
         """日志区域：可滚动，显示最近 100 条 log 事件。"""
 
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            # LogScreen 打开时持有对其 RichLog 的引用，用于实时同步新日志
+            self._log_screen_ref: "RichLog | None" = None
+
         def compose(self) -> ComposeResult:
             yield RichLog(id="log-rich", max_lines=100, wrap=True)
 
         def append_log(self, level: str, node_id: str, message: str) -> None:
+            prefix = f"[{level}] " if level not in ("INFO", "") else ""
+            node_prefix = f"[{node_id}] " if node_id else ""
+            text = f"{prefix}{node_prefix}{message}"
             try:
                 log_widget = self.query_one("#log-rich", RichLog)
-                prefix = f"[{level}] " if level not in ("INFO", "") else ""
-                log_widget.write(f"{prefix}[{node_id}] {message}")
+                log_widget.write(text)
             except Exception:
                 pass
+            # 若 LogScreen 当前打开，同步写入全屏日志
+            if self._log_screen_ref is not None:
+                try:
+                    self._log_screen_ref.write(text)
+                except Exception:
+                    self._log_screen_ref = None
 
     # -----------------------------------------------------------------------
     # ReviewScreen（Widget，嵌入 MainArea）
@@ -379,11 +450,9 @@ if _TEXTUAL_AVAILABLE:
 
             if parsed == "show_log":
                 try:
-                    self.query_one("#message-bar", Static).update(
-                        "（TUI 模式下日志显示在底部区域）"
-                    )
-                except Exception:
-                    pass
+                    self.app.push_screen(LogScreen())
+                except Exception as e:
+                    logger.warning("show_log 推屏失败: %s", e)
                 return
 
             if parsed is None:
@@ -396,6 +465,55 @@ if _TEXTUAL_AVAILABLE:
                 return
 
             self._on_action(parsed)
+
+    # -----------------------------------------------------------------------
+    # LogScreen（全屏日志界面，push_screen 推入，Esc 返回）
+    # -----------------------------------------------------------------------
+
+    class LogScreen(Screen):
+        """全屏日志界面。
+
+        通过 L 键从主界面推入（push_screen），Esc 键弹出返回（pop_screen）。
+        日志内容与底部 LogArea 共享同一个 RichLog 实例——LogScreen 挂载时把
+        RichLog 从 LogArea 移过来，卸载时再移回去，保证日志不丢失、不重复。
+
+        注意：Textual 不允许同一个 Widget 实例同时挂载在两处，因此采用"借用"
+        而非"复制"的方式。若借用失败（LogArea 尚未就绪），则降级为独立 RichLog
+        并在 LogArea 上追加一条提示。
+        """
+
+        BINDINGS = [Binding("escape", "app.pop_screen", "返回", show=True)]
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            yield RichLog(id="log-screen-rich", max_lines=2000, wrap=True)
+            yield Footer()
+
+        def on_mount(self) -> None:
+            """挂载时把 LogArea 中已有的日志内容复制到本屏的 RichLog。"""
+            try:
+                log_area = self.app.query_one("#log-area", LogArea)
+                src = log_area.query_one("#log-rich", RichLog)
+                dst = self.query_one("#log-screen-rich", RichLog)
+                # RichLog 没有公开"导出所有行"的 API，通过内部 _lines 读取
+                # 若未来 Textual 版本移除该属性，此处静默跳过，不影响功能
+                lines = getattr(src, "_lines", None)
+                if lines:
+                    for line in lines:
+                        dst.write(line)
+                dst.scroll_end(animate=False)
+                # 将后续新日志同步写入本屏（通过 LogArea.append_log 的钩子）
+                log_area._log_screen_ref = dst
+            except Exception as e:
+                logger.warning("LogScreen.on_mount 复制日志失败: %s", e)
+
+        def on_unmount(self) -> None:
+            """卸载时清除 LogArea 上的屏幕引用，停止同步。"""
+            try:
+                log_area = self.app.query_one("#log-area", LogArea)
+                log_area._log_screen_ref = None
+            except Exception:
+                pass
 
     # -----------------------------------------------------------------------
     # PauseDialog

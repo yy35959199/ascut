@@ -79,19 +79,26 @@ def _install_sinks(
     file_path: Path | None,
     verbose: bool,
     banner: str | None = None,
+    suppress_stderr: bool = False,
 ) -> None:
-    """安装 loguru：终端 INFO/DEBUG + 可选文件 DEBUG（enqueue）。"""
+    """安装 loguru：终端 INFO/DEBUG + 可选文件 DEBUG（enqueue）。
+
+    suppress_stderr=True 时跳过 stderr sink，仅写文件。
+    TUI 模式必须传 suppress_stderr=True：Textual 接管了终端 alternate screen
+    buffer，若 loguru 继续往 stderr 写则会直接覆盖 Textual 的渲染输出。
+    """
     global _active_file_path, _current_verbose
 
     loguru_logger.remove()
-    stderr_level = "DEBUG" if verbose else "INFO"
-    loguru_logger.add(
-        sys.stderr,
-        level=stderr_level,
-        format=_STDERR_FMT,
-        colorize=True,
-        enqueue=False,
-    )
+    if not suppress_stderr:
+        stderr_level = "DEBUG" if verbose else "INFO"
+        loguru_logger.add(
+            sys.stderr,
+            level=stderr_level,
+            format=_STDERR_FMT,
+            colorize=True,
+            enqueue=False,
+        )
     if file_path is not None:
         fp = Path(file_path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -129,6 +136,27 @@ def setup_logging(run: PipelineRun, *, verbose: bool = False) -> None:
         f"input={run.video_path} | log={run.log_path} ==="
     )
     _install_sinks(file_path=run.log_path, verbose=verbose, banner=banner)
+
+
+def setup_logging_tui(run: PipelineRun, *, verbose: bool = False) -> None:
+    """TUI 模式：仅写文件，不挂 stderr sink。
+
+    Textual 接管了终端 alternate screen buffer，任何往 stderr/stdout 的输出
+    都会覆盖 TUI 渲染。TUI 内的日志通过两条路径展示：
+      1. EventBus LogEvent → LogArea（pipeline 节点主动 emit 的日志）
+      2. loguru TUI sink → LogArea（由 PipelineApp.on_mount 注册，覆盖所有日志）
+    """
+    started = run.started_at.strftime("%Y-%m-%d %H:%M:%S")
+    banner = (
+        f"=== AutoSmartCut TUI 开始 | run_id={run.run_id} | started_at={started} | "
+        f"input={run.video_path} | log={run.log_path} ==="
+    )
+    _install_sinks(
+        file_path=run.log_path,
+        verbose=verbose,
+        banner=banner,
+        suppress_stderr=True,
+    )
 
 
 def setup_logging_for_manifest(manifest_path: Path, *, verbose: bool = False) -> None:

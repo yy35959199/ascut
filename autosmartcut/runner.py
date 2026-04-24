@@ -22,7 +22,7 @@ import warnings
 from pathlib import Path
 
 from autosmartcut.config import load_config
-from autosmartcut.log import setup_logging
+from autosmartcut.log import setup_logging, setup_logging_tui
 from autosmartcut.manifest_io import load_manifest, validate_manifest_for_stages
 from autosmartcut.manifest_stages import infer_l1_mode, resolve_stages, validate_cli_args
 from autosmartcut.pipeline_run import PipelineRun
@@ -205,7 +205,10 @@ def _run_pipeline(args: argparse.Namespace, *, use_tui: bool = False) -> int:
         print(f"错误: {e}", file=sys.stderr)
         return 1
 
-    setup_logging(run, verbose=args.verbose)
+    if use_tui:
+        setup_logging_tui(run, verbose=args.verbose)
+    else:
+        setup_logging(run, verbose=args.verbose)
 
     # 将 --stage 映射为 stage_filter
     stage_str = getattr(args, "stage", None)
