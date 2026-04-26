@@ -38,7 +38,7 @@ class L3PrecomputeNode:
         from autosmartcut.l3_precompute import build_sentence_tile_cache
 
         manifest = ctx.manifest
-        params = manifest.get("_params", {})
+        params = ctx.params
         manifest_path_str = params.get("manifest_path", "")
 
         if not manifest_path_str:
@@ -59,7 +59,9 @@ class L3PrecomputeNode:
                 error=ValueError("annotations 为空"),
             )
 
-        ctx.emit(ProgressEvent(node_id=self.id, message="VAD 静音检测与句边界吸附中..."))
+        ctx.emit(ProgressEvent(node_id=self.id, phase="precompute_start", payload={
+            "sentence_count": len(annotations),
+        }))
 
         try:
             sidecar_dir, snapped_annotations = await asyncio.to_thread(
@@ -78,8 +80,6 @@ class L3PrecomputeNode:
                 error=e,
             )
 
-        ctx.emit(ProgressEvent(node_id=self.id, message="预切分片完成，写入缓存索引..."))
-
         # 将 sidecar_dir 路径写入 manifest
         manifest["sentence_tile_cache"] = str(sidecar_dir)
 
@@ -91,10 +91,11 @@ class L3PrecomputeNode:
         except Exception:
             clip_count = 0
 
-        ctx.emit(ProgressEvent(
-            node_id=self.id,
-            message=f"L3 预计算完成：{clip_count} 个分片，缓存目录 {sidecar_dir.name}",
-        ))
+        ctx.emit(ProgressEvent(node_id=self.id, phase="precompute_done", payload={
+            "elapsed_sec": 0.0,
+            "clip_count": clip_count,
+            "sidecar_dir": str(sidecar_dir),
+        }))
 
         return StageResult(
             status=StageStatus.SUCCESS,

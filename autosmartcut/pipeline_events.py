@@ -24,15 +24,28 @@ class StageExitEvent:
     node_id: str = ""
     status: str = ""     # "success" / "failed" / "needs_input" / "reflow"
     summary: str = ""
+    """人类可读摘要，保留用于 CLI 向后兼容。"""
+    output: "object | None" = None
+    """结构化摘要（StageOutput 子类），由 PipelineSession 调用 node.summarize() 填充。
+    消费层可据此渲染节点完成后的详细信息，无需解析 summary 字符串。"""
+    elapsed_sec: float = 0.0
+    """节点从开始到完成的挂钟时间（秒），由 PipelineSession 填充。"""
     timestamp: datetime = field(default_factory=datetime.now)
 
 
 @dataclass
 class ProgressEvent:
-    """节点执行过程中的进度更新事件。"""
+    """节点执行过程中的进度更新事件。
+
+    逻辑层只发结构化数据，不做任何格式化。
+    消费层（CLI/TUI/WebUI）各自根据 node_id + phase + payload 决定如何呈现。
+    """
     type: Literal["progress"] = "progress"
     node_id: str = ""
-    message: str = ""
+    phase: str = ""
+    """节点内部阶段标识，如 "transcode_start"、"asr_chunk_done" 等。"""
+    payload: dict = field(default_factory=dict)
+    """结构化数据，键集合由各节点的 phase/payload 契约定义。"""
     timestamp: datetime = field(default_factory=datetime.now)
 
 

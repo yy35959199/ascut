@@ -28,12 +28,15 @@ class CLIAdapter:
                 print(f"[{event.timestamp.strftime('%H:%M:%S')}] → 开始: {event.node_id}")
             case "stage_exit":
                 status_icon = "✓" if event.status == "success" else "✗"
+                elapsed = f" ({event.elapsed_sec:.1f}s)" if event.elapsed_sec else ""
                 print(
                     f"[{event.timestamp.strftime('%H:%M:%S')}] "
-                    f"{status_icon} 完成: {event.node_id} — {event.summary}"
+                    f"{status_icon} 完成: {event.node_id}{elapsed} — {event.summary}"
                 )
             case "progress":
-                print(f"  {event.message}")
+                text = self._format_progress(event)
+                if text:
+                    print(text)
             case "log":
                 if event.level in ("WARNING", "ERROR"):
                     print(f"  [{event.level}] {event.message}", file=sys.stderr)
@@ -49,6 +52,11 @@ class CLIAdapter:
                 print(f"  [暂停] 已完成节点: {', '.join(event.completed_nodes)}")
             case "pipeline_complete":
                 print(f"\n=== 完成 → {event.output} ===")
+
+    def _format_progress(self, event: "PipelineEvent") -> str:
+        """将结构化 ProgressEvent 格式化为人类可读文本。"""
+        from autosmartcut.tui_adapter import _format_progress as _fmt
+        return _fmt(event.node_id, event.phase, event.payload)
 
     def start_sync(self) -> None:
         """同步启动流水线。内部调用 session.start_sync()。"""

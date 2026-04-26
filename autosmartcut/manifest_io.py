@@ -72,6 +72,8 @@ def save_manifest(path: Path, data: dict[str, Any], *, atomic: bool = True) -> N
 
 def strip_volatile_fields(data: dict[str, Any]) -> dict[str, Any]:
     """移除不应落盘的运行时字段（就地修改并返回 data）。"""
+    # L1A 分块信息：仅用于 L1B 强制对齐，不需要永久保存
+    data.pop("l1a_chunks", None)
     cur = data.get("current")
     if isinstance(cur, dict):
         cur.pop("tokens", None)

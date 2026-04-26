@@ -58,6 +58,7 @@ class L2dNode:
 
         while True:
             # 发布 NeedInputEvent，通知消费层渲染审阅界面
+            ctx.emit(ProgressEvent(node_id=self.id, phase="waiting_input", payload={}))
             ctx.emit(NeedInputEvent(
                 node_id=self.id,
                 display=core_result.display_data,
@@ -76,7 +77,11 @@ class L2dNode:
                 # 继续等待下一个操作
                 ctx.emit(ProgressEvent(
                     node_id=self.id,
-                    message=core_result.message or "操作已处理，等待下一步...",
+                    phase="action_processed",
+                    payload={
+                        "action_type": type(action).__name__,
+                        "result_message": core_result.message or "",
+                    },
                 ))
                 continue
 

@@ -334,10 +334,11 @@ class TestEventBus:
         session.subscribe(received.append)
 
         from autosmartcut.pipeline_events import ProgressEvent
-        evt = ProgressEvent(node_id="test", message="hello")
+        evt = ProgressEvent(node_id="test", phase="test_phase", payload={"msg": "hello"})
         session._emit(evt)
         assert len(received) == 1
-        assert received[0].message == "hello"
+        assert received[0].phase == "test_phase"
+        assert received[0].payload == {"msg": "hello"}
 
     def test_handler_exception_does_not_crash(self, tmp_path: Path) -> None:
         session = _make_session(tmp_path)
@@ -348,7 +349,7 @@ class TestEventBus:
         session.subscribe(bad_handler)
         from autosmartcut.pipeline_events import ProgressEvent
         # 不应抛异常
-        session._emit(ProgressEvent(node_id="x", message="y"))
+        session._emit(ProgressEvent(node_id="x", phase="test", payload={}))
 
 
 # ---------------------------------------------------------------------------

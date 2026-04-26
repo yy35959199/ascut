@@ -59,7 +59,7 @@ class L2aNode:
                     for i, ann in enumerate(annotations_l1a)
                 ]
 
-        ctx.emit(ProgressEvent(node_id=self.id, message="R1 粗理解与误识候选构建中..."))
+        ctx.emit(ProgressEvent(node_id=self.id, phase="r1_start", payload={}))
 
         try:
             # run_2a_comprehension 直接修改 manifest_dict 并返回
@@ -75,7 +75,7 @@ class L2aNode:
                 error=e,
             )
 
-        ctx.emit(ProgressEvent(node_id=self.id, message="R2 精化主旨与分块完成..."))
+        ctx.emit(ProgressEvent(node_id=self.id, phase="r2_start", payload={}))
 
         comprehension = manifest.get("comprehension", {})
         purpose = comprehension.get("purpose", "")
@@ -87,10 +87,12 @@ class L2aNode:
             if i < len(tokens) and tokens[i].get("text", "") != clean.get("cleaned_content", "")
         )
 
-        ctx.emit(ProgressEvent(
-            node_id=self.id,
-            message=f"L2A 完成：{block_count} 块，{correction_count} 处纠错",
-        ))
+        ctx.emit(ProgressEvent(node_id=self.id, phase="r2_done", payload={
+            "elapsed_sec": 0.0,
+            "purpose": purpose[:80],
+            "block_count": block_count,
+            "correction_count": correction_count,
+        }))
 
         return StageResult(
             status=StageStatus.SUCCESS,

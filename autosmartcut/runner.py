@@ -4,9 +4,13 @@
 
     ascut run [--stage SPEC] [--input|--manifest ...]
     ascut tui [--stage SPEC] [--input|--manifest ...]
+    ascut resume <path> [--goal ...] [--stage ...] [--tui] [-y]
 
 ``--stage``：``1`` | ``2`` | ``3`` | ``12`` | ``23`` | ``123`` | ``1a`` | ``1b`` | ``1a2`` | ``1b2`` | ``1a23`` | ``1b23``；省略且未指定 ``--from-stage`` 时等价全流程 ``123``。
 ``--from-stage`` 已弃用，映射为等价 ``--stage``（见 doc/AutoSmartCut-MVP-Mini.md）。
+
+``ascut resume``：读取已有 timeline_manifest.json（或其父文件夹），自动推断进度，
+展示各层完成状态，并建议下一步 ``--stage``，确认后续跑。
 
 单一持久化文件：``timeline_manifest.json``（见 ``autosmartcut.manifest_io``）。
 """
@@ -115,6 +119,59 @@ def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
     p.set_defaults(layer1_json=None, layer2_json=None, layer3_json=None)
 
 
+def _add_resume_args(p: argparse.ArgumentParser) -> None:
+    """向 resume 子命令解析器添加参数。"""
+    p.add_argument(
+        "path",
+        type=Path,
+        help="timeline_manifest.json 或其父文件夹",
+    )
+    p.add_argument(
+        "--goal",
+        type=str,
+        default=None,
+        help="覆盖或补充清单中的剪辑意图（续跑 L2 时若清单无 goal 则必填）",
+    )
+    p.add_argument(
+        "--stage",
+        type=str,
+        default=None,
+        metavar="SPEC",
+        help="覆盖自动推断的 stage（1|2|3|12|23|123|1a|1b|...）",
+    )
+    p.add_argument(
+        "--tui",
+        action="store_true",
+        help="使用 TUI 模式执行",
+    )
+    p.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="跳过确认直接执行",
+    )
+    p.add_argument("--config", type=Path, default=None, help="config.toml")
+    p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="产物目录（默认与清单同目录）",
+    )
+    p.add_argument(
+        "--output-name",
+        type=str,
+        default=None,
+        help="输出视频文件名（basename）",
+    )
+    p.add_argument("--pre-pad", type=float, default=0.15)
+    p.add_argument("--post-pad", type=float, default=0.25)
+    p.add_argument(
+        "--no-vad-snap",
+        action="store_true",
+        help="关闭 L3 VAD 切点吸附",
+    )
+    p.add_argument("--verbose", action="store_true", help="DEBUG 日志")
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="ascut",
@@ -128,7 +185,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     pt = sub.add_parser("tui", help="TUI 模式（Textual 交互界面）")
     _add_pipeline_args(pt)
 
+    ps = sub.add_parser(
+        "resume",
+        help="从已有清单识别进度并选择继续执行",
+    )
+    _add_resume_args(ps)
+
     args = parser.parse_args(argv)
+
+    # resume 子命令不走 resolve_stages / validate_cli_args
+    if args.command == "resume":
+        return args
 
     with warnings.catch_warnings():
         warnings.simplefilter("always", DeprecationWarning)
@@ -250,6 +317,122 @@ def _run_pipeline(args: argparse.Namespace, *, use_tui: bool = False) -> int:
     return 0
 
 
+def _print_progress_report(report: "ProgressReport") -> None:
+    """CLI 文本格式打印进度报告。"""
+    print(f"清单: {report.manifest_path}")
+    print(f"  run_id : {report.run_id}")
+    print(f"  目标   : {report.goal or '(未设置)'}")
+    print(f"  视频   : {report.source_video}")
+    if report.duration:
+        m, s = divmod(int(report.duration), 60)
+        print(f"  时长   : {m}分{s}秒")
+    print()
+    print("进度状态:")
+    for n in report.nodes:
+        icon = "✓" if n.completed else "✗"
+        at = f"  {n.completed_at[:19]}" if n.completed_at else ""
+        print(f"  {icon} {n.display_name:<20}{at}  {n.summary}")
+    if report.warnings:
+        print()
+        for w in report.warnings:
+            print(f"  ⚠ {w}")
+    if report.suggested_stage:
+        print(f"\n建议继续: --stage {report.suggested_stage}")
+
+
+def _run_resume(args: argparse.Namespace) -> int:
+    """resume 子命令主逻辑：推断进度 → 展示 → 确认 → 续跑。"""
+    from autosmartcut.manifest_progress import (
+        ProgressReport,
+        infer_progress,
+        resolve_manifest_path,
+    )
+
+    # 1. 解析路径
+    try:
+        mp = resolve_manifest_path(args.path)
+    except FileNotFoundError as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 1
+
+    # 2. 加载清单 + 推断进度
+    try:
+        data = load_manifest(mp)
+    except Exception as e:
+        print(f"错误: 无法读取清单: {e}", file=sys.stderr)
+        return 1
+
+    report: ProgressReport = infer_progress(data, mp)
+
+    # 3. 打印进度摘要
+    _print_progress_report(report)
+
+    # 4. 全部完成
+    if report.all_completed:
+        print("\n所有阶段已完成，无需续跑。")
+        print(f"如需重跑 L3: ascut run --manifest \"{mp}\" --stage 3")
+        return 0
+
+    # 5. 空骨架（无 annotations）
+    if report.suggested_stage is None:
+        print("\n清单为空骨架，请使用 ascut run --input <视频> 从头开始。")
+        return 1
+
+    # 6. 确定 stage（用户覆盖 > 自动推断）
+    stage = args.stage or report.suggested_stage
+
+    # 7. goal 检查
+    goal = args.goal or report.goal
+    if report.goal_needed and not goal:
+        print(
+            "\n续跑 L2 需要 --goal 参数，请提供剪辑意图。",
+            file=sys.stderr,
+        )
+        print(f"示例: ascut resume \"{args.path}\" --goal \"保留核心内容\"")
+        return 1
+
+    # 8. 确认
+    cmd_preview = f"ascut run --manifest \"{mp}\" --stage {stage}"
+    if goal:
+        cmd_preview += f' --goal "{goal}"'
+    if args.tui:
+        cmd_preview = cmd_preview.replace("ascut run", "ascut tui", 1)
+
+    if not args.yes:
+        print(f"\n将执行: {cmd_preview}")
+        try:
+            answer = input("继续？[Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n已取消。")
+            return 0
+        if answer and answer != "y":
+            print("已取消。")
+            return 0
+
+    # 9. 构造等价 run/tui 参数并递归调用 main()
+    run_argv: list[str] = ["tui" if args.tui else "run"]
+    run_argv += ["--manifest", str(mp)]
+    run_argv += ["--stage", stage]
+    if goal:
+        run_argv += ["--goal", goal]
+    if args.output_dir:
+        run_argv += ["--output-dir", str(args.output_dir)]
+    if args.output_name:
+        run_argv += ["--output-name", args.output_name]
+    if args.config:
+        run_argv += ["--config", str(args.config)]
+    if getattr(args, "no_vad_snap", False):
+        run_argv += ["--no-vad-snap"]
+    if args.verbose:
+        run_argv += ["--verbose"]
+
+    try:
+        main(run_argv)
+    except SystemExit as e:
+        return int(e.code) if e.code is not None else 0
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     if args.command == "run":
@@ -257,6 +440,9 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(code)
     if args.command == "tui":
         code = _run_pipeline(args, use_tui=True)
+        raise SystemExit(code)
+    if args.command == "resume":
+        code = _run_resume(args)
         raise SystemExit(code)
     raise SystemExit(2)
 

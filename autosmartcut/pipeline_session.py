@@ -312,7 +312,12 @@ class PipelineSession:
     # -----------------------------------------------------------------------
 
     async def start_async(self) -> None:
-        """异步启动流水线。构建 DAG，应用 stage_filter，进入调度循环。"""
+        """异步启动流水线。构建 DAG，应用 stage_filter，进入流式调度循环。
+
+        流式调度模式：节点完成即触发重新调度，不等待同批次其他节点。
+        使用 asyncio.wait(FIRST_COMPLETED) 替代 gather，任意节点完成就重新扫描
+        schedulable 节点并立刻启动，彻底消除"慢节点阻塞快节点下游"的问题。
+        """
         self._build_dag()
         manifest = load_manifest(self._manifest_path)
         self._current_manifest = manifest  # 供 abort() 使用
@@ -322,22 +327,22 @@ class PipelineSession:
 
         start_time = datetime.now()
 
+        # running: task → node_id，追踪所有正在运行的节点任务
+        running: dict[asyncio.Task, str] = {}
+        # launched: 已启动的 node_id 集合，防止同一节点被重复启动
+        launched: set[str] = set()
+
         while not self._abort_flag:
-            snapshot = self._build_snapshot(manifest)
-
-            if not snapshot.schedulable_nodes and self._all_done():
-                output = str(manifest.get("output_video", self._manifest_path))
-                elapsed = (datetime.now() - start_time).total_seconds()
-                self._emit(PipelineCompleteEvent(output=output, elapsed_seconds=elapsed))
-                break
-
-            if self._pause_flag:
+            # ── 暂停检查 ────────────────────────────────────────────────────
+            if self._pause_flag and not running:
                 self._emit(PausedEvent(
                     completed_nodes=self._completed_node_ids(),
                     checkpoint_path=str(self._manifest_path),
                 ))
                 break
 
+            # ── 扫描可调度节点，启动新任务 ──────────────────────────────────
+            snapshot = self._build_snapshot(manifest)
             action = await self._scheduler.next_action(snapshot)
 
             if action.action_type == SchedulerActionType.COMPLETE:
@@ -348,26 +353,49 @@ class PipelineSession:
 
             if action.action_type == SchedulerActionType.PAUSE:
                 self._pause_flag = True
-                continue
+                # 不立即 break，等 running 任务完成后再发 PausedEvent
 
-            if action.action_type == SchedulerActionType.RUN_BATCH:
-                if not action.node_ids:
-                    # 空批次：等待中，避免忙等
-                    await asyncio.sleep(0.05)
-                    continue
-                results = await self._run_batch(action.node_ids, manifest, action.params)
-                for node_id, result in results.items():
-                    await self._handle_result(node_id, result, manifest)
-                    if self._abort_flag:
-                        break
+            # 启动所有新的可调度节点（跳过已启动的）
+            for node_id in (action.node_ids or []):
+                if node_id not in launched:
+                    launched.add(node_id)
+                    task = asyncio.create_task(
+                        self._run_node(node_id, manifest, action.params)
+                    )
+                    running[task] = node_id
 
-            elif action.action_type == SchedulerActionType.RUN_NODE:
-                if not action.node_ids:
-                    await asyncio.sleep(0.05)
-                    continue
-                node_id = action.node_ids[0]
-                result = await self._run_node(node_id, manifest, action.params)
+            # ── 等待任意一个节点完成 ─────────────────────────────────────────
+            if not running:
+                if self._all_done():
+                    output = str(manifest.get("output_video", self._manifest_path))
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    self._emit(PipelineCompleteEvent(output=output, elapsed_seconds=elapsed))
+                break
+
+            done_tasks, _ = await asyncio.wait(
+                running.keys(), return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # ── 处理完成的节点 ───────────────────────────────────────────────
+            for task in done_tasks:
+                node_id = running.pop(task)
+                try:
+                    result = task.result()
+                except Exception as e:
+                    from autosmartcut.pipeline_models import StageResult, StageStatus
+                    result = StageResult(
+                        status=StageStatus.FAILED,
+                        summary=str(e),
+                        error=e,
+                    )
                 await self._handle_result(node_id, result, manifest)
+                if self._abort_flag:
+                    # 取消所有仍在运行的任务
+                    for t in running:
+                        t.cancel()
+                    break
+
+            # 回到循环顶部，重新扫描 schedulable 节点
 
     def start_sync(self) -> None:
         """同步启动流水线（供 CLIAdapter 使用）。内部调用 asyncio.run()。"""
@@ -379,7 +407,7 @@ class PipelineSession:
         manifest: dict,
         params: dict,
     ) -> StageResult:
-        """执行单个节点。"""
+        """执行单个节点。params 通过 StageContext.params 传入，不写入 manifest。"""
         # l2d_human 节点走交互路径
         if node_id == "l2d_human":
             return await self._handle_interactive(node_id, manifest, params)
@@ -387,22 +415,22 @@ class PipelineSession:
         node = self._nodes[node_id]
         self._node_states[node_id].status = "running"
 
+        # 将 manifest_path 注入 params（节点需要知道输出目录）
+        injected_params = dict(params) if params else {}
+        injected_params["manifest_path"] = str(self._manifest_path)
+
         ctx = StageContext(
             manifest=manifest,
             config=self._config,
             emit=self._emit,
+            params=injected_params,
             pending_action=None,
             stage_filter=self._stage_filter,
         )
-        # 将 params 注入 ctx（通过 manifest 传递或直接附加到 ctx）
-        # params 由 Scheduler 传入，节点通过 ctx 读取
-        # 为了让节点能读取 params，我们将其存入 manifest 的临时键
-        # 同时注入 manifest_path，供节点构造 PipelineRun
-        injected_params = dict(params) if params else {}
-        injected_params["manifest_path"] = str(self._manifest_path)
-        manifest["_params"] = injected_params
 
+        import time as _time
         self._emit(StageEnterEvent(node_id=node_id))
+        _t_start = _time.monotonic()
         try:
             result = await node.run(ctx)
         except Exception as e:
@@ -412,56 +440,25 @@ class PipelineSession:
                 summary=str(e),
                 error=e,
             )
-        finally:
-            manifest.pop("_params", None)
+
+        _elapsed = _time.monotonic() - _t_start
+
+        # 尝试获取结构化摘要（summarize 失败时静默降级，不中止流水线）
+        _output = None
+        if result.status == StageStatus.SUCCESS:
+            try:
+                _output = node.summarize(manifest)
+            except Exception as _e:
+                logger.warning("节点 %s summarize() 失败，output 置 None: %s", node_id, _e)
 
         self._emit(StageExitEvent(
             node_id=node_id,
             status=result.status.value,
             summary=result.summary,
+            output=_output,
+            elapsed_sec=_elapsed,
         ))
         return result
-
-    async def _run_batch(
-        self,
-        node_ids: list[str],
-        manifest: dict,
-        params: dict,
-    ) -> dict[str, StageResult]:
-        """并行执行一批节点（asyncio.gather）。
-
-        若某节点失败则取消其他任务。
-        """
-        tasks: dict[str, asyncio.Task] = {
-            node_id: asyncio.create_task(self._run_node(node_id, manifest, params))
-            for node_id in node_ids
-        }
-        try:
-            results_list = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        except Exception:
-            for t in tasks.values():
-                t.cancel()
-            raise
-
-        results: dict[str, StageResult] = {}
-        for node_id, result in zip(tasks.keys(), results_list):
-            if isinstance(result, BaseException):
-                results[node_id] = StageResult(
-                    status=StageStatus.FAILED,
-                    summary=str(result),
-                    error=result if isinstance(result, Exception) else None,
-                )
-            else:
-                results[node_id] = result
-
-        # 若有失败，取消其他仍在运行的任务
-        has_failure = any(r.status == StageStatus.FAILED for r in results.values())
-        if has_failure:
-            for t in tasks.values():
-                if not t.done():
-                    t.cancel()
-
-        return results
 
     def _build_snapshot(self, manifest: dict) -> PipelineSnapshot:
         """构建 PipelineSnapshot。
@@ -594,23 +591,25 @@ class PipelineSession:
     ) -> StageResult:
         """处理 NEEDS_INPUT 节点的交互循环。
 
-        构造 StageContext（注入 pending_action 队列），调用节点 run()。
+        构造 StageContext（注入 pending_action 队列和 params），调用节点 run()。
         节点内部通过 await ctx.pending_action.get() 等待用户操作。
         """
         injected_params = dict(params) if params else {}
         injected_params["manifest_path"] = str(self._manifest_path)
-        manifest["_params"] = injected_params
 
         ctx = StageContext(
             manifest=manifest,
             config=self._config,
             emit=self._emit,
+            params=injected_params,
             pending_action=self._action_queue,
             stage_filter=self._stage_filter,
         )
+        import time as _time
         self._node_states[node_id].status = "running"
         self._emit(StageEnterEvent(node_id=node_id))
         node = self._nodes[node_id]
+        _t_start = _time.monotonic()
         try:
             result = await node.run(ctx)
         except Exception as e:
@@ -620,13 +619,21 @@ class PipelineSession:
                 summary=str(e),
                 error=e,
             )
-        finally:
-            manifest.pop("_params", None)
+
+        _elapsed = _time.monotonic() - _t_start
+        _output = None
+        if result.status == StageStatus.SUCCESS:
+            try:
+                _output = node.summarize(manifest)
+            except Exception as _e:
+                logger.warning("交互节点 %s summarize() 失败，output 置 None: %s", node_id, _e)
 
         self._emit(StageExitEvent(
             node_id=node_id,
             status=result.status.value,
             summary=result.summary,
+            output=_output,
+            elapsed_sec=_elapsed,
         ))
         return result
 

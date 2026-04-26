@@ -208,3 +208,120 @@ def silence_intervals_for_video(
 			clipped.append({"start": s, "end": e})
 
 	return speech_segments_to_silence_intervals(clipped, timeline_end)
+
+
+# ---------------------------------------------------------------------------
+# plan_chunks — VAD 静音边界切块规划（纯函数，无 GPU 依赖）
+# ---------------------------------------------------------------------------
+
+def plan_chunks(
+	speech_segments: list[dict[str, float]],
+	total_duration: float,
+	*,
+	first_chunk_min_sec: float = 3.0,
+	first_chunk_max_sec: float = 15.0,
+	normal_chunk_target_sec: float = 30.0,
+	silence_snap_radius_sec: float = 5.0,
+	silence_min_duration_sec: float = 0.2,
+) -> list[dict]:
+	"""将音频按 VAD 静音边界规划为渐进式 ASR 切块。
+
+	Args:
+		speech_segments: Silero VAD 返回的语音段列表，每条 {"start": float, "end": float}（秒）
+		total_duration: 音频总时长（秒）
+		first_chunk_min_sec: 第一块最短时长（秒）
+		first_chunk_max_sec: 第一块最长时长（秒）
+		normal_chunk_target_sec: 后续块目标时长（秒）
+		silence_snap_radius_sec: 静音吸附搜索半径（秒）
+		silence_min_duration_sec: 有效静音间隔最小时长（秒）
+
+	Returns:
+		切块列表，每条 {"start_sec": float, "end_sec": float, "chunk_id": int}
+
+	Postconditions:
+		- 切块连续：chunks[i].end_sec == chunks[i+1].start_sec
+		- 覆盖全程：chunks[0].start_sec == 0.0，chunks[-1].end_sec == total_duration
+		- 无空块：每块 end_sec > start_sec
+		- chunk_id 从 0 开始连续递增
+	"""
+	if total_duration <= 0:
+		return []
+
+	# 从语音段派生静音间隔
+	silence_gaps: list[tuple[float, float]] = []
+	if speech_segments:
+		ordered = sorted(speech_segments, key=lambda s: float(s["start"]))
+		prev = 0.0
+		for seg in ordered:
+			s = float(seg["start"])
+			e = float(seg["end"])
+			if s > prev:
+				silence_gaps.append((prev, s))
+			prev = max(prev, e)
+		if prev < total_duration:
+			silence_gaps.append((prev, total_duration))
+	else:
+		silence_gaps = [(0.0, total_duration)]
+
+	# 过滤满足最小时长的静音间隔
+	qualifying = [(s, e) for s, e in silence_gaps if (e - s) >= silence_min_duration_sec]
+
+	chunks: list[dict] = []
+	cursor = 0.0
+	chunk_id = 0
+
+	# ── 块 0：第一句启发式 ──────────────────────────────────────────────────
+	found_boundary: float | None = None
+	for gap_s, gap_e in qualifying:
+		# 找到 end 落在 [first_chunk_min_sec, first_chunk_max_sec] 内的第一个静音间隔
+		if gap_e >= first_chunk_min_sec and gap_e <= first_chunk_max_sec:
+			found_boundary = gap_e
+			break
+
+	if found_boundary is None:
+		found_boundary = min(first_chunk_max_sec, total_duration)
+
+	chunks.append({"start_sec": 0.0, "end_sec": found_boundary, "chunk_id": 0})
+	cursor = found_boundary
+	chunk_id = 1
+
+	# ── 块 1+：目标时长 + 静音吸附 ──────────────────────────────────────────
+	while cursor < total_duration:
+		remaining = total_duration - cursor
+
+		# 尾部合并：剩余音频 < 目标时长的 50%，合入上一块
+		if remaining < normal_chunk_target_sec * 0.5:
+			if chunks:
+				chunks[-1]["end_sec"] = total_duration
+			else:
+				chunks.append({"start_sec": 0.0, "end_sec": total_duration, "chunk_id": 0})
+			break
+
+		target = min(cursor + normal_chunk_target_sec, total_duration)
+
+		# 在 ±silence_snap_radius_sec 内搜索最近的静音间隔起点
+		snap_lo = target - silence_snap_radius_sec
+		snap_hi = target + silence_snap_radius_sec
+		best_snap: float | None = None
+		best_dist = float("inf")
+
+		for gap_s, gap_e in qualifying:
+			cand = gap_s
+			if cand >= snap_lo and cand <= snap_hi and cand > cursor:
+				dist = abs(cand - target)
+				if dist < best_dist:
+					best_dist = dist
+					best_snap = cand
+
+		end_sec = best_snap if best_snap is not None else target
+
+		# 确保不超过总时长且不产生空块
+		end_sec = min(end_sec, total_duration)
+		if end_sec <= cursor:
+			end_sec = min(cursor + normal_chunk_target_sec, total_duration)
+
+		chunks.append({"start_sec": cursor, "end_sec": end_sec, "chunk_id": chunk_id})
+		cursor = end_sec
+		chunk_id += 1
+
+	return chunks

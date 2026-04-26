@@ -83,6 +83,10 @@ class StageContext:
     """事件发布回调。节点调用此方法向 EventBus 发布 progress/log 事件。
     示例：ctx.emit(ProgressEvent(node_id=self.id, message="ASR 转录中..."))"""
 
+    params: dict = field(default_factory=dict)
+    """调度器注入的运行时参数（如 review_round、two_b_mode、manifest_path 等）。
+    每个节点拿到独立副本，不再通过 manifest["_params"] 共享传递，避免并发写入竞争。"""
+
     pending_action: "asyncio.Queue | None" = None
     """仅 l2d_human 节点使用。PipelineSession 在调度 l2d_human 时注入此队列，
     节点通过 await pending_action.get() 等待用户操作。"""

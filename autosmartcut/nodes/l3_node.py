@@ -40,7 +40,7 @@ class L3Node:
         from autosmartcut.execution import run_execution_layer
 
         manifest = ctx.manifest
-        params = manifest.get("_params", {})
+        params = ctx.params
         manifest_path_str = params.get("manifest_path", "")
 
         if not manifest_path_str:
@@ -81,7 +81,9 @@ class L3Node:
             video_path=video_path,
         )
 
-        ctx.emit(ProgressEvent(node_id=self.id, message="L3 编排中（计算保留片段）..."))
+        ctx.emit(ProgressEvent(node_id=self.id, phase="resolve_start", payload={
+            "segment_count": len(manifest.get("keep_mask", [])),
+        }))
 
         # 同步 keep_mask 到 manifest["current"]["keep_mask"]（execution.py 从此处读取）
         if "keep_mask" in manifest:
@@ -101,7 +103,12 @@ class L3Node:
                 error=e,
             )
 
-        ctx.emit(ProgressEvent(node_id=self.id, message=f"视频合成完成 → {out_path}"))
+        ctx.emit(ProgressEvent(node_id=self.id, phase="execute_done", payload={
+            "elapsed_sec": 0.0,
+            "output_path": str(out_path),
+            "output_duration_sec": 0.0,
+            "compression_ratio": 0.0,
+        }))
 
         # 将输出视频路径写入 manifest
         manifest["output_video"] = str(out_path)

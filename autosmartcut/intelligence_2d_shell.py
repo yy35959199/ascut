@@ -159,84 +159,6 @@ except ImportError:
     _TEXTUAL_AVAILABLE = False
 
 
-def _format_review_summary(review_report: dict) -> str:
-    """格式化 2c 审核报告为文本。"""
-    if not review_report:
-        return "（无审核报告）"
-
-    lines: list[str] = []
-    verdict = review_report.get("verdict", "unknown")
-    lines.append(f"审核结论: {verdict}")
-
-    checklist = review_report.get("checklist", [])
-    judgments = review_report.get("judgments", [])
-
-    # 将 judgments 按 checklist item 索引映射
-    judgment_map: dict[int, dict] = {}
-    for j in judgments:
-        idx = j.get("checklist_index", j.get("index", -1))
-        judgment_map[idx] = j
-
-    for i, item in enumerate(checklist):
-        label = item.get("label", item.get("text", f"项目 {i}"))
-        priority = item.get("priority", "")
-        j = judgment_map.get(i, {})
-        covered = j.get("covered", j.get("pass", False))
-        mark = "✓" if covered else "✗"
-        priority_tag = f"[{priority}]" if priority else ""
-        lines.append(f"  {mark} {priority_tag} {label}")
-
-    return "\n".join(lines)
-
-
-def _format_decision_list(display_data: DisplayData) -> str:
-    """格式化决策列表为文本，按 outline_blocks 分组。"""
-    tokens = display_data.tokens
-    mask = display_data.effective_mask
-    comp = display_data.comprehension
-    outline_blocks = comp.get("outline_blocks", [])
-
-    lines: list[str] = []
-
-    if outline_blocks:
-        # 按 outline_block 分组
-        for block in outline_blocks:
-            block_label = block.get("label", block.get("title", ""))
-            start = block.get("start", 0)
-            end = block.get("end", len(tokens))
-            lines.append(f"\n── {block_label} [{start}-{end}] ──")
-            for i in range(start, min(end + 1, len(tokens))):
-                keep = mask[i]["keep"] if i < len(mask) else True
-                status = "[保留]" if keep else "[删除]"
-                text = tokens[i].get("text", "")
-                preview = (text[:60] + "…") if len(text) > 63 else text
-                if not preview:
-                    preview = "(空)"
-                lines.append(f"  {status}[{i}] {preview}")
-    else:
-        # 无分组，直接列出
-        for i, tok in enumerate(tokens):
-            keep = mask[i]["keep"] if i < len(mask) else True
-            status = "[保留]" if keep else "[删除]"
-            text = tok.get("text", "")
-            preview = (text[:60] + "…") if len(text) > 63 else text
-            if not preview:
-                preview = "(空)"
-            lines.append(f"  {status}[{i}] {preview}")
-
-    return "\n".join(lines)
-
-
-def _format_stats(stats: dict) -> str:
-    """格式化统计栏。"""
-    return (
-        f"保留: {stats.get('keep_count', 0)} | "
-        f"删除: {stats.get('cut_count', 0)} | "
-        f"总数: {stats.get('total', 0)} | "
-        f"人工修改: {stats.get('override_count', 0)}"
-    )
-
-
 HELP_TEXT = """\
 可用命令:
   t <index>            切换指定句子的保留/删除状态
@@ -294,6 +216,12 @@ if _TEXTUAL_AVAILABLE:
             dd = self.display_data
             if dd is None:
                 return
+
+            from autosmartcut.tui_adapter import (
+                _format_decision_list,
+                _format_review_summary,
+                _format_stats,
+            )
 
             goal = dd.goal or ""
             purpose = dd.comprehension.get("purpose", "")
@@ -517,6 +445,11 @@ def _run_2d_fallback(manifest_dict: dict[str, Any]) -> tuple[dict, Signal]:
 
 def _print_display(dd: DisplayData) -> None:
     """简单模式下打印 DisplayData。"""
+    from autosmartcut.tui_adapter import (
+        _format_decision_list,
+        _format_review_summary,
+        _format_stats,
+    )
     print("\n" + "=" * 80)
     print(f"目标: {dd.goal}")
     print(f"主旨: {dd.comprehension.get('purpose', '')}")

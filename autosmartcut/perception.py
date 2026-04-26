@@ -530,7 +530,9 @@ def assign_times_to_spans(
 		timings.append(SentenceTiming(sp.index, ts, te))
 
 	# 修正零时长句子：ForcedAligner 量化步长为 80ms，极短发音可能导致 t_start == t_end。
-	# 策略：向后借 0.01s（不超过后一句的 t_start）；末句向前借（不超过前一句的 t_end）。
+	# 两遍扫描，职责正交：
+	#   第一遍：每句独立决策，零时长一律向后扩 _MIN_DUR（不看邻居，可能产生新重叠）
+	#   第二遍：消除相邻重叠，把后句 t_start 推到前句 t_end（级联处理连续重叠）
 	# 这是 ascut 侧的防御性后处理，不修改 upstream 对齐器行为。
 	_MIN_DUR = 0.01
 	for i, t in enumerate(timings):
@@ -538,24 +540,28 @@ def assign_times_to_spans(
 			continue
 		if t.t_end > t.t_start:
 			continue
-		# t_start == t_end（或逆序，但逆序已在上面 raise 过，此处只剩相等情况）
-		if i + 1 < len(timings) and timings[i + 1].t_start is not None:
-			new_te = min(t.t_start + _MIN_DUR, timings[i + 1].t_start)
-		elif i > 0 and timings[i - 1].t_end is not None:
-			new_ts = max(t.t_end - _MIN_DUR, timings[i - 1].t_end)
-			timings[i] = SentenceTiming(t.index, new_ts, t.t_end)
-			logging.getLogger(__name__).warning(
-				"[L1B] 句 index=%d 零时长，向前借 %.3fs: t_start %.5f→%.5f",
-				t.index, _MIN_DUR, t.t_start, new_ts,
-			)
-			continue
-		else:
-			new_te = t.t_start + _MIN_DUR
+		# t_start == t_end（逆序已在上面 raise 过，此处只剩相等情况）
+		new_te = t.t_start + _MIN_DUR
 		timings[i] = SentenceTiming(t.index, t.t_start, new_te)
 		logging.getLogger(__name__).warning(
-			"[L1B] 句 index=%d 零时长，向后借 %.3fs: t_end %.5f→%.5f",
+			"[L1B] 句 index=%d 零时长，向后扩 %.3fs: t_end %.5f→%.5f",
 			t.index, _MIN_DUR, t.t_end, new_te,
 		)
+
+	# 第二遍：消除因扩展产生的相邻重叠（级联推后）
+	for i in range(len(timings) - 1):
+		a = timings[i]
+		b = timings[i + 1]
+		if a.t_end is None or b.t_start is None or b.t_end is None:
+			continue
+		if b.t_start < a.t_end:
+			new_bs = a.t_end
+			new_be = max(b.t_end, a.t_end + _MIN_DUR)
+			timings[i + 1] = SentenceTiming(b.index, new_bs, new_be)
+			logging.getLogger(__name__).warning(
+				"[L1B] 句 index=%d 与前句重叠，t_start %.5f→%.5f t_end %.5f→%.5f",
+				b.index, b.t_start, new_bs, b.t_end, new_be,
+			)
 
 	for a, b in zip(timings, timings[1:]):
 		if (
@@ -658,6 +664,35 @@ def _merge_align_items_with_offset(
 	return out
 
 
+def _forced_align_with_l1a_chunks(
+	aligner: Qwen3ForcedAligner,
+	l1a_chunks: list[dict[str, Any]],
+	audio_arr: np.ndarray,
+	audio_sr: int,
+	language: str,
+) -> list[Any]:
+	"""用 L1A 分块信息做强制对齐（F 方案）。
+
+	L1A 已经把音频按能量低点切成若干块，并对每块独立做了 ASR，得到每块的文字。
+	L1B 直接复用这些分块边界：每块音频配每块自己的 ASR 文字，文字和音频天然对应，
+	不存在字符比例切分导致的错位问题。
+	"""
+	merged: list[Any] = []
+	for chunk in sorted(l1a_chunks, key=lambda c: c["chunk_id"]):
+		chunk_text = str(chunk.get("text", "")).strip()
+		if not chunk_text:
+			# 该块 ASR 结果为空（静音段），跳过，不产生任何对齐 item
+			continue
+		start_sample = int(float(chunk["start_sec"]) * audio_sr)
+		end_sample = int(float(chunk["end_sec"]) * audio_sr)
+		chunk_wav = audio_arr[start_sample:end_sample]
+		offset_sec = float(chunk["start_sec"])
+
+		res = aligner.align(audio=(chunk_wav, audio_sr), text=chunk_text, language=language)
+		merged.extend(_merge_align_items_with_offset(list(res[0]), offset_sec))
+	return merged
+
+
 def _forced_align_chunked(
 	aligner: Qwen3ForcedAligner,
 	raw_text: str,
@@ -750,6 +785,9 @@ def _build_qwen3_asr_model_asr_only(
 	dtype: torch.dtype,
 	gpu_memory_utilization: float,
 ) -> Qwen3ASRModel:
+	# 静默 transformers 内部的 "Setting pad_token_id to eos_token_id" warning，
+	# 该消息在每次 model.generate() 时触发，对用户无意义且会穿透 TUI 渲染。
+	logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
 	asr_path = str(asr_model_path)
 	if backend == "transformers":
 		return Qwen3ASRModel.from_pretrained(
@@ -906,6 +944,269 @@ def run_l1a_asr_only(
 	logger.info("[L1A] 完成 annotations=%d → %s", len(light_doc["annotations"]), run.manifest_path)
 
 
+def run_l1a_asr_chunked(
+	run: PipelineRun,
+	*,
+	asr_model_path: Path,
+	config: AppConfig | None = None,
+	backend: str = "transformers",
+	device: str = "cuda:0",
+	dtype: str = "float16",
+	language: str = "Chinese",
+	gpu_memory_utilization: float = 0.8,
+	progress_callback: "Callable[[Any], None] | None" = None,
+	# 切块参数
+	first_chunk_min_sec: float = 3.0,
+	first_chunk_max_sec: float = 15.0,
+	normal_chunk_target_sec: float = 30.0,
+	silence_snap_radius_sec: float = 5.0,
+	silence_min_duration_sec: float = 0.2,
+) -> None:
+	"""L1A 渐进式 ASR：转码 → VAD → 分块 → 逐块推理，每块完成后通过 progress_callback 发布进度事件。
+
+	与 run_l1a_asr_only 产出相同的 manifest 字段（annotations、raw_text、tokens），
+	但在推理过程中持续发布结构化 ProgressEvent，供 TUI/CLI 展示实时进度。
+
+	Args:
+		run: PipelineRun 元信息
+		asr_model_path: ASR 模型目录
+		config: AppConfig（None 时自动加载）
+		backend: "transformers" 或 "vllm"
+		device: CUDA 设备
+		dtype: 模型精度
+		language: 语言
+		gpu_memory_utilization: vLLM GPU 显存占比
+		progress_callback: 每个阶段事件的回调，接收 ProgressEvent；None 时静默运行
+		first_chunk_min_sec: 第一块最短时长
+		first_chunk_max_sec: 第一块最长时长
+		normal_chunk_target_sec: 后续块目标时长
+		silence_snap_radius_sec: 静音吸附搜索半径
+		silence_min_duration_sec: 有效静音间隔最小时长
+	"""
+	import time as _time
+	from typing import Callable
+	from autosmartcut.pipeline_events import ProgressEvent
+	from autosmartcut.progress_utils import SpeedEstimator
+	from autosmartcut.vad_silence import plan_chunks, silero_speech_segments
+
+	setup_logging_for_manifest(run.manifest_path, verbose=False)
+	if config is None:
+		from autosmartcut.config import load_config
+		config = load_config()
+
+	_, _, max_c, sentence_endings, seg_mode = _resolve_perception_params(
+		config,
+		split_pause_threshold=None,
+		silence_threshold=None,
+		max_chars=None,
+		segmentation_mode=None,
+	)
+	if seg_mode != "punctuation":
+		raise ValueError("L1A/L1B 解耦路径暂仅支持 segmentation_mode=punctuation")
+	if not run.video_path.exists():
+		raise FileNotFoundError(f"输入视频不存在: {run.video_path}")
+	if not asr_model_path.exists():
+		raise FileNotFoundError(f"ASR 模型目录不存在: {asr_model_path}")
+
+	def _emit(phase: str, payload: dict) -> None:
+		if progress_callback is not None:
+			try:
+				progress_callback(ProgressEvent(node_id="l1a_asr", phase=phase, payload=payload))
+			except Exception as _e:
+				logger.warning("[L1A] progress_callback 异常（忽略）: %s", _e)
+
+	estimator = SpeedEstimator()
+
+	# ── Step 0: 音频转码 ────────────────────────────────────────────────────
+	_emit("transcode_start", {})
+	t0 = _time.monotonic()
+	wav_cache = run.output_dir / AUDIO_16K_WAV_NAME
+	extract_audio_16k_wav(run.video_path, wav_cache)
+	transcode_sec = _time.monotonic() - t0
+	_emit("transcode_done", {"elapsed_sec": transcode_sec})
+
+	audio_arr, audio_sr = read_audio_16k_wav(wav_cache)
+	total_audio_sec = audio_arr.shape[0] / audio_sr
+	logger.info("[L1A] 音频就绪 %.1fs @ %dHz", total_audio_sec, audio_sr)
+
+	# ── Step 1: VAD ─────────────────────────────────────────────────────────
+	_emit("vad_start", {})
+	t1 = _time.monotonic()
+	speech_segs = silero_speech_segments(
+		audio_arr,
+		sample_rate=audio_sr,
+		threshold=config.execution.vad_threshold,
+		min_silence_duration_ms=config.execution.vad_min_silence_ms,
+		speech_pad_ms=config.execution.vad_speech_pad_ms,
+	)
+	vad_sec = _time.monotonic() - t1
+	_emit("vad_done", {"elapsed_sec": vad_sec, "speech_segment_count": len(speech_segs)})
+
+	# ── Step 2: 切块规划 ─────────────────────────────────────────────────────
+	t2 = _time.monotonic()
+	chunk_plan = plan_chunks(
+		speech_segs,
+		total_audio_sec,
+		first_chunk_min_sec=first_chunk_min_sec,
+		first_chunk_max_sec=first_chunk_max_sec,
+		normal_chunk_target_sec=normal_chunk_target_sec,
+		silence_snap_radius_sec=silence_snap_radius_sec,
+		silence_min_duration_sec=silence_min_duration_sec,
+	)
+	if not chunk_plan:
+		# 极端情况：plan_chunks 返回空（total_duration <= 0），退化为整条推理
+		chunk_plan = [{"start_sec": 0.0, "end_sec": total_audio_sec, "chunk_id": 0}]
+	plan_sec = _time.monotonic() - t2
+	_emit("plan_done", {"total_chunks": len(chunk_plan), "total_audio_sec": total_audio_sec})
+
+	# ── Step 3: 加载 ASR 模型 ────────────────────────────────────────────────
+	torch_dtype = _torch_dtype(dtype)
+	with log_stage("l1a.load_asr_model", backend=backend, device=device, dtype=dtype):
+		model = _build_qwen3_asr_model_asr_only(
+			asr_model_path=asr_model_path,
+			backend=backend,
+			device=device,
+			dtype=torch_dtype,
+			gpu_memory_utilization=gpu_memory_utilization,
+		)
+
+	# ── Step 4: 逐块 ASR ─────────────────────────────────────────────────────
+	chunk_texts: list[str] = []
+	chunk_langs: list[str] = []
+	chunk_timings: list[dict] = []
+	completed_audio_sec = 0.0
+	asr_total_start = _time.monotonic()
+
+	for chunk in chunk_plan:
+		chunk_id = int(chunk["chunk_id"])
+		start_sample = int(chunk["start_sec"] * audio_sr)
+		end_sample = int(chunk["end_sec"] * audio_sr)
+		chunk_wav = audio_arr[start_sample:end_sample]
+		chunk_audio_sec = float(chunk["end_sec"] - chunk["start_sec"])
+
+		_emit("asr_chunk_start", {
+			"chunk_id": chunk_id,
+			"total_chunks": len(chunk_plan),
+			"chunk_audio_sec": chunk_audio_sec,
+			"total_audio_sec": total_audio_sec,
+			"completed_audio_sec": completed_audio_sec,
+		})
+
+		t_chunk = _time.monotonic()
+		results = model.transcribe(
+			audio=(chunk_wav, audio_sr),
+			language=language,
+			return_time_stamps=False,
+		)
+		chunk_elapsed = _time.monotonic() - t_chunk
+
+		if not results:
+			logger.warning("[L1A] 块 %d 返回空结果，跳过", chunk_id)
+			chunk_texts.append("")
+			chunk_langs.append(language)
+		else:
+			transcription = results[0]
+			chunk_text = str(getattr(transcription, "text", ""))
+			chunk_lang = str(getattr(transcription, "language", "") or language)
+			chunk_texts.append(chunk_text)
+			chunk_langs.append(chunk_lang)
+
+		estimator.record(chunk_id, chunk_audio_sec, chunk_elapsed)
+		completed_audio_sec += chunk_audio_sec
+		chunk_timings.append({
+			"chunk_id": chunk_id,
+			"audio_sec": chunk_audio_sec,
+			"elapsed_sec": chunk_elapsed,
+		})
+
+		text_preview = (chunk_texts[-1][:50] + "…") if len(chunk_texts[-1]) > 53 else chunk_texts[-1]
+		_emit("asr_chunk_done", {
+			"chunk_id": chunk_id,
+			"total_chunks": len(chunk_plan),
+			"chunk_audio_sec": chunk_audio_sec,
+			"chunk_elapsed_sec": chunk_elapsed,
+			"completed_audio_sec": completed_audio_sec,
+			"total_audio_sec": total_audio_sec,
+			"estimated_speed": estimator.speed,
+			"text_preview": text_preview,
+			"text_full": chunk_texts[-1],
+		})
+
+	asr_total_sec = _time.monotonic() - asr_total_start
+
+	# ── Step 5: 后处理 ───────────────────────────────────────────────────────
+	t5 = _time.monotonic()
+	raw_text = "".join(chunk_texts)
+	# 语言取最常见的
+	from collections import Counter
+	lang_out = Counter(chunk_langs).most_common(1)[0][0] if chunk_langs else language
+	duration = duration_seconds(run.video_path)
+
+	spans = segment_raw_text_only(raw_text, sentence_endings, max_c)
+	ann_full = _annotations_l1a_from_spans(spans)
+	postprocess_sec = _time.monotonic() - t5
+
+	_emit("postprocess_done", {
+		"elapsed_sec": postprocess_sec,
+		"sentence_count": len(ann_full),
+		"raw_text_length": len(raw_text),
+	})
+
+	# ── Step 6: 写 manifest ──────────────────────────────────────────────────
+	light_doc = {
+		"source": str(run.video_path),
+		"language": lang_out,
+		"raw_text": raw_text,
+		"annotations": compact_annotations(ann_full),
+	}
+	contract = build_l1_contract(
+		segmentation_mode=seg_mode,
+		sentence_endings=sorted(sentence_endings),
+		max_chars=max_c,
+		language=language,
+	)
+
+	data = load_manifest(run.manifest_path)
+	data["source"] = light_doc["source"]
+	data["language"] = light_doc["language"]
+	data["raw_text"] = light_doc["raw_text"]
+	data["annotations"] = light_doc["annotations"]
+	data["l1_contract"] = contract
+	sm = data.setdefault("source_media", {})
+	if isinstance(sm, dict):
+		sm["path"] = light_doc["source"]
+		sm["duration"] = float(duration)
+		sm["audio_16k_path"] = AUDIO_16K_WAV_NAME
+	# 写入 L1A 分块信息，供 L1B 强制对齐时直接使用，避免 L1B 自行按字符比例切分
+	# 导致文字块与音频块错位。strip_volatile_fields 会在最终落盘前删除此字段。
+	data["l1a_chunks"] = [
+		{
+			"chunk_id": chunk["chunk_id"],
+			"start_sec": float(chunk["start_sec"]),
+			"end_sec": float(chunk["end_sec"]),
+			"text": chunk_texts[chunk["chunk_id"]],
+		}
+		for chunk in chunk_plan
+	]
+	with log_stage("l1a.persist_manifest", manifest=str(run.manifest_path)):
+		touch_layer_status(data, "l1a")
+		save_manifest(run.manifest_path, data, atomic=True)
+
+	# ── 耗时报告 ─────────────────────────────────────────────────────────────
+	total_sec = transcode_sec + vad_sec + plan_sec + asr_total_sec + postprocess_sec
+	logger.info(
+		"[L1A] 耗时报告: 转码=%.2fs VAD=%.2fs 规划=%.3fs ASR=%.2fs 后处理=%.3fs 总计=%.2fs",
+		transcode_sec, vad_sec, plan_sec, asr_total_sec, postprocess_sec, total_sec,
+	)
+	timing_parts = " ".join(
+		f"{{chunk_id={t['chunk_id']}: audio={t['audio_sec']:.1f}s elapsed={t['elapsed_sec']:.1f}s "
+		f"speed={t['audio_sec']/t['elapsed_sec']:.2f}x}}"
+		for t in chunk_timings
+	)
+	logger.info("[L1A] 各块耗时: %s", timing_parts)
+	logger.info("[L1A] 完成 annotations=%d → %s", len(light_doc["annotations"]), run.manifest_path)
+
+
 def compute_l1b_aligned_annotations(
 	run: PipelineRun,
 	manifest_data: dict[str, Any],
@@ -981,9 +1282,19 @@ def compute_l1b_aligned_annotations(
 		)
 
 	with log_stage("l1b.forced_align", language=language):
-		align_items = _forced_align_chunked(
-			aligner, raw_text, audio_arr, audio_sr, language
-		)
+		l1a_chunks = manifest_data.get("l1a_chunks")
+		if isinstance(l1a_chunks, list) and l1a_chunks:
+			# F 方案：直接用 L1A 的分块信息，文字和音频块天然对应，不再按字符比例切分
+			logger.info("[L1B] 使用 L1A 分块信息对齐（%d 块）", len(l1a_chunks))
+			align_items = _forced_align_with_l1a_chunks(
+				aligner, l1a_chunks, audio_arr, audio_sr, language
+			)
+		else:
+			# 兜底：无分块信息时退回原有逻辑（单独跑 L1B 的场景）
+			logger.info("[L1B] 无 L1A 分块信息，使用字符比例切分对齐")
+			align_items = _forced_align_chunked(
+				aligner, raw_text, audio_arr, audio_sr, language
+			)
 	validate_alignment_kept_match(raw_text, align_items)
 	validate_align_items_monotonic(align_items)
 
@@ -1078,6 +1389,29 @@ def run_l1b_align_only(
 	logger.info("[L1B] 完成 → %s", run.manifest_path)
 
 
+def plan_chunks(
+	speech_segments: list[dict[str, float]],
+	total_duration: float,
+	*,
+	first_chunk_min_sec: float = 3.0,
+	first_chunk_max_sec: float = 15.0,
+	normal_chunk_target_sec: float = 30.0,
+	silence_snap_radius_sec: float = 5.0,
+	silence_min_duration_sec: float = 0.2,
+) -> list[dict[str, Any]]:
+	"""将音频按 VAD 静音边界规划为渐进式 ASR 切块。（从 vad_silence 重导出）"""
+	from autosmartcut.vad_silence import plan_chunks as _plan_chunks
+	return _plan_chunks(
+		speech_segments,
+		total_duration,
+		first_chunk_min_sec=first_chunk_min_sec,
+		first_chunk_max_sec=first_chunk_max_sec,
+		normal_chunk_target_sec=normal_chunk_target_sec,
+		silence_snap_radius_sec=silence_snap_radius_sec,
+		silence_min_duration_sec=silence_min_duration_sec,
+	)
+
+
 def _torch_dtype(dtype_name: str) -> torch.dtype:
 	mapping = {
 		"float16": torch.float16,
@@ -1096,6 +1430,7 @@ def _build_qwen3_asr_model(
 	dtype: torch.dtype,
 	gpu_memory_utilization: float,
 ) -> Qwen3ASRModel:
+	logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
 	asr_path = str(asr_model_path)
 	forced_path = str(forced_aligner_path)
 	if backend == "transformers":

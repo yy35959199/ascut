@@ -41,7 +41,7 @@ class L1bNode:
         from autosmartcut.perception import run_l1b_align_only
 
         manifest = ctx.manifest
-        params = manifest.get("_params", {})
+        params = ctx.params
         manifest_path_str = params.get("manifest_path", "")
 
         if not manifest_path_str:
@@ -84,7 +84,7 @@ class L1bNode:
             video_path=video_path,
         )
 
-        ctx.emit(ProgressEvent(node_id=self.id, message="对齐模型加载中..."))
+        ctx.emit(ProgressEvent(node_id=self.id, phase="aligner_loading", payload={}))
 
         try:
             await asyncio.to_thread(
@@ -102,7 +102,9 @@ class L1bNode:
                 error=e,
             )
 
-        ctx.emit(ProgressEvent(node_id=self.id, message="强制对齐完成，加载结果..."))
+        ctx.emit(ProgressEvent(node_id=self.id, phase="align_start", payload={
+            "sentence_count": len(manifest.get("annotations_l1a", [])),
+        }))
 
         # 重新加载 manifest，更新内存中的 annotations
         updated = load_manifest(manifest_path)
@@ -115,10 +117,11 @@ class L1bNode:
             if a.get("t_start") is not None and a.get("t_end") is not None
         )
 
-        ctx.emit(ProgressEvent(
-            node_id=self.id,
-            message=f"L1B 完成：{ann_count} 句，{aligned_count} 句已对齐时间轴",
-        ))
+        ctx.emit(ProgressEvent(node_id=self.id, phase="align_done", payload={
+            "elapsed_sec": 0.0,
+            "aligned_count": aligned_count,
+            "sentence_count": ann_count,
+        }))
 
         return StageResult(
             status=StageStatus.SUCCESS,

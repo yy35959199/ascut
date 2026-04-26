@@ -38,7 +38,7 @@ class L2cNode:
         from autosmartcut.intelligence_2c import run_2c_review
 
         manifest = ctx.manifest
-        params = manifest.get("_params", {})
+        params = ctx.params
         review_round = int(params.get("review_round", 0))
 
         annotations_l1a = manifest.get("annotations_l1a", [])
@@ -69,10 +69,9 @@ class L2cNode:
                     for i, ann in enumerate(annotations_l1a)
                 ]
 
-        ctx.emit(ProgressEvent(
-            node_id=self.id,
-            message=f"审核中（轮次 {review_round}）：生成 checklist 并逐条判断...",
-        ))
+        ctx.emit(ProgressEvent(node_id=self.id, phase="review_start", payload={
+            "review_round": review_round,
+        }))
 
         try:
             # run_2c_review 直接修改 manifest 并返回
@@ -94,10 +93,12 @@ class L2cNode:
         must_pass_rate = review_report.get("must_pass_rate", "0/0")
         fix_count = len(review_report.get("fix_instructions", []))
 
-        ctx.emit(ProgressEvent(
-            node_id=self.id,
-            message=f"L2C 完成：verdict={verdict} must通过率={must_pass_rate} 修正={fix_count}条",
-        ))
+        ctx.emit(ProgressEvent(node_id=self.id, phase="review_done", payload={
+            "elapsed_sec": 0.0,
+            "verdict": verdict,
+            "must_pass_rate": must_pass_rate,
+            "fix_count": fix_count,
+        }))
 
         return StageResult(
             status=StageStatus.SUCCESS,

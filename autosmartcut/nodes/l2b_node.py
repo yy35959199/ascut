@@ -2,7 +2,7 @@
 
 薄包装 intelligence_2b.run_2b_decision()。
 直接操作 ctx.manifest（run_2b_decision 就地修改并返回 manifest_dict）。
-从 ctx.manifest["_params"] 读取 review_round、two_b_mode、review_fixes、force_pass。
+从 ctx.params 读取 review_round、two_b_mode、review_fixes、force_pass。
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ class L2bNode:
         from autosmartcut.intelligence_2b import run_2b_decision
 
         manifest = ctx.manifest
-        params = manifest.get("_params", {})
+        params = ctx.params
 
         review_round = int(params.get("review_round", 0))
         two_b_mode = str(params.get("two_b_mode", self._config.intelligence.two_b_mode))
@@ -81,20 +81,24 @@ class L2bNode:
             keep_mask = [{"index": int(t["index"]), "keep": True} for t in tokens]
             manifest["keep_mask"] = keep_mask
             keep_count = len(keep_mask)
-            ctx.emit(ProgressEvent(
-                node_id=self.id,
-                message=f"L2B 强制通过（已达最大审核轮次）：{keep_count} 句全部保留",
-            ))
+            ctx.emit(ProgressEvent(node_id=self.id, phase="decision_done", payload={
+                "elapsed_sec": 0.0,
+                "keep_count": keep_count,
+                "cut_count": 0,
+                "total": keep_count,
+                "review_round": review_round,
+            }))
             return StageResult(
                 status=StageStatus.SUCCESS,
                 summary=f"force_pass keep={keep_count} cut=0 total={keep_count} round={review_round}",
             )
 
         is_rerun = bool(review_fixes)
-        ctx.emit(ProgressEvent(
-            node_id=self.id,
-            message=f"决策中（轮次 {review_round}，模式 {two_b_mode}）{'（2c 修正重跑）' if is_rerun else ''}...",
-        ))
+        ctx.emit(ProgressEvent(node_id=self.id, phase="decision_start", payload={
+            "mode": two_b_mode,
+            "review_round": review_round,
+            "is_rerun": is_rerun,
+        }))
 
         try:
             # run_2b_decision 直接修改 manifest 并返回
@@ -117,10 +121,13 @@ class L2bNode:
         cut_count = sum(1 for e in keep_mask if e.get("keep") is False)
         total = len(keep_mask)
 
-        ctx.emit(ProgressEvent(
-            node_id=self.id,
-            message=f"L2B 完成：保留 {keep_count}，删除 {cut_count}，共 {total} 句",
-        ))
+        ctx.emit(ProgressEvent(node_id=self.id, phase="decision_done", payload={
+            "elapsed_sec": 0.0,
+            "keep_count": keep_count,
+            "cut_count": cut_count,
+            "total": total,
+            "review_round": review_round,
+        }))
 
         return StageResult(
             status=StageStatus.SUCCESS,
@@ -131,11 +138,9 @@ class L2bNode:
         keep_mask = manifest.get("keep_mask", [])
         keep_count = sum(1 for e in keep_mask if e.get("keep") is True)
         cut_count = sum(1 for e in keep_mask if e.get("keep") is False)
-        params = manifest.get("_params", {})
-        review_round = int(params.get("review_round", 0))
         return L2bOutput(
             keep_count=keep_count,
             cut_count=cut_count,
             total=len(keep_mask),
-            review_round=review_round,
+            review_round=0,  # summarize 不再从 manifest["_params"] 读取，review_round 由调度器追踪
         )

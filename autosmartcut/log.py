@@ -145,6 +145,8 @@ def setup_logging_tui(run: PipelineRun, *, verbose: bool = False) -> None:
     都会覆盖 TUI 渲染。TUI 内的日志通过两条路径展示：
       1. EventBus LogEvent → LogArea（pipeline 节点主动 emit 的日志）
       2. loguru TUI sink → LogArea（由 PipelineApp.on_mount 注册，覆盖所有日志）
+
+    额外措施：将第三方库常见的 stderr warning 静默，避免穿透 TUI 渲染。
     """
     started = run.started_at.strftime("%Y-%m-%d %H:%M:%S")
     banner = (
@@ -157,6 +159,14 @@ def setup_logging_tui(run: PipelineRun, *, verbose: bool = False) -> None:
         banner=banner,
         suppress_stderr=True,
     )
+    # TUI 模式下静默第三方库直接写 stderr 的 warning，
+    # 避免穿透 Textual alternate screen buffer。
+    for noisy_logger in (
+        "transformers.generation.utils",
+        "transformers.modeling_utils",
+        "torch.nn.modules.module",
+    ):
+        logging.getLogger(noisy_logger).setLevel(logging.ERROR)
 
 
 def setup_logging_for_manifest(manifest_path: Path, *, verbose: bool = False) -> None:
