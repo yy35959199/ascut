@@ -61,7 +61,7 @@ ascut tui [--stage SPEC] [--input VIDEO | --manifest MANIFEST] [选项...]
 | `--input PATH` | Path | — | 输入视频文件（`--stage` 含 `1` 时必填） |
 | `--manifest PATH` | Path | — | `timeline_manifest.json` 路径（`--stage` 不以 `1` 开头时必填） |
 | `--goal TEXT` | string | `""` | 智能层目标，传给 LLM |
-| `--output-dir PATH` | Path | 自动生成 | 产物目录；含 `1` 且省略时为 `<视频父目录>/ascut_out_<ULID前8位>` |
+| `--output-dir PATH` | Path | 自动生成 | 产物目录；含 `1` 且省略时为 `<视频父目录>/ascut_out_<YYYY-mm-DD_HH-MM-ss.SSS>`（冲突 `_01`…） |
 | `--output-name NAME` | string | — | 输出视频文件名（basename），落在 `output_dir` |
 | `--interactive-2d` | flag | False | 启用 2d TUI 人工审阅；默认 auto 跳过（仅 `ascut run` 有效，`ascut tui` 始终启用） |
 | `--two-b-mode MODE` | `single`\|`block` | config 值 | 覆盖 `config.toml` 的 `two_b_mode` |
@@ -255,6 +255,18 @@ ascut run \
 
 含 `--stage 1` 且未指定 `--output-dir` 时，自动创建：
 ```
-<视频父目录>/ascut_out_<ULID前8位>/
+<视频父目录>/ascut_out_<YYYY-mm-DD_HH-MM-ss.SSS>/
 ```
-例如：`/videos/ascut_out_01KNSX8E/`
+若该目录名已存在，则依次尝试 `..._01/`、`..._02/` … 至 `..._99/`。
+
+例如：`/videos/ascut_out_2026-04-27_15-49-12.348/`
+
+### 5.5 日志文件命名
+
+与清单同目录的 DEBUG 日志文件名为：
+
+```
+run_<YYYY-mm-DD_HH-MM-ss.SSS>.log
+```
+
+若同名文件已存在，则依次 `run_..._01.log`、`run_..._02.log` …。清单内 **`run_id` 仍为 ULID**，与日志文件名无关。

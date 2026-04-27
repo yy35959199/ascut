@@ -17,6 +17,42 @@ from autosmartcut.manifest_io import (
 )
 
 
+def format_label_ts(dt: datetime) -> str:
+    """人类可读时间串：``YYYY-mm-DD_HH-MM-ss.SSS``（本地时间，毫秒 3 位）。"""
+    ms = dt.microsecond // 1000
+    return dt.strftime("%Y-%m-%d_%H-%M-%S") + f".{ms:03d}"
+
+
+def allocate_unique_dir(parent: Path, base_name: str) -> Path:
+    """在 parent 下分配不存在的子目录名；冲突时追加 ``_01``…``_99``。"""
+    candidate = parent / base_name
+    if not candidate.exists():
+        return candidate
+    for n in range(1, 100):
+        candidate = parent / f"{base_name}_{n:02d}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(
+        f"无法分配唯一输出目录（已尝试 {base_name} 至 {base_name}_99）: {parent}"
+    )
+
+
+def allocate_unique_file(parent: Path, stem: str, suffix: str) -> Path:
+    """在 parent 下分配不存在的文件名 ``{stem}{suffix}``；冲突时 ``{stem}_01{suffix}``…。"""
+    if suffix and not suffix.startswith("."):
+        suffix = f".{suffix}"
+    candidate = parent / f"{stem}{suffix}"
+    if not candidate.exists():
+        return candidate
+    for n in range(1, 100):
+        candidate = parent / f"{stem}_{n:02d}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(
+        f"无法分配唯一日志文件（已尝试 {stem}{suffix} 等）: {parent}"
+    )
+
+
 def _default_output_video(
     output_dir: Path, video_path: Path, output_video_name: str | None
 ) -> Path:
@@ -41,10 +77,7 @@ class PipelineRun:
     goal: str
     started_at: datetime
     video_path: Path
-
-    @property
-    def log_path(self) -> Path:
-        return self.output_dir / f"run_{self.run_id}.log"
+    log_path: Path
 
     @classmethod
     def new(
@@ -57,15 +90,18 @@ class PipelineRun:
         """从视频新建输出目录、写清单骨架、返回句柄。"""
         run_id = str(ULID())
         vp = video_path.resolve()
+        started = datetime.now()
+        label_ts = format_label_ts(started)
         if output_dir is None:
-            od = vp.parent / f"ascut_out_{run_id[:8]}"
+            base_name = f"ascut_out_{label_ts}"
+            od = allocate_unique_dir(vp.parent, base_name)
         else:
             od = Path(output_dir).resolve()
         od.mkdir(parents=True, exist_ok=True)
         mp = od / MANIFEST_FILENAME
-        started = datetime.now()
         sk = make_manifest_skeleton(run_id, goal, str(vp))
         save_manifest(mp, sk, atomic=True)
+        log_p = allocate_unique_file(od, f"run_{label_ts}", ".log")
         out = _default_output_video(od, vp, output_video_name)
         return cls(
             run_id=run_id,
@@ -75,6 +111,7 @@ class PipelineRun:
             goal=goal,
             started_at=started,
             video_path=vp,
+            log_path=log_p,
         )
 
     @classmethod
@@ -97,6 +134,8 @@ class PipelineRun:
         vp = video_path_from_manifest(data, mp)
         g = goal_override if goal_override is not None else str(data.get("goal", ""))
         started = datetime.now()
+        label_ts = format_label_ts(started)
+        log_p = allocate_unique_file(od, f"run_{label_ts}", ".log")
         out = _default_output_video(od, vp, output_video_name)
         return cls(
             run_id=rid,
@@ -106,6 +145,7 @@ class PipelineRun:
             goal=g,
             started_at=started,
             video_path=vp,
+            log_path=log_p,
         )
 
     @classmethod

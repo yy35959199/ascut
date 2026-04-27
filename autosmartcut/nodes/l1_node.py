@@ -15,7 +15,11 @@ from autosmartcut.annotation_tokens import tokens_from_annotations
 from autosmartcut.manifest_io import load_manifest, save_manifest
 from autosmartcut.pipeline_events import ProgressEvent
 from autosmartcut.pipeline_models import L1Output, StageResult, StageStatus
-from autosmartcut.pipeline_run import PipelineRun
+from autosmartcut.pipeline_run import (
+    PipelineRun,
+    allocate_unique_file,
+    format_label_ts,
+)
 from autosmartcut.progress_utils import SpeedEstimator
 
 if TYPE_CHECKING:
@@ -72,14 +76,19 @@ class L1Node:
         suffix = video_path.suffix or ".mp4"
         output_video = output_dir / f"{video_path.stem}_cut{suffix}"
 
+        started_at = datetime.now()
+        log_path = allocate_unique_file(
+            output_dir, f"run_{format_label_ts(started_at)}", ".log"
+        )
         run = PipelineRun(
             run_id=run_id,
             manifest_path=manifest_path,
             output_dir=output_dir,
             output_video=output_video,
             goal=goal,
-            started_at=datetime.now(),
+            started_at=started_at,
             video_path=video_path,
+            log_path=log_path,
         )
 
         state: dict[str, Any] = {

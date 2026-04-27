@@ -1,4 +1,4 @@
-"""流水线统一日志：loguru 双写（stderr + ``run_<run_id>.log``）+ stdlib ``logging`` 桥接。
+"""流水线统一日志：loguru 双写（stderr + ``run_<时间串>.log``）+ stdlib ``logging`` 桥接。
 
 - 文件 sink 使用 ``enqueue=True``，格式化与写盘在后台线程，减轻主线程阻塞。
 - 大块 JSON（annotations、LLM 全文）使用 ``opt(lazy=True)`` + DEBUG，仅在 DEBUG sink（文件）上于后台序列化；终端默认 INFO，避免刷屏。
@@ -12,6 +12,7 @@ import json
 import logging
 import sys
 import time
+from datetime import datetime
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -20,7 +21,11 @@ from typing import Any
 from loguru import logger as loguru_logger
 
 from autosmartcut.manifest_io import load_manifest
-from autosmartcut.pipeline_run import PipelineRun
+from autosmartcut.pipeline_run import (
+    PipelineRun,
+    allocate_unique_file,
+    format_label_ts,
+)
 
 _PACKAGE = "autosmartcut"
 
@@ -40,13 +45,12 @@ _current_verbose: bool = False
 
 
 def log_path_for_manifest(manifest_path: Path) -> Path:
-    """与 ``PipelineRun.log_path`` 一致：``<清单父目录>/run_<run_id>.log``。"""
+    """与 ``PipelineRun`` 日志命名一致：``<清单父目录>/run_<YYYY-mm-DD_HH-MM-ss.SSS>.log``。"""
     mp = Path(manifest_path).resolve()
     if not mp.is_file():
         return mp.parent / "run_unknown.log"
-    data = load_manifest(mp)
-    run_id = str(data.get("run_id") or "unknown")
-    return mp.parent / f"run_{run_id}.log"
+    label_ts = format_label_ts(datetime.now())
+    return allocate_unique_file(mp.parent, f"run_{label_ts}", ".log")
 
 
 class _InterceptHandler(logging.Handler):
@@ -129,7 +133,7 @@ atexit.register(_shutdown_loguru)
 
 
 def setup_logging(run: PipelineRun, *, verbose: bool = False) -> None:
-    """CLI 全流程：stderr + ``output_dir/run_<run_id>.log``。"""
+    """CLI 全流程：stderr + ``PipelineRun.log_path``（时间串日志名）。"""
     started = run.started_at.strftime("%Y-%m-%d %H:%M:%S")
     banner = (
         f"=== AutoSmartCut 开始 | run_id={run.run_id} | started_at={started} | "
@@ -170,7 +174,7 @@ def setup_logging_tui(run: PipelineRun, *, verbose: bool = False) -> None:
 
 
 def setup_logging_for_manifest(manifest_path: Path, *, verbose: bool = False) -> None:
-    """仅清单续跑 / 单独 L2：与清单同目录的 ``run_<run_id>.log``；若与当前文件 sink 相同则尽量不重复 remove。"""
+    """仅清单续跑 / 单独 L2：与清单同目录的时间串 ``run_*.log``；若与当前文件 sink 相同则尽量不重复 remove。"""
     lp = log_path_for_manifest(manifest_path)
     global _active_file_path, _current_verbose
     if (

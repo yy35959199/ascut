@@ -43,7 +43,7 @@ class PipelineParams:
 
     # ── 输出 ────────────────────────────────────────────────────────────────
     output_dir: Path | None = None
-    """产物目录；含 L1 且省略时自动生成 ascut_out_<ULID 前8位>。"""
+    """产物目录；含 L1 且省略时自动生成 ascut_out_<YYYY-mm-DD_HH-MM-ss.SSS>（冲突追加 _01）。"""
 
     output_name: str | None = None
     """输出视频文件名（basename），落在 output_dir。"""

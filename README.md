@@ -199,7 +199,7 @@ ascut tui --input video.mp4 --goal "精华版，压缩至原时长 60%" --stage 
 ascut run --input video.mp4 --goal "..." --stage 123 --interactive-2d
 ```
 
-首次含 L1 且未指定 `--output-dir` 时，默认输出目录为**视频同目录下的 `ascut_out_<ULID 前 8 位>`**；清单为 **`{output_dir}/timeline_manifest.json`**。
+首次含 L1 且未指定 `--output-dir` 时，默认输出目录为**视频同目录下的 `ascut_out_<YYYY-mm-DD_HH-MM-ss.SSS>`**（同名已存在则追加 `_01`、`_02`…）；清单为 **`{output_dir}/timeline_manifest.json`**。同目录下流水线日志为 **`run_<YYYY-mm-DD_HH-MM-ss.SSS>.log`**（按本次启动时间生成；新建任务时与目录名中的时间串一致；冲突同样 `_01` 后缀）；**`run_id` 仍为 ULID**，写入清单，不因显示名改变。
 
 完整 CLI 参数、`--stage` 所有合法值及使用示例见 [doc/cli-and-config.md](doc/cli-and-config.md)。
 

@@ -85,7 +85,7 @@ def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
         "--output-dir",
         type=Path,
         default=None,
-        help="产物目录；含 1 且省略时 <视频父目录>/ascut_out_<ULID 前8位>",
+        help="产物目录；含 1 且省略时 <视频父目录>/ascut_out_<YYYY-mm-DD_HH-MM-ss.SSS>（冲突 _01）",
     )
     p.add_argument(
         "--output-name",

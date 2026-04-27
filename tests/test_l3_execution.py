@@ -36,6 +36,7 @@ def test_run_execution_layer_rejects_same_input_output_path(
         goal="",
         started_at=datetime.now(),
         video_path=src,
+        log_path=tmp_path / "run_test.log",
     )
 
     monkeypatch.setattr(execution_mod, "load_manifest", lambda _p: manifest_data)
@@ -77,6 +78,7 @@ def test_run_execution_layer_propagates_smartcut_backend_error(
         goal="",
         started_at=datetime.now(),
         video_path=src,
+        log_path=tmp_path / "run_test.log",
     )
 
     monkeypatch.setattr(execution_mod, "load_manifest", lambda _p: manifest_data)
