@@ -23,8 +23,6 @@ vad_min_silence_ms = 80
 vad_speech_pad_ms = 10
 # L1A 后 L1B 与 L2 双轨并行（false 时恢复为仅串行 L2；CLI 可用 --no-parallel-l1b-l2 覆盖）
 parallel_l1b_l2_enabled = true
-# L3 句级分片缓存快速拼接（需 PATH 中 ffmpeg；失败自动回退 smartcut）
-sentence_tile_cache_enabled = true
 
 [llm]
 api_key = "sk-f46d082357234fd2977e400835892f35"                       

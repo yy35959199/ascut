@@ -25,7 +25,7 @@ class L2bNode:
     """L2B：决策子阶段（keep_mask 生成）。"""
 
     id = "l2b_decision"
-    reads = frozenset({"comprehension", "annotations_l1a"})
+    reads = frozenset({"comprehension", "annotations"})
     writes = frozenset({"keep_mask"})
     phase = 2
     resumable = True
@@ -45,14 +45,14 @@ class L2bNode:
         review_fixes = params.get("review_fixes", None)
         force_pass = bool(params.get("force_pass", False))
 
-        annotations_l1a = manifest.get("annotations_l1a", [])
+        annotations = manifest.get("annotations", [])
         comprehension = manifest.get("comprehension", {})
 
-        if not annotations_l1a:
+        if not annotations:
             return StageResult(
                 status=StageStatus.FAILED,
-                summary="annotations_l1a 为空，无法执行 L2B 决策",
-                error=ValueError("annotations_l1a 为空"),
+                summary="annotations 为空，无法执行 L2B 决策",
+                error=ValueError("annotations 为空"),
             )
 
         if not comprehension:
@@ -62,15 +62,15 @@ class L2bNode:
                 error=ValueError("comprehension 为空"),
             )
 
-        # 确保 tokens 存在（从 annotations_l1a 派生）
+        # 确保 tokens 存在（从 annotations 派生）
         if "tokens" not in manifest:
             try:
-                manifest["tokens"] = tokens_from_annotations(annotations_l1a)
+                manifest["tokens"] = tokens_from_annotations(annotations)
             except Exception as e:
                 logger.warning("[L2bNode] tokens_from_annotations 失败: %s", e)
                 manifest["tokens"] = [
                     {"index": int(ann.get("index", i)), "text": str(ann.get("content", ""))}
-                    for i, ann in enumerate(annotations_l1a)
+                    for i, ann in enumerate(annotations)
                 ]
 
         tokens = manifest.get("tokens", [])

@@ -91,9 +91,6 @@ class PipelineSession:
         self._review_round: int = 0
         self._last_review_verdict: str = ""
 
-        # node_id_filter：用于 1a/1b 细粒度过滤
-        self._node_id_filter: "frozenset[str] | None" = None
-
         # 供 abort() 使用的当前 manifest 引用
         self._current_manifest: dict = {}
 
@@ -109,21 +106,17 @@ class PipelineSession:
         self._node_states[node.id] = NodeState(node_id=node.id, status="pending")
 
     def register_default_nodes(self) -> None:
-        """注册标准 8 个节点（快捷方法）。"""
+        """注册标准 6 个节点（快捷方法）。"""
         from autosmartcut.nodes import (
-            L1aNode,
-            L1bNode,
+            L1Node,
             L2aNode,
             L2bNode,
             L2cNode,
             L2dNode,
             L3Node,
-            L3PrecomputeNode,
         )
         for node in [
-            L1aNode(self._config),
-            L1bNode(self._config),
-            L3PrecomputeNode(self._config),
+            L1Node(self._config),
             L2aNode(self._config),
             L2bNode(self._config),
             L2cNode(self._config),
@@ -233,11 +226,7 @@ class PipelineSession:
             return
         for node_id, node in self._nodes.items():
             if node.phase not in self._stage_filter:
-                # 额外检查：node_id_filter（用于 1a/1b 细粒度过滤）
-                if self._node_id_filter and node_id not in self._node_id_filter:
-                    self._node_states[node_id] = NodeState(node_id=node_id, status="skipped")
-                elif not self._node_id_filter:
-                    self._node_states[node_id] = NodeState(node_id=node_id, status="skipped")
+                self._node_states[node_id] = NodeState(node_id=node_id, status="skipped")
 
     def _apply_resumable_skip(self, manifest: dict) -> None:
         """resumable=True 且 layer_status 有完成标记时跳过节点。
@@ -268,26 +257,18 @@ class PipelineSession:
 
     @staticmethod
     def parse_stage_arg(stage_str: str) -> "tuple[frozenset[int], frozenset[str] | None]":
-        """将 --stage 参数映射为 (stage_filter, node_id_filter)。
+        """将 ``--stage`` 参数映射为 ``(stage_filter, node_id_filter)``。
 
-        Returns:
-            (stage_filter, node_id_filter)
-            - stage_filter: 需要运行的 phase 集合
-            - node_id_filter: 细粒度节点 id 过滤（None 表示不过滤）
+        当前仅支持按 phase 过滤；``node_id_filter`` 恒为 ``None``（保留二元组返回值以兼容旧调用）。
 
-        映射表：
-            "1"   → ({1}, None)
-            "2"   → ({2}, None)
-            "3"   → ({3}, None)
-            "12"  → ({1,2}, None)
-            "23"  → ({2,3}, None)
-            "123" → ({1,2,3}, None)
-            "1a"  → ({1}, {"l1a_asr"})
-            "1b"  → ({1}, {"l1b_align"})
-            "1a2" → ({1,2}, {"l1a_asr"})
-            "1b2" → ({1,2}, {"l1b_align"})
-            "1a23"→ ({1,2,3}, {"l1a_asr"})
-            "1b23"→ ({1,2,3}, {"l1b_align"})
+        合法 ``stage_str`` 与 ``stage_filter`` 对应关系：
+
+        - ``"1"`` → ``{1}``
+        - ``"2"`` → ``{2}``
+        - ``"3"`` → ``{3}``
+        - ``"12"`` → ``{1, 2}``
+        - ``"23"`` → ``{2, 3}``
+        - ``"123"`` → ``{1, 2, 3}``
         """
         _MAP: dict[str, tuple[frozenset[int], frozenset[str] | None]] = {
             "1":    (frozenset({1}),     None),
@@ -296,12 +277,6 @@ class PipelineSession:
             "12":   (frozenset({1, 2}),  None),
             "23":   (frozenset({2, 3}),  None),
             "123":  (frozenset({1, 2, 3}), None),
-            "1a":   (frozenset({1}),     frozenset({"l1a_asr"})),
-            "1b":   (frozenset({1}),     frozenset({"l1b_align"})),
-            "1a2":  (frozenset({1, 2}),  frozenset({"l1a_asr"})),
-            "1b2":  (frozenset({1, 2}),  frozenset({"l1b_align"})),
-            "1a23": (frozenset({1, 2, 3}), frozenset({"l1a_asr"})),
-            "1b23": (frozenset({1, 2, 3}), frozenset({"l1b_align"})),
         }
         if stage_str not in _MAP:
             raise ValueError(f"非法 --stage 值: {stage_str!r}")
@@ -667,7 +642,7 @@ class PipelineSession:
         """将 L2 节点写出的顶层字段同步到 manifest["current"]。
 
         pipeline 内各节点直接写 manifest 顶层（如 manifest["keep_mask"]），
-        但 l3_planner / validate_manifest_for_stages 读的是 manifest["current"]["keep_mask"]。
+        但 execution / validate_manifest_for_stages 读的是 manifest["current"]["keep_mask"]。
         每次保存前调用此方法确保两者一致。
         """
         cur = manifest.setdefault("current", {})
@@ -678,29 +653,44 @@ class PipelineSession:
             if key in manifest:
                 cur[key] = manifest[key]
 
+    def _mark_node_completed(self, node_id: str, manifest: dict) -> None:
+        """SUCCESS：更新 NodeState、layer_status、l2c 的 review 元数据。"""
+        self._node_states[node_id].status = "completed"
+        self._node_states[node_id].completed_at = datetime.now()
+        ls = manifest.setdefault("layer_status", {})
+        ls[f"{node_id}_completed_at"] = datetime.now().isoformat()
+        if node_id == "l2c_review":
+            report = manifest.get("review_report", {})
+            self._last_review_verdict = report.get("verdict", "")
+            self._review_round += 1
+
+    def _persist_manifest(self, manifest: dict) -> None:
+        """将 manifest 落盘；失败仅记录 warning，不中断流水线。"""
+        try:
+            save_manifest(self._manifest_path, manifest, atomic=True)
+        except Exception as e:
+            logger.warning("保存 manifest 失败（路径=%s）: %s", self._manifest_path, e)
+
+    def _mark_node_failed(self, node_id: str, result: StageResult) -> None:
+        """FAILED：更新状态、发 ErrorEvent、置中止标志。"""
+        self._node_states[node_id].status = "failed"
+        self._emit(ErrorEvent(
+            node_id=node_id,
+            error=str(result.error or result.summary),
+        ))
+        self._abort_flag = True
+
     async def _handle_result(
         self,
         node_id: str,
         result: StageResult,
         manifest: dict,
     ) -> None:
-        """统一处理节点执行结果（SUCCESS / FAILED / REFLOW 分支）。"""
+        """统一处理节点执行结果（SUCCESS / FAILED / REFLOW 等分支）。"""
         if result.status == StageStatus.SUCCESS:
-            self._node_states[node_id].status = "completed"
-            self._node_states[node_id].completed_at = datetime.now()
-            # 更新 layer_status
-            ls = manifest.setdefault("layer_status", {})
-            ls[f"{node_id}_completed_at"] = datetime.now().isoformat()
-            # 更新 review_round 和 last_review_verdict（l2c 节点）
-            if node_id == "l2c_review":
-                report = manifest.get("review_report", {})
-                self._last_review_verdict = report.get("verdict", "")
-                self._review_round += 1
-            # 将 L2 节点写出的顶层字段同步到 current，确保磁盘上结构完整
+            self._mark_node_completed(node_id, manifest)
             self._sync_to_current(manifest)
-            # 保存 manifest
-            save_manifest(self._manifest_path, manifest, atomic=True)
-            # 更新 node output
+            self._persist_manifest(manifest)
             node = self._nodes[node_id]
             try:
                 self._node_states[node_id].output = node.summarize(manifest)
@@ -708,13 +698,7 @@ class PipelineSession:
                 logger.warning("节点 %s summarize() 异常: %s", node_id, e)
 
         elif result.status == StageStatus.FAILED:
-            self._node_states[node_id].status = "failed"
-            self._emit(ErrorEvent(
-                node_id=node_id,
-                error=str(result.error or result.summary),
-            ))
-            # 失败时中止流水线
-            self._abort_flag = True
+            self._mark_node_failed(node_id, result)
 
         elif result.status == StageStatus.REFLOW:
             self._node_states[node_id].status = "completed"  # l2d 本次执行完成

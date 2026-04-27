@@ -6,7 +6,7 @@
     ascut tui [--stage SPEC] [--input|--manifest ...]
     ascut resume <path> [--goal ...] [--stage ...] [--tui] [-y]
 
-``--stage``：``1`` | ``2`` | ``3`` | ``12`` | ``23`` | ``123`` | ``1a`` | ``1b`` | ``1a2`` | ``1b2`` | ``1a23`` | ``1b23``；省略且未指定 ``--from-stage`` 时等价全流程 ``123``。
+``--stage``：``1`` | ``2`` | ``3`` | ``12`` | ``23`` | ``123``；省略且未指定 ``--from-stage`` 时等价全流程 ``123``。
 ``--from-stage`` 已弃用，映射为等价 ``--stage``（见 doc/AutoSmartCut-MVP-Mini.md）。
 
 ``ascut resume``：读取已有 timeline_manifest.json（或其父文件夹），自动推断进度，
@@ -27,22 +27,39 @@ from pathlib import Path
 
 from autosmartcut.config import load_config
 from autosmartcut.log import setup_logging, setup_logging_tui
-from autosmartcut.manifest_io import load_manifest, validate_manifest_for_stages
-from autosmartcut.manifest_stages import infer_l1_mode, resolve_stages, validate_cli_args
-from autosmartcut.pipeline_run import PipelineRun
+from autosmartcut.manifest_io import load_manifest
 from autosmartcut.pipeline_session import PipelineSession
+from autosmartcut.session_factory import PipelineParams
 
 logger = logging.getLogger(__name__)
 
 
+def _add_tui_args(p: argparse.ArgumentParser) -> None:
+    """向 tui 子命令解析器添加参数。
+
+    支持两种用法：
+    1. ascut tui <path>  — 智能识别媒体文件或清单文件（推荐）
+    2. ascut tui --input video.mp4 --stage 123  — 旧用法（兼容）
+    """
+    p.add_argument(
+        "path",
+        type=Path,
+        nargs="?",
+        default=None,
+        help="输入路径：媒体文件（新建工程）或 timeline_manifest.json / 其父文件夹（续跑）",
+    )
+    # 保留旧参数以兼容
+    _add_pipeline_args(p)
+
+
 def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
-    """向子命令解析器添加流水线公共参数（run 和 tui 共用）。"""
+    """向子命令解析器添加流水线公共参数（run 使用）。"""
     p.add_argument(
         "--stage",
         type=str,
         default=None,
         metavar="SPEC",
-        help="1|2|3|12|23|123|1a|1b|1a2|1b2|1a23|1b23；省略且未指定 --from-stage 时默认全流程 123",
+        help="1|2|3|12|23|123；省略且未指定 --from-stage 时默认全流程 123",
     )
     p.add_argument(
         "--from-stage",
@@ -183,7 +200,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     _add_pipeline_args(pr)
 
     pt = sub.add_parser("tui", help="TUI 模式（Textual 交互界面）")
-    _add_pipeline_args(pt)
+    _add_tui_args(pt)
 
     ps = sub.add_parser(
         "resume",
@@ -193,115 +210,188 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     args = parser.parse_args(argv)
 
-    # resume 子命令不走 resolve_stages / validate_cli_args
+    # resume 子命令不走 stage 解析
     if args.command == "resume":
         return args
 
+    # tui 子命令：如果提供了 path 参数，跳过 stage 解析（由 AppController.open() 处理）
+    if args.command == "tui" and getattr(args, "path", None) is not None:
+        return args
+
+    # ── stage / from-stage 解析（原 manifest_stages.resolve_stages）──────────
     with warnings.catch_warnings():
         warnings.simplefilter("always", DeprecationWarning)
         try:
-            stages = resolve_stages(args)
+            stages, l1_mode = _resolve_stages(args)
         except ValueError as e:
-            # find the right subparser to call error()
             sp = pr if args.command == "run" else pt
             sp.error(str(e))
-    validate_cli_args(stages, args, pr if args.command == "run" else pt)
+
+    # ── CLI 参数交叉校验（原 manifest_stages.validate_cli_args）──────────────
+    _validate_cli_args(stages, l1_mode, args, pr if args.command == "run" else pt)
 
     setattr(args, "_resolved_stages", stages)
+    setattr(args, "_l1_mode", l1_mode)
     return args
 
 
-def _build_run(args: argparse.Namespace) -> PipelineRun:
-    stages: frozenset[int] = getattr(args, "_resolved_stages")
-    l1_mode = infer_l1_mode(args, stages)
-    if 1 in stages or l1_mode in ("both", "a"):
-        return PipelineRun.new(
-            video_path=args.input,
-            goal=args.goal or "",
-            output_dir=args.output_dir,
-            output_video_name=args.output_name,
+# ---------------------------------------------------------------------------
+# stage 解析与 CLI 校验（原 manifest_stages.py 的逻辑，内联至此）
+# ---------------------------------------------------------------------------
+
+_VALID_STAGE_SPECS = frozenset({
+    "1", "2", "3", "12", "23", "123",
+})
+
+_L1_MODE_BY_SPEC: dict[str, str] = {
+    "1": "both",
+    "2": "none",
+    "3": "none",
+    "12": "both",
+    "23": "none",
+    "123": "both",
+}
+
+_FROM_STAGE_MAP = {1: "123", 2: "23", 3: "3"}
+
+
+def _resolve_stages(args: argparse.Namespace) -> tuple[frozenset[int], str]:
+    """解析 --stage / --from-stage，返回 (stage_filter, l1_mode)。"""
+    raw = getattr(args, "stage", None)
+    has_stage = raw is not None and str(raw).strip() != ""
+    has_from = getattr(args, "from_stage", None) is not None
+
+    if has_stage and has_from:
+        raise ValueError("不可同时使用 --stage 与 --from-stage")
+
+    if has_stage:
+        s = str(args.stage).strip()
+        if s not in _VALID_STAGE_SPECS:
+            allowed = ", ".join(sorted(_VALID_STAGE_SPECS, key=len))
+            raise ValueError(f"非法 --stage {s!r}；允许: {allowed}")
+        stage_filter, _ = PipelineSession.parse_stage_arg(s)
+        return stage_filter, _L1_MODE_BY_SPEC[s]
+
+    if has_from:
+        fs = int(args.from_stage)
+        if fs not in _FROM_STAGE_MAP:
+            raise ValueError(f"非法 --from-stage {fs}")
+        warnings.warn(
+            "--from-stage 已弃用，请改用 --stage " + repr(_FROM_STAGE_MAP[fs]),
+            DeprecationWarning,
+            stacklevel=4,
         )
-    mp = Path(args.manifest).resolve()
-    od_arg = Path(args.output_dir).resolve() if args.output_dir else None
-    if od_arg is not None and od_arg != mp.parent.resolve():
-        return PipelineRun.fork(mp, od_arg, output_video_name=args.output_name)
-    return PipelineRun.from_manifest(
-        mp,
-        goal_override=args.goal if args.goal else None,
-        output_dir=args.output_dir,
-        output_video_name=args.output_name,
+        s = _FROM_STAGE_MAP[fs]
+        stage_filter, _ = PipelineSession.parse_stage_arg(s)
+        return stage_filter, "both"
+
+    # 默认全流程
+    stage_filter, _ = PipelineSession.parse_stage_arg("123")
+    return stage_filter, "both"
+
+
+def _validate_cli_args(
+    stages: frozenset[int],
+    l1_mode: str,
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> None:
+    """CLI 参数交叉校验（--input / --manifest 约束）。"""
+    needs_video_input = l1_mode == "both"
+
+    if needs_video_input:
+        if getattr(args, "input", None) is None:
+            parser.error("当 --stage 含阶段 1（L1）时必须提供 --input")
+        if getattr(args, "manifest", None) is not None:
+            parser.error("当 --stage 含阶段 1 时不要使用 --manifest（本次运行将创建清单）")
+    else:
+        if getattr(args, "manifest", None) is None:
+            parser.error("当 --stage 不含阶段 1 时必须提供 --manifest")
+        if getattr(args, "input", None) is not None:
+            parser.error("当 --stage 不含阶段 1 时不要提供 --input")
+        mp = Path(args.manifest)
+        if not mp.is_file():
+            parser.error(f"--manifest 不是有效文件: {mp}")
+
+
+def _args_to_params(args: argparse.Namespace) -> PipelineParams:
+    """将 argparse Namespace 转换为 PipelineParams。"""
+    stages: frozenset[int] = getattr(args, "_resolved_stages", frozenset({1, 2, 3}))
+    l1_mode: str = getattr(args, "_l1_mode", "both")
+
+    input_video = None
+    manifest_path = None
+    if l1_mode == "both":
+        input_video = getattr(args, "input", None)
+    else:
+        manifest_path = getattr(args, "manifest", None)
+
+    stage_str = getattr(args, "stage", None) or "123"
+
+    return PipelineParams(
+        input_video=input_video,
+        manifest_path=manifest_path,
+        stage=stage_str,
+        goal=getattr(args, "goal", "") or "",
+        output_dir=getattr(args, "output_dir", None),
+        output_name=getattr(args, "output_name", None),
+        config_path=getattr(args, "config", None),
+        asr_model=getattr(args, "asr_model", None),
+        forced_aligner=getattr(args, "forced_aligner", None),
+        backend=getattr(args, "backend", None),
+        two_b_mode=getattr(args, "two_b_mode", None),
+        pre_pad=getattr(args, "pre_pad", 0.15),
+        post_pad=getattr(args, "post_pad", 0.25),
+        min_duration=getattr(args, "min_duration", 1.0),
+        no_vad_snap=getattr(args, "no_vad_snap", False),
+        device=getattr(args, "device", "cuda:0"),
+        dtype=getattr(args, "dtype", "float16"),
+        language=getattr(args, "language", "Chinese"),
+        gpu_memory_utilization=getattr(args, "gpu_memory_utilization", 0.8),
+        interactive_2d=getattr(args, "interactive_2d", False),
+        verbose=getattr(args, "verbose", False),
     )
 
 
-def _validate_prereq_manifest(stages: frozenset[int], manifest_path: Path) -> None:
-    data = load_manifest(manifest_path)
-    need: frozenset[int] = frozenset()
-    if 2 in stages and 1 not in stages:
-        need |= {2}
-    if 3 in stages and 2 not in stages:
-        need |= {3}
-    if need:
-        validate_manifest_for_stages(need, data)
-
-
 def _run_pipeline(args: argparse.Namespace, *, use_tui: bool = False) -> int:
-    """流水线主逻辑：基于 PipelineSession + DAG 调度。"""
-    cfg = load_config(args.config)
+    """流水线主逻辑：基于 SessionController/AppController + 适配器。"""
+    from autosmartcut.app_controller import AppController, AppState, SessionController
 
-    # CLI 参数覆盖 config
-    if args.asr_model is not None:
-        cfg.models.asr_model_path = args.asr_model
-    if args.forced_aligner is not None:
-        cfg.models.forced_aligner_path = args.forced_aligner
-    if args.backend is not None:
-        cfg.models.backend = args.backend
-    if args.two_b_mode is not None:
-        cfg.intelligence.two_b_mode = args.two_b_mode
+    # TUI 模式 + 提供了 path 参数 → 使用 AppController 智能识别
+    if use_tui and getattr(args, "path", None) is not None:
+        return _run_tui_with_path(args)
 
-    stages: frozenset[int] = getattr(args, "_resolved_stages")
-
+    # 其他情况（run 模式，或 tui 旧用法）→ 使用 SessionController
     try:
-        run = _build_run(args)
+        params = _args_to_params(args)
+        ctrl = SessionController()
+        ctrl.setup(params)
     except (FileNotFoundError, ValueError) as e:
         print(f"错误: {e}", file=sys.stderr)
         return 1
 
-    try:
-        _validate_prereq_manifest(stages, run.manifest_path)
-    except ValueError as e:
-        print(f"错误: {e}", file=sys.stderr)
-        return 1
+    run = ctrl.run
+    session = ctrl.session
 
     if use_tui:
-        setup_logging_tui(run, verbose=args.verbose)
+        setup_logging_tui(run, verbose=params.verbose)
     else:
-        setup_logging(run, verbose=args.verbose)
-
-    # 将 --stage 映射为 stage_filter
-    stage_str = getattr(args, "stage", None)
-    if stage_str:
-        stage_filter, node_id_filter = PipelineSession.parse_stage_arg(stage_str)
-    else:
-        stage_filter = frozenset({1, 2, 3})
-        node_id_filter = None
-
-    session = PipelineSession(
-        manifest_path=run.manifest_path,
-        config=cfg,
-        stage_filter=stage_filter,
-    )
-    # 注入细粒度节点过滤（1a/1b 等）
-    session._node_id_filter = node_id_filter
-
-    session.register_default_nodes()
+        setup_logging(run, verbose=params.verbose)
 
     # 选择适配器
-    interactive = use_tui or getattr(args, "interactive_2d", False)
+    interactive = use_tui or params.interactive_2d
     if interactive:
-        from autosmartcut.tui_adapter import TUIAdapter
-        adapter = TUIAdapter(session)
+        # TUI 旧用法（--input/--manifest 参数）：用 AppController 包装
+        from autosmartcut.app_controller import AppController, AppState
+        app_ctrl = AppController()
+        app_ctrl._run = run
+        app_ctrl._session = session
+        app_ctrl._cfg = ctrl.cfg
+        app_ctrl._set_state(AppState.READY)
+        app_ctrl._subscribe_to_session()  # 必须订阅，否则 TUI 收不到任何事件
+        from autosmartcut.tui import PipelineApp
         try:
-            asyncio.run(adapter.start_async())
+            asyncio.run(PipelineApp(app_ctrl).run_async())
         except Exception as e:
             logger.exception("TUI 流水线失败: %s", e)
             return 1
@@ -313,6 +403,34 @@ def _run_pipeline(args: argparse.Namespace, *, use_tui: bool = False) -> int:
         except Exception as e:
             logger.exception("流水线失败: %s", e)
             return 1
+
+    return 0
+
+
+def _run_tui_with_path(args: argparse.Namespace) -> int:
+    """TUI 模式 + path 参数：使用 AppController 智能识别输入类型。"""
+    from autosmartcut.app_controller import AppController, AppState
+
+    ctrl = AppController()
+    try:
+        ctrl.open(Path(args.path))
+    except (FileNotFoundError, ValueError) as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 1
+
+    # 如果是媒体文件，session 已构造（READY 状态），可以初始化日志
+    # 如果是清单文件，session 尚未构造（DIAGNOSING 状态），日志在确认后初始化
+    run = ctrl._run  # 可能为 None（DIAGNOSING 状态）
+    verbose = getattr(args, "verbose", False)
+    if run is not None:
+        setup_logging_tui(run, verbose=verbose)
+
+    from autosmartcut.tui import PipelineApp
+    try:
+        asyncio.run(PipelineApp(ctrl).run_async())
+    except Exception as e:
+        logger.exception("TUI 流水线失败: %s", e)
+        return 1
 
     return 0
 
@@ -342,46 +460,46 @@ def _print_progress_report(report: "ProgressReport") -> None:
 
 def _run_resume(args: argparse.Namespace) -> int:
     """resume 子命令主逻辑：推断进度 → 展示 → 确认 → 续跑。"""
-    from autosmartcut.manifest_progress import (
-        ProgressReport,
-        infer_progress,
-        resolve_manifest_path,
-    )
+    from autosmartcut.input_resolver import InputType, resolve_input
 
-    # 1. 解析路径
+    # 1. 解析路径 + 推断进度
     try:
-        mp = resolve_manifest_path(args.path)
-    except FileNotFoundError as e:
+        resolved = resolve_input(Path(args.path))
+    except (FileNotFoundError, ValueError) as e:
         print(f"错误: {e}", file=sys.stderr)
         return 1
 
-    # 2. 加载清单 + 推断进度
-    try:
-        data = load_manifest(mp)
-    except Exception as e:
-        print(f"错误: 无法读取清单: {e}", file=sys.stderr)
+    # resume 只接受清单输入
+    if resolved.input_type == InputType.MEDIA_FILE:
+        print(
+            f"错误: resume 命令需要 timeline_manifest.json 或其父文件夹，"
+            f"不接受媒体文件。\n"
+            f"如需从头开始，请使用: ascut run --input \"{args.path}\" --stage 123",
+            file=sys.stderr,
+        )
         return 1
 
-    report: ProgressReport = infer_progress(data, mp)
+    report = resolved.progress_report
+    mp = resolved.manifest_path
 
-    # 3. 打印进度摘要
+    # 2. 打印进度摘要
     _print_progress_report(report)
 
-    # 4. 全部完成
+    # 3. 全部完成
     if report.all_completed:
         print("\n所有阶段已完成，无需续跑。")
         print(f"如需重跑 L3: ascut run --manifest \"{mp}\" --stage 3")
         return 0
 
-    # 5. 空骨架（无 annotations）
+    # 4. 空骨架（无 annotations）
     if report.suggested_stage is None:
         print("\n清单为空骨架，请使用 ascut run --input <视频> 从头开始。")
         return 1
 
-    # 6. 确定 stage（用户覆盖 > 自动推断）
+    # 5. 确定 stage（用户覆盖 > 自动推断）
     stage = args.stage or report.suggested_stage
 
-    # 7. goal 检查
+    # 6. goal 检查
     goal = args.goal or report.goal
     if report.goal_needed and not goal:
         print(
@@ -391,7 +509,7 @@ def _run_resume(args: argparse.Namespace) -> int:
         print(f"示例: ascut resume \"{args.path}\" --goal \"保留核心内容\"")
         return 1
 
-    # 8. 确认
+    # 7. 确认
     cmd_preview = f"ascut run --manifest \"{mp}\" --stage {stage}"
     if goal:
         cmd_preview += f' --goal "{goal}"'
@@ -409,7 +527,7 @@ def _run_resume(args: argparse.Namespace) -> int:
             print("已取消。")
             return 0
 
-    # 9. 构造等价 run/tui 参数并递归调用 main()
+    # 8. 构造等价 run/tui 参数并递归调用 main()
     run_argv: list[str] = ["tui" if args.tui else "run"]
     run_argv += ["--manifest", str(mp)]
     run_argv += ["--stage", stage]

@@ -217,10 +217,10 @@ if _TEXTUAL_AVAILABLE:
             if dd is None:
                 return
 
-            from autosmartcut.tui_adapter import (
-                _format_decision_list,
-                _format_review_summary,
-                _format_stats,
+            from autosmartcut.formatters import (
+                format_decision_list as _format_decision_list,
+                format_review_summary as _format_review_summary,
+                format_stats as _format_stats,
             )
 
             goal = dd.goal or ""
@@ -445,10 +445,10 @@ def _run_2d_fallback(manifest_dict: dict[str, Any]) -> tuple[dict, Signal]:
 
 def _print_display(dd: DisplayData) -> None:
     """简单模式下打印 DisplayData。"""
-    from autosmartcut.tui_adapter import (
-        _format_decision_list,
-        _format_review_summary,
-        _format_stats,
+    from autosmartcut.formatters import (
+        format_decision_list as _format_decision_list,
+        format_review_summary as _format_review_summary,
+        format_stats as _format_stats,
     )
     print("\n" + "=" * 80)
     print(f"目标: {dd.goal}")

@@ -2,7 +2,7 @@
 
 薄包装 intelligence_2a.run_2a_comprehension()。
 直接操作 ctx.manifest（run_2a_comprehension 就地修改并返回 manifest_dict）。
-若 tokens 不存在，从 annotations_l1a 派生。
+若 tokens 不存在，从 annotations 派生。
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ class L2aNode:
     """L2A：理解子阶段（两轮 LLM + 稀疏纠错 + 稠密回填）。"""
 
     id = "l2a_comprehension"
-    reads = frozenset({"annotations_l1a", "goal"})
+    reads = frozenset({"annotations", "goal"})
     writes = frozenset({"comprehension"})
     phase = 2
     resumable = True
@@ -38,25 +38,25 @@ class L2aNode:
         from autosmartcut.intelligence_2a import run_2a_comprehension
 
         manifest = ctx.manifest
-        annotations_l1a = manifest.get("annotations_l1a", [])
+        annotations = manifest.get("annotations", [])
 
-        if not annotations_l1a:
+        if not annotations:
             return StageResult(
                 status=StageStatus.FAILED,
-                summary="annotations_l1a 为空，无法执行 L2A 理解",
-                error=ValueError("annotations_l1a 为空"),
+                summary="annotations 为空，无法执行 L2A 理解",
+                error=ValueError("annotations 为空"),
             )
 
-        # 确保 tokens 存在（从 annotations_l1a 派生）
+        # 确保 tokens 存在（从 annotations 派生）
         if "tokens" not in manifest:
             try:
-                manifest["tokens"] = tokens_from_annotations(annotations_l1a)
+                manifest["tokens"] = tokens_from_annotations(annotations)
             except Exception as e:
                 logger.warning("[L2aNode] tokens_from_annotations 失败: %s", e)
                 # 手动构建 tokens
                 manifest["tokens"] = [
                     {"index": int(ann.get("index", i)), "text": str(ann.get("content", ""))}
-                    for i, ann in enumerate(annotations_l1a)
+                    for i, ann in enumerate(annotations)
                 ]
 
         ctx.emit(ProgressEvent(node_id=self.id, phase="r1_start", payload={}))

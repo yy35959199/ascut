@@ -72,8 +72,9 @@ def save_manifest(path: Path, data: dict[str, Any], *, atomic: bool = True) -> N
 
 def strip_volatile_fields(data: dict[str, Any]) -> dict[str, Any]:
     """移除不应落盘的运行时字段（就地修改并返回 data）。"""
-    # L1A 分块信息：仅用于 L1B 强制对齐，不需要永久保存
     data.pop("l1a_chunks", None)
+    data.pop("l1_contract", None)
+    data.pop("annotations_l1a", None)
     cur = data.get("current")
     if isinstance(cur, dict):
         cur.pop("tokens", None)
@@ -118,15 +119,15 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def validate_manifest_for_l1b(manifest_path: Path) -> None:
-    """L1B 前置：清单须含 L1A 产物与可续跑的句级文本。"""
+def validate_manifest_l1_text_prereq(manifest_path: Path) -> None:
+    """校验清单具备 L1 文本产物（非空 raw_text 与 annotations），供续跑等场景使用。"""
     data = load_manifest(manifest_path)
     raw = data.get("raw_text")
     if not isinstance(raw, str) or not raw.strip():
-        raise ValueError("L1B 需要 manifest 含非空 raw_text（请先执行 L1A 或 --stage 1）")
+        raise ValueError("需要 manifest 含非空 raw_text（请先执行 --stage 1）")
     anns = data.get("annotations")
     if not isinstance(anns, list) or len(anns) == 0:
-        raise ValueError("L1B 需要非空 annotations[]")
+        raise ValueError("需要非空 annotations[]")
     for i, ann in enumerate(anns):
         if not isinstance(ann, dict):
             raise ValueError(f"annotations[{i}] 须为对象")
@@ -152,7 +153,7 @@ def validate_manifest_for_stages(stages: frozenset[int], data: dict[str, Any]) -
             if ann.get("t_start") is None or ann.get("t_end") is None:
                 raise ValueError(
                     "执行 L3 需要每条 annotation 含 t_start/t_end；"
-                    "若仅有 L1A 文本请先执行 --stage 1b 或完整 --stage 1"
+                    "请先执行完整 --stage 1 以生成带时间轴的 annotations"
                 )
         cur = data.get("current")
         if not isinstance(cur, dict):

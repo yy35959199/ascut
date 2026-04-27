@@ -1,9 +1,9 @@
 """pipeline_session DAG 构建与调度核心单测。
 
 覆盖：
-- DAG 依赖推导正确性（8 节点标准拓扑）
+- DAG 依赖推导正确性（6 节点标准拓扑，L1→L2→L3 线性）
 - 环路检测
-- 并行批次推导（l1b_align 与 l2a_comprehension 在批次 1 中并行）
+- 并行批次推导（多节点同时可调度时 RUN_BATCH）
 - stage_filter / resumable skip
 - REFLOW 重置逻辑
 - parse_stage_arg 映射表
@@ -32,34 +32,26 @@ from autosmartcut.pipeline_session import PipelineSession
 
 
 # ---------------------------------------------------------------------------
-# 辅助：重建标准 8 节点 DAG 拓扑（不依赖真实节点实现，避免 qwen_asr 导入）
+# 辅助：重建标准 7 节点 DAG 拓扑（不依赖真实节点实现，避免 qwen_asr 导入）
 # ---------------------------------------------------------------------------
 
 def _register_standard_dag_stubs(session: PipelineSession) -> None:
-    """用 stub 节点重建标准 8 节点 DAG 拓扑，与真实节点的 reads/writes 完全一致。"""
+    """用 stub 节点重建标准 6 节点 DAG 拓扑，与真实节点的 reads/writes 完全一致。"""
     nodes = [
-        StubNode("l1a_asr",
+        StubNode("l1_perception",
                  reads=frozenset({"source_media"}),
-                 writes=frozenset({"annotations_l1a", "raw_text"}),
+                 writes=frozenset({"annotations", "raw_text"}),
                  phase=1, resumable=False),
-        StubNode("l1b_align",
-                 reads=frozenset({"annotations_l1a", "source_media"}),
-                 writes=frozenset({"annotations"}),
-                 phase=1, resumable=True),
-        StubNode("l3_precompute",
-                 reads=frozenset({"annotations", "source_media"}),
-                 writes=frozenset({"sentence_tile_cache"}),
-                 phase=1, resumable=True),
         StubNode("l2a_comprehension",
-                 reads=frozenset({"annotations_l1a", "goal"}),
+                 reads=frozenset({"annotations", "goal"}),
                  writes=frozenset({"comprehension"}),
                  phase=2, resumable=True),
         StubNode("l2b_decision",
-                 reads=frozenset({"comprehension", "annotations_l1a"}),
+                 reads=frozenset({"comprehension", "annotations"}),
                  writes=frozenset({"keep_mask"}),
                  phase=2, resumable=True),
         StubNode("l2c_review",
-                 reads=frozenset({"keep_mask", "comprehension", "annotations_l1a", "goal"}),
+                 reads=frozenset({"keep_mask", "comprehension", "annotations", "goal"}),
                  writes=frozenset({"review_report"}),
                  phase=2, resumable=True),
         StubNode("l2d_human",
@@ -67,8 +59,7 @@ def _register_standard_dag_stubs(session: PipelineSession) -> None:
                  writes=frozenset({"human_feedback_history", "l2d_completed"}),
                  phase=2, resumable=True),
         StubNode("l3_execute",
-                 reads=frozenset({"annotations", "keep_mask", "source_media",
-                                  "sentence_tile_cache", "l2d_completed"}),
+                 reads=frozenset({"annotations", "keep_mask", "source_media", "l2d_completed"}),
                  writes=frozenset({"output_video"}),
                  phase=3, resumable=True),
     ]
@@ -111,12 +102,12 @@ def _make_session(tmp_path: Path, nodes: list[StubNode] | None = None) -> Pipeli
 
 
 # ---------------------------------------------------------------------------
-# 1. DAG 构建：8 节点标准拓扑
+# 1. DAG 构建：6 节点标准拓扑
 # ---------------------------------------------------------------------------
 
 class TestBuildDag:
-    def test_standard_8_nodes_no_error(self, tmp_path: Path) -> None:
-        """注册标准 8 节点后 _build_dag() 不抛异常。"""
+    def test_standard_6_nodes_no_error(self, tmp_path: Path) -> None:
+        """注册标准 6 节点后 _build_dag() 不抛异常。"""
         session = _make_session(tmp_path)
         _register_standard_dag_stubs(session)
         session._build_dag()  # 不应抛异常
@@ -127,13 +118,6 @@ class TestBuildDag:
         _register_standard_dag_stubs(session)
         session._build_dag()
         assert "l2d_human" in session._dag["l3_execute"]
-
-    def test_l2a_does_not_depend_on_l1b(self, tmp_path: Path) -> None:
-        """l2a_comprehension 不依赖 l1b_align（可并行）。"""
-        session = _make_session(tmp_path)
-        _register_standard_dag_stubs(session)
-        session._build_dag()
-        assert "l1b_align" not in session._dag["l2a_comprehension"]
 
     def test_cyclic_dependency_raises(self, tmp_path: Path) -> None:
         """含环路的节点集合应抛出 CyclicDependencyError。"""
@@ -162,20 +146,18 @@ class TestBuildDag:
 # ---------------------------------------------------------------------------
 
 class TestSchedulable:
-    def test_l1b_and_l2a_parallel_after_l1a(self, tmp_path: Path) -> None:
-        """l1a 完成后，l1b_align 和 l2a_comprehension 应同时可调度。"""
+    def test_l2a_only_schedulable_after_l1(self, tmp_path: Path) -> None:
+        """l1_perception 完成后，仅 l2a_comprehension 可调度（无 L3 预计算并行）。"""
         session = _make_session(tmp_path)
         _register_standard_dag_stubs(session)
         session._build_dag()
 
-        # 模拟 l1a_asr 已完成
-        session._node_states["l1a_asr"].status = "completed"
+        session._node_states["l1_perception"].status = "completed"
 
-        manifest = {"source_media": {}, "annotations_l1a": [], "goal": ""}
+        manifest = {"source_media": {}, "annotations": [], "goal": ""}
         snapshot = session._build_snapshot(manifest)
 
-        assert "l1b_align" in snapshot.schedulable_nodes
-        assert "l2a_comprehension" in snapshot.schedulable_nodes
+        assert snapshot.schedulable_nodes == ["l2a_comprehension"]
 
     def test_nothing_schedulable_when_all_pending_with_deps(self, tmp_path: Path) -> None:
         """所有节点 pending 且有依赖时，只有无依赖节点可调度。"""
@@ -185,8 +167,7 @@ class TestSchedulable:
 
         manifest = {}
         snapshot = session._build_snapshot(manifest)
-        # 只有 l1a_asr 无前置依赖
-        assert snapshot.schedulable_nodes == ["l1a_asr"]
+        assert snapshot.schedulable_nodes == ["l1_perception"]
 
 
 # ---------------------------------------------------------------------------
@@ -198,16 +179,6 @@ class TestStageFilter:
         sf, nf = PipelineSession.parse_stage_arg("123")
         assert sf == frozenset({1, 2, 3})
         assert nf is None
-
-    def test_parse_stage_arg_1a(self) -> None:
-        sf, nf = PipelineSession.parse_stage_arg("1a")
-        assert sf == frozenset({1})
-        assert nf == frozenset({"l1a_asr"})
-
-    def test_parse_stage_arg_1b23(self) -> None:
-        sf, nf = PipelineSession.parse_stage_arg("1b23")
-        assert sf == frozenset({1, 2, 3})
-        assert nf == frozenset({"l1b_align"})
 
     def test_parse_stage_arg_invalid(self) -> None:
         with pytest.raises(ValueError):
@@ -392,17 +363,17 @@ class TestFixedScheduler:
 
     def test_run_batch_for_multiple_schedulable(self) -> None:
         sched = self._make_scheduler()
-        snap = self._make_snapshot(["l1b_align", "l2a_comprehension"])
+        snap = self._make_snapshot(["n2", "n3"])
         action = asyncio.run(sched.next_action(snap))
         assert action.action_type == SchedulerActionType.RUN_BATCH
-        assert set(action.node_ids) == {"l1b_align", "l2a_comprehension"}
+        assert set(action.node_ids) == {"n2", "n3"}
 
     def test_run_node_for_single_schedulable(self) -> None:
         sched = self._make_scheduler()
-        snap = self._make_snapshot(["l1a_asr"])
+        snap = self._make_snapshot(["l1_perception"])
         action = asyncio.run(sched.next_action(snap))
         assert action.action_type == SchedulerActionType.RUN_NODE
-        assert action.node_ids == ["l1a_asr"]
+        assert action.node_ids == ["l1_perception"]
 
     def test_rerun_l2b_on_fix_decision(self) -> None:
         sched = self._make_scheduler()

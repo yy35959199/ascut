@@ -27,7 +27,7 @@ class L3Node:
 
     id = "l3_execute"
     # l2d_completed 确保 l3_execute 在 l2d_human 完成后才调度
-    reads = frozenset({"annotations", "keep_mask", "source_media", "sentence_tile_cache", "l2d_completed"})
+    reads = frozenset({"annotations", "keep_mask", "source_media", "l2d_completed"})
     writes = frozenset({"output_video"})
     phase = 3
     resumable = True
@@ -90,7 +90,7 @@ class L3Node:
             manifest.setdefault("current", {})["keep_mask"] = manifest["keep_mask"]
 
         try:
-            out_path = await asyncio.to_thread(
+            out_path, segment_count = await asyncio.to_thread(
                 run_execution_layer,
                 run,
                 config=self._config,
@@ -110,8 +110,9 @@ class L3Node:
             "compression_ratio": 0.0,
         }))
 
-        # 将输出视频路径写入 manifest
+        # 将输出视频路径与段数写入 manifest
         manifest["output_video"] = str(out_path)
+        manifest["l3_segment_count"] = segment_count
 
         return StageResult(
             status=StageStatus.SUCCESS,
@@ -121,16 +122,7 @@ class L3Node:
     def summarize(self, manifest: dict) -> L3Output:
         output_video = manifest.get("output_video", "")
         duration = float(manifest.get("source_media", {}).get("duration", 0.0))
-        # 尝试从 sidecar 获取 segment_count
-        segment_count = 0
-        sidecar_dir_str = manifest.get("sentence_tile_cache", "")
-        if sidecar_dir_str:
-            try:
-                from autosmartcut.l3_sidecar import load_seam_index
-                index_obj = load_seam_index(Path(sidecar_dir_str)) or {}
-                segment_count = len(index_obj.get("clips", []))
-            except Exception:
-                pass
+        segment_count = int(manifest.get("l3_segment_count", 0))
         return L3Output(
             output_video=output_video,
             segment_count=segment_count,

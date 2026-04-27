@@ -152,7 +152,6 @@ ascut tui [--stage SPEC] [--input VIDEO | --manifest MANIFEST] [选项...]
 | `vad_min_silence_ms` | `80` | Silero `min_silence_duration_ms` |
 | `vad_speech_pad_ms` | `10` | Silero `speech_pad_ms` |
 | `parallel_l1b_l2_enabled` | `true` | L1A 完成后 L1B 与 L2 是否并行（`--stage` 含 `1a*` 且含 `2` 时生效） |
-| `sentence_tile_cache_enabled` | `true` | L3 是否尝试 seam_index + ffmpeg concat 快速成片（失败自动回退 smartcut） |
 
 **CLI 覆盖关系：**
 - `--no-vad-snap` 关闭 `vad_snap_enabled`

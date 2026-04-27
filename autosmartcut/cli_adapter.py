@@ -55,8 +55,8 @@ class CLIAdapter:
 
     def _format_progress(self, event: "PipelineEvent") -> str:
         """将结构化 ProgressEvent 格式化为人类可读文本。"""
-        from autosmartcut.tui_adapter import _format_progress as _fmt
-        return _fmt(event.node_id, event.phase, event.payload)
+        from autosmartcut.formatters import format_progress
+        return format_progress(event.node_id, event.phase, event.payload)
 
     def start_sync(self) -> None:
         """同步启动流水线。内部调用 session.start_sync()。"""

@@ -10,14 +10,13 @@ import logging
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import av
 import bisect
 import numpy as np
 import torch
 from qwen_asr.inference.qwen3_asr import Qwen3ASRModel
-from qwen_asr.inference.qwen3_forced_aligner import Qwen3ForcedAligner
 
 from autosmartcut.config import AppConfig
 from autosmartcut.log import (
@@ -26,12 +25,7 @@ from autosmartcut.log import (
 	log_stage_result,
 	setup_logging_for_manifest,
 )
-from autosmartcut.manifest_io import (
-	load_manifest,
-	save_manifest,
-	touch_layer_status,
-	validate_manifest_for_l1b,
-)
+from autosmartcut.manifest_io import load_manifest, save_manifest, touch_layer_status
 from autosmartcut.pipeline_run import PipelineRun
 
 logger = logging.getLogger(__name__)
@@ -70,7 +64,7 @@ def default_punct_set(sentence_endings: set[str]) -> set[str]:
 
 @dataclass(frozen=True)
 class SentenceSpan:
-	"""纯文本分句结果（L1A/L1B 共用 SSOT）。"""
+	"""纯文本分句结果（L1 分句与对齐共用 SSOT）。"""
 
 	index: int
 	raw_start: int
@@ -612,7 +606,7 @@ def validate_align_items_monotonic(align_items: Sequence[Any]) -> None:
 		prev = e
 
 
-def _annotations_l1a_from_spans(spans: Sequence[SentenceSpan]) -> list[dict[str, Any]]:
+def _sentence_annos_from_spans(spans: Sequence[SentenceSpan]) -> list[dict[str, Any]]:
 	out: list[dict[str, Any]] = []
 	for sp in spans:
 		out.append(
@@ -627,22 +621,6 @@ def _annotations_l1a_from_spans(spans: Sequence[SentenceSpan]) -> list[dict[str,
 			}
 		)
 	return out
-
-
-def build_l1_contract(
-	*,
-	segmentation_mode: str,
-	sentence_endings: Sequence[str],
-	max_chars: int,
-	language: str,
-) -> dict[str, Any]:
-	return {
-		"text_norm_version": "v1",
-		"segmentation_mode": segmentation_mode,
-		"sentence_endings": list(sentence_endings),
-		"max_chars": int(max_chars),
-		"asr_language": language,
-	}
 
 
 def _merge_align_items_with_offset(
@@ -662,96 +640,6 @@ def _merge_align_items_with_offset(
 			)
 		)
 	return out
-
-
-def _forced_align_with_l1a_chunks(
-	aligner: Qwen3ForcedAligner,
-	l1a_chunks: list[dict[str, Any]],
-	audio_arr: np.ndarray,
-	audio_sr: int,
-	language: str,
-) -> list[Any]:
-	"""用 L1A 分块信息做强制对齐（F 方案）。
-
-	L1A 已经把音频按能量低点切成若干块，并对每块独立做了 ASR，得到每块的文字。
-	L1B 直接复用这些分块边界：每块音频配每块自己的 ASR 文字，文字和音频天然对应，
-	不存在字符比例切分导致的错位问题。
-	"""
-	merged: list[Any] = []
-	for chunk in sorted(l1a_chunks, key=lambda c: c["chunk_id"]):
-		chunk_text = str(chunk.get("text", "")).strip()
-		if not chunk_text:
-			# 该块 ASR 结果为空（静音段），跳过，不产生任何对齐 item
-			continue
-		start_sample = int(float(chunk["start_sec"]) * audio_sr)
-		end_sample = int(float(chunk["end_sec"]) * audio_sr)
-		chunk_wav = audio_arr[start_sample:end_sample]
-		offset_sec = float(chunk["start_sec"])
-
-		res = aligner.align(audio=(chunk_wav, audio_sr), text=chunk_text, language=language)
-		merged.extend(_merge_align_items_with_offset(list(res[0]), offset_sec))
-	return merged
-
-
-def _forced_align_chunked(
-	aligner: Qwen3ForcedAligner,
-	raw_text: str,
-	audio_arr: np.ndarray,
-	audio_sr: int,
-	language: str,
-) -> list[Any]:
-	"""长音频按 ``MAX_FORCE_ALIGN_INPUT_SECONDS`` 分块对齐并合并 items（V6）。"""
-	from qwen_asr.inference.utils import MAX_FORCE_ALIGN_INPUT_SECONDS, split_audio_into_chunks
-
-	chunks = split_audio_into_chunks(
-		audio_arr, sr=audio_sr, max_chunk_sec=float(MAX_FORCE_ALIGN_INPUT_SECONDS)
-	)
-	if len(chunks) == 1:
-		res = aligner.align(audio=(audio_arr, audio_sr), text=raw_text, language=language)
-		return list(res[0])
-
-	total_kept = count_kept_chars_in_raw(raw_text)
-	if total_kept == 0:
-		res = aligner.align(audio=(audio_arr, audio_sr), text=raw_text, language=language)
-		return list(res[0])
-
-	# 按 kept 字符比例切分 raw_text，尽量落在标点处
-	kept_ord_to_raw_end: list[int] = []
-	g = 0
-	for i, ch in enumerate(raw_text):
-		if aligner_is_kept_char(ch):
-			g += 1
-			kept_ord_to_raw_end.append(i + 1)
-	n = len(chunks)
-	text_chunks: list[str] = []
-	prev_cut = 0
-	punct = default_punct_set(set())
-	for ci in range(n - 1):
-		target = max(1, min(total_kept - 1, int(round((ci + 1) * total_kept / n))))
-		raw_hi = kept_ord_to_raw_end[target - 1]
-		best = raw_hi
-		for j in range(raw_hi - 1, prev_cut - 1, -1):
-			if j < 0:
-				break
-			if raw_text[j] in punct:
-				best = j + 1
-				break
-		if best <= prev_cut:
-			best = raw_hi
-		text_chunks.append(raw_text[prev_cut:best].strip())
-		prev_cut = best
-	text_chunks.append(raw_text[prev_cut:].strip())
-	if len(text_chunks) != n:
-		raise RuntimeError("内部分句块数与音频块数不一致")
-	for tc in text_chunks:
-		if not tc.strip():
-			raise ValueError("长音频分块后某段文本为空，无法对齐；请缩短单段或调整分句参数")
-
-	merged: list[Any] = []
-	for (cwav, offset_sec), tchunk in zip(chunks, text_chunks):
-		res = aligner.align(audio=(cwav, audio_sr), text=tchunk, language=language)
-		merged.extend(_merge_align_items_with_offset(list(res[0]), offset_sec))
-	return merged
 
 
 def _resolve_perception_params(
@@ -777,76 +665,43 @@ def _resolve_perception_params(
 	return split_pause, silence_thr, max_c, sentence_endings, seg_mode
 
 
-def _build_qwen3_asr_model_asr_only(
-	*,
-	asr_model_path: Path,
-	backend: str,
-	device: str,
-	dtype: torch.dtype,
-	gpu_memory_utilization: float,
-) -> Qwen3ASRModel:
-	# 静默 transformers 内部的 "Setting pad_token_id to eos_token_id" warning，
-	# 该消息在每次 model.generate() 时触发，对用户无意义且会穿透 TUI 渲染。
-	logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
-	asr_path = str(asr_model_path)
-	if backend == "transformers":
-		return Qwen3ASRModel.from_pretrained(
-			pretrained_model_name_or_path=asr_path,
-			forced_aligner=None,
-			dtype=dtype,
-			device_map=device,
-			max_new_tokens=1024,
-		)
-	return Qwen3ASRModel.LLM(
-		model=asr_path,
-		forced_aligner=None,
-		gpu_memory_utilization=gpu_memory_utilization,
-		max_new_tokens=1024,
-	)
-
-
-def _build_forced_aligner_only(
-	*,
-	forced_aligner_path: Path,
-	device: str,
-	dtype: torch.dtype,
-	backend: str = "transformers",
-) -> Qwen3ForcedAligner:
-	# ForcedAligner 是 NAR 模型，qwen-asr 包只提供 from_pretrained 接口，无 vLLM 入口。
-	# Qwen3ASRModel.LLM() 里的 forced_aligner= 参数底层也是 transformers 加载的。
-	# 因此无论 backend 传什么，这里始终走 transformers。
-	if backend == "vllm":
-		logger.warning(
-			"[L1B] ForcedAligner 不支持 vLLM 后端（NAR 模型），自动降级为 transformers。"
-		)
-	return Qwen3ForcedAligner.from_pretrained(
-		str(forced_aligner_path),
-		dtype=dtype,
-		device_map=device,
-	)
-
-
-def run_l1a_asr_only(
+def run_l1_chunked(
 	run: PipelineRun,
 	*,
 	asr_model_path: Path,
+	forced_aligner_path: Path,
 	config: AppConfig | None = None,
 	backend: str = "transformers",
 	device: str = "cuda:0",
 	dtype: str = "float16",
 	language: str = "Chinese",
 	gpu_memory_utilization: float = 0.8,
+	progress_callback: Callable[..., Any] | None = None,
 	split_pause_threshold: float | None = None,
 	silence_threshold: float | None = None,
 	max_chars: int | None = None,
 	segmentation_mode: str | None = None,
+	first_chunk_min_sec: float = 3.0,
+	first_chunk_max_sec: float = 15.0,
+	normal_chunk_target_sec: float = 30.0,
+	silence_snap_radius_sec: float = 5.0,
+	silence_min_duration_sec: float = 0.2,
 ) -> None:
-	"""L1A：ASR 文本定稿，``annotations`` 无时间字段。"""
+	"""L1 合并路径：转码 → VAD → 分块 → 每块 ASR 后立即强制对齐 → 单次分句与时间回填。"""
+	import time as _time
+	from collections import Counter
+
+	from autosmartcut.pipeline_events import ProgressEvent
+	from autosmartcut.progress_utils import SpeedEstimator
+	from autosmartcut.vad_silence import plan_chunks as vad_plan_chunks
+	from autosmartcut.vad_silence import silero_speech_segments
+
 	setup_logging_for_manifest(run.manifest_path, verbose=False)
 	if config is None:
 		from autosmartcut.config import load_config
 
 		config = load_config()
+
 	_, _, max_c, sentence_endings, seg_mode = _resolve_perception_params(
 		config,
 		split_pause_threshold=split_pause_threshold,
@@ -855,169 +710,29 @@ def run_l1a_asr_only(
 		segmentation_mode=segmentation_mode,
 	)
 	if seg_mode != "punctuation":
-		raise ValueError("L1A/L1B 解耦路径暂仅支持 segmentation_mode=punctuation")
+		raise ValueError("当前仅支持 segmentation_mode=punctuation")
 	if not run.video_path.exists():
 		raise FileNotFoundError(f"输入视频不存在: {run.video_path}")
 	if not asr_model_path.exists():
 		raise FileNotFoundError(f"ASR 模型目录不存在: {asr_model_path}")
-
-	torch_dtype = _torch_dtype(dtype)
-	with log_stage(
-		"l1a.load_asr_model",
-		backend=backend,
-		device=device,
-		dtype=dtype,
-		asr_model_path=str(asr_model_path),
-	):
-		model = _build_qwen3_asr_model_asr_only(
-			asr_model_path=asr_model_path,
-			backend=backend,
-			device=device,
-			dtype=torch_dtype,
-			gpu_memory_utilization=gpu_memory_utilization,
+	if not forced_aligner_path.exists():
+		raise FileNotFoundError(f"Forced aligner 目录不存在: {forced_aligner_path}")
+	if backend == "vllm":
+		logger.warning(
+			"ForcedAligner 仅通过 transformers 加载；vLLM 后端下对齐仍走 transformers。"
 		)
 
-	wav_cache = run.output_dir / AUDIO_16K_WAV_NAME
-	with log_stage(
-		"l1a.audio_transcode",
-		video=str(run.video_path),
-		wav_out=str(wav_cache),
-	):
-		extract_audio_16k_wav(run.video_path, wav_cache)
-	audio_arr, audio_sr = read_audio_16k_wav(wav_cache)
-	logger.info(
-		"[L1A] 音频就绪 %.1fs @ %dHz", audio_arr.shape[0] / audio_sr, audio_sr
-	)
-
-	with log_stage(
-		"l1a.asr_transcribe",
-		language=language,
-		audio_samples=int(audio_arr.shape[0]),
-		sample_rate=int(audio_sr),
-	):
-		results = model.transcribe(
-			audio=(audio_arr, audio_sr),
-			language=language,
-			return_time_stamps=False,
-		)
-	if not results:
-		raise RuntimeError("ASR 返回空结果")
-	transcription = results[0]
-	raw_text = str(getattr(transcription, "text", ""))
-	lang_out = str(getattr(transcription, "language", "") or language)
-	duration = duration_seconds(run.video_path)
-
-	spans = segment_raw_text_only(raw_text, sentence_endings, max_c)
-	ann_full = _annotations_l1a_from_spans(spans)
-	light_doc = {
-		"source": str(run.video_path),
-		"language": lang_out,
-		"raw_text": raw_text,
-		"annotations": compact_annotations(ann_full),
-	}
-	contract = build_l1_contract(
-		segmentation_mode=seg_mode,
-		sentence_endings=sorted(sentence_endings),
-		max_chars=max_c,
-		language=language,
-	)
-
-	data = load_manifest(run.manifest_path)
-	data["source"] = light_doc["source"]
-	data["language"] = light_doc["language"]
-	data["raw_text"] = light_doc["raw_text"]
-	data["annotations"] = light_doc["annotations"]
-	data["l1_contract"] = contract
-	sm = data.setdefault("source_media", {})
-	if isinstance(sm, dict):
-		sm["path"] = light_doc["source"]
-		sm["duration"] = float(duration)
-		sm["audio_16k_path"] = AUDIO_16K_WAV_NAME
-	with log_stage("l1a.persist_manifest", manifest=str(run.manifest_path)):
-		touch_layer_status(data, "l1a")
-		save_manifest(run.manifest_path, data, atomic=True)
-
-	log_stage_result(
-		"l1a.output",
-		summary=f"annotations={len(light_doc['annotations'])} manifest={run.manifest_path}",
-	)
-	logger.info("[L1A] 完成 annotations=%d → %s", len(light_doc["annotations"]), run.manifest_path)
-
-
-def run_l1a_asr_chunked(
-	run: PipelineRun,
-	*,
-	asr_model_path: Path,
-	config: AppConfig | None = None,
-	backend: str = "transformers",
-	device: str = "cuda:0",
-	dtype: str = "float16",
-	language: str = "Chinese",
-	gpu_memory_utilization: float = 0.8,
-	progress_callback: "Callable[[Any], None] | None" = None,
-	# 切块参数
-	first_chunk_min_sec: float = 3.0,
-	first_chunk_max_sec: float = 15.0,
-	normal_chunk_target_sec: float = 30.0,
-	silence_snap_radius_sec: float = 5.0,
-	silence_min_duration_sec: float = 0.2,
-) -> None:
-	"""L1A 渐进式 ASR：转码 → VAD → 分块 → 逐块推理，每块完成后通过 progress_callback 发布进度事件。
-
-	与 run_l1a_asr_only 产出相同的 manifest 字段（annotations、raw_text、tokens），
-	但在推理过程中持续发布结构化 ProgressEvent，供 TUI/CLI 展示实时进度。
-
-	Args:
-		run: PipelineRun 元信息
-		asr_model_path: ASR 模型目录
-		config: AppConfig（None 时自动加载）
-		backend: "transformers" 或 "vllm"
-		device: CUDA 设备
-		dtype: 模型精度
-		language: 语言
-		gpu_memory_utilization: vLLM GPU 显存占比
-		progress_callback: 每个阶段事件的回调，接收 ProgressEvent；None 时静默运行
-		first_chunk_min_sec: 第一块最短时长
-		first_chunk_max_sec: 第一块最长时长
-		normal_chunk_target_sec: 后续块目标时长
-		silence_snap_radius_sec: 静音吸附搜索半径
-		silence_min_duration_sec: 有效静音间隔最小时长
-	"""
-	import time as _time
-	from typing import Callable
-	from autosmartcut.pipeline_events import ProgressEvent
-	from autosmartcut.progress_utils import SpeedEstimator
-	from autosmartcut.vad_silence import plan_chunks, silero_speech_segments
-
-	setup_logging_for_manifest(run.manifest_path, verbose=False)
-	if config is None:
-		from autosmartcut.config import load_config
-		config = load_config()
-
-	_, _, max_c, sentence_endings, seg_mode = _resolve_perception_params(
-		config,
-		split_pause_threshold=None,
-		silence_threshold=None,
-		max_chars=None,
-		segmentation_mode=None,
-	)
-	if seg_mode != "punctuation":
-		raise ValueError("L1A/L1B 解耦路径暂仅支持 segmentation_mode=punctuation")
-	if not run.video_path.exists():
-		raise FileNotFoundError(f"输入视频不存在: {run.video_path}")
-	if not asr_model_path.exists():
-		raise FileNotFoundError(f"ASR 模型目录不存在: {asr_model_path}")
+	_NODE = "l1_perception"
 
 	def _emit(phase: str, payload: dict) -> None:
 		if progress_callback is not None:
 			try:
-				progress_callback(ProgressEvent(node_id="l1a_asr", phase=phase, payload=payload))
+				progress_callback(ProgressEvent(node_id=_NODE, phase=phase, payload=payload))
 			except Exception as _e:
-				logger.warning("[L1A] progress_callback 异常（忽略）: %s", _e)
+				logger.warning("[L1] progress_callback 异常（忽略）: %s", _e)
 
 	estimator = SpeedEstimator()
 
-	# ── Step 0: 音频转码 ────────────────────────────────────────────────────
 	_emit("transcode_start", {})
 	t0 = _time.monotonic()
 	wav_cache = run.output_dir / AUDIO_16K_WAV_NAME
@@ -1027,9 +742,8 @@ def run_l1a_asr_chunked(
 
 	audio_arr, audio_sr = read_audio_16k_wav(wav_cache)
 	total_audio_sec = audio_arr.shape[0] / audio_sr
-	logger.info("[L1A] 音频就绪 %.1fs @ %dHz", total_audio_sec, audio_sr)
+	logger.info("[L1] 音频就绪 %.1fs @ %dHz", total_audio_sec, audio_sr)
 
-	# ── Step 1: VAD ─────────────────────────────────────────────────────────
 	_emit("vad_start", {})
 	t1 = _time.monotonic()
 	speech_segs = silero_speech_segments(
@@ -1042,9 +756,8 @@ def run_l1a_asr_chunked(
 	vad_sec = _time.monotonic() - t1
 	_emit("vad_done", {"elapsed_sec": vad_sec, "speech_segment_count": len(speech_segs)})
 
-	# ── Step 2: 切块规划 ─────────────────────────────────────────────────────
 	t2 = _time.monotonic()
-	chunk_plan = plan_chunks(
+	chunk_plan = vad_plan_chunks(
 		speech_segs,
 		total_audio_sec,
 		first_chunk_min_sec=first_chunk_min_sec,
@@ -1054,28 +767,31 @@ def run_l1a_asr_chunked(
 		silence_min_duration_sec=silence_min_duration_sec,
 	)
 	if not chunk_plan:
-		# 极端情况：plan_chunks 返回空（total_duration <= 0），退化为整条推理
 		chunk_plan = [{"start_sec": 0.0, "end_sec": total_audio_sec, "chunk_id": 0}]
 	plan_sec = _time.monotonic() - t2
 	_emit("plan_done", {"total_chunks": len(chunk_plan), "total_audio_sec": total_audio_sec})
 
-	# ── Step 3: 加载 ASR 模型 ────────────────────────────────────────────────
 	torch_dtype = _torch_dtype(dtype)
-	with log_stage("l1a.load_asr_model", backend=backend, device=device, dtype=dtype):
-		model = _build_qwen3_asr_model_asr_only(
+	with log_stage("l1.load_model", backend=backend, device=device, dtype=dtype):
+		model = _build_qwen3_asr_model(
 			asr_model_path=asr_model_path,
+			forced_aligner_path=forced_aligner_path,
 			backend=backend,
 			device=device,
 			dtype=torch_dtype,
 			gpu_memory_utilization=gpu_memory_utilization,
 		)
+	aligner = getattr(model, "forced_aligner", None)
+	if aligner is None:
+		raise RuntimeError("ASR 模型未挂载 forced_aligner，无法执行逐块对齐")
 
-	# ── Step 4: 逐块 ASR ─────────────────────────────────────────────────────
+	align_items: list[Any] = []
 	chunk_texts: list[str] = []
 	chunk_langs: list[str] = []
-	chunk_timings: list[dict] = []
+	chunk_timings: list[dict[str, Any]] = []
 	completed_audio_sec = 0.0
-	asr_total_start = _time.monotonic()
+	asr_only_sum = 0.0
+	align_total_sec = 0.0
 
 	for chunk in chunk_plan:
 		chunk_id = int(chunk["chunk_id"])
@@ -1083,6 +799,7 @@ def run_l1a_asr_chunked(
 		end_sample = int(chunk["end_sec"] * audio_sr)
 		chunk_wav = audio_arr[start_sample:end_sample]
 		chunk_audio_sec = float(chunk["end_sec"] - chunk["start_sec"])
+		offset_sec = float(chunk["start_sec"])
 
 		_emit("asr_chunk_start", {
 			"chunk_id": chunk_id,
@@ -1092,16 +809,18 @@ def run_l1a_asr_chunked(
 			"completed_audio_sec": completed_audio_sec,
 		})
 
-		t_chunk = _time.monotonic()
+		t_asr = _time.monotonic()
 		results = model.transcribe(
 			audio=(chunk_wav, audio_sr),
 			language=language,
 			return_time_stamps=False,
 		)
-		chunk_elapsed = _time.monotonic() - t_chunk
+		asr_elapsed = _time.monotonic() - t_asr
+		asr_only_sum += asr_elapsed
 
+		align_elapsed = 0.0
 		if not results:
-			logger.warning("[L1A] 块 %d 返回空结果，跳过", chunk_id)
+			logger.warning("[L1] 块 %d ASR 返回空结果，跳过", chunk_id)
 			chunk_texts.append("")
 			chunk_langs.append(language)
 		else:
@@ -1110,13 +829,26 @@ def run_l1a_asr_chunked(
 			chunk_lang = str(getattr(transcription, "language", "") or language)
 			chunk_texts.append(chunk_text)
 			chunk_langs.append(chunk_lang)
+			ct = chunk_text.strip()
+			if ct:
+				t_al = _time.monotonic()
+				res = aligner.align(
+					audio=(chunk_wav, audio_sr),
+					text=chunk_text,
+					language=language,
+				)
+				align_elapsed = _time.monotonic() - t_al
+				align_total_sec += align_elapsed
+				merged = _merge_align_items_with_offset(list(res[0]), offset_sec)
+				align_items.extend(merged)
 
-		estimator.record(chunk_id, chunk_audio_sec, chunk_elapsed)
+		estimator.record(chunk_id, chunk_audio_sec, asr_elapsed)
 		completed_audio_sec += chunk_audio_sec
 		chunk_timings.append({
 			"chunk_id": chunk_id,
 			"audio_sec": chunk_audio_sec,
-			"elapsed_sec": chunk_elapsed,
+			"asr_sec": asr_elapsed,
+			"align_sec": align_elapsed,
 		})
 
 		text_preview = (chunk_texts[-1][:50] + "…") if len(chunk_texts[-1]) > 53 else chunk_texts[-1]
@@ -1124,7 +856,8 @@ def run_l1a_asr_chunked(
 			"chunk_id": chunk_id,
 			"total_chunks": len(chunk_plan),
 			"chunk_audio_sec": chunk_audio_sec,
-			"chunk_elapsed_sec": chunk_elapsed,
+			"chunk_elapsed_sec": asr_elapsed,
+			"align_elapsed_sec": align_elapsed,
 			"completed_audio_sec": completed_audio_sec,
 			"total_audio_sec": total_audio_sec,
 			"estimated_speed": estimator.speed,
@@ -1132,184 +865,21 @@ def run_l1a_asr_chunked(
 			"text_full": chunk_texts[-1],
 		})
 
-	asr_total_sec = _time.monotonic() - asr_total_start
-
-	# ── Step 5: 后处理 ───────────────────────────────────────────────────────
 	t5 = _time.monotonic()
 	raw_text = "".join(chunk_texts)
-	# 语言取最常见的
-	from collections import Counter
 	lang_out = Counter(chunk_langs).most_common(1)[0][0] if chunk_langs else language
 	duration = duration_seconds(run.video_path)
 
 	spans = segment_raw_text_only(raw_text, sentence_endings, max_c)
-	ann_full = _annotations_l1a_from_spans(spans)
-	postprocess_sec = _time.monotonic() - t5
-
-	_emit("postprocess_done", {
-		"elapsed_sec": postprocess_sec,
-		"sentence_count": len(ann_full),
-		"raw_text_length": len(raw_text),
-	})
-
-	# ── Step 6: 写 manifest ──────────────────────────────────────────────────
-	light_doc = {
-		"source": str(run.video_path),
-		"language": lang_out,
-		"raw_text": raw_text,
-		"annotations": compact_annotations(ann_full),
-	}
-	contract = build_l1_contract(
-		segmentation_mode=seg_mode,
-		sentence_endings=sorted(sentence_endings),
-		max_chars=max_c,
-		language=language,
-	)
-
-	data = load_manifest(run.manifest_path)
-	data["source"] = light_doc["source"]
-	data["language"] = light_doc["language"]
-	data["raw_text"] = light_doc["raw_text"]
-	data["annotations"] = light_doc["annotations"]
-	data["l1_contract"] = contract
-	sm = data.setdefault("source_media", {})
-	if isinstance(sm, dict):
-		sm["path"] = light_doc["source"]
-		sm["duration"] = float(duration)
-		sm["audio_16k_path"] = AUDIO_16K_WAV_NAME
-	# 写入 L1A 分块信息，供 L1B 强制对齐时直接使用，避免 L1B 自行按字符比例切分
-	# 导致文字块与音频块错位。strip_volatile_fields 会在最终落盘前删除此字段。
-	data["l1a_chunks"] = [
-		{
-			"chunk_id": chunk["chunk_id"],
-			"start_sec": float(chunk["start_sec"]),
-			"end_sec": float(chunk["end_sec"]),
-			"text": chunk_texts[chunk["chunk_id"]],
-		}
-		for chunk in chunk_plan
-	]
-	with log_stage("l1a.persist_manifest", manifest=str(run.manifest_path)):
-		touch_layer_status(data, "l1a")
-		save_manifest(run.manifest_path, data, atomic=True)
-
-	# ── 耗时报告 ─────────────────────────────────────────────────────────────
-	total_sec = transcode_sec + vad_sec + plan_sec + asr_total_sec + postprocess_sec
-	logger.info(
-		"[L1A] 耗时报告: 转码=%.2fs VAD=%.2fs 规划=%.3fs ASR=%.2fs 后处理=%.3fs 总计=%.2fs",
-		transcode_sec, vad_sec, plan_sec, asr_total_sec, postprocess_sec, total_sec,
-	)
-	timing_parts = " ".join(
-		f"{{chunk_id={t['chunk_id']}: audio={t['audio_sec']:.1f}s elapsed={t['elapsed_sec']:.1f}s "
-		f"speed={t['audio_sec']/t['elapsed_sec']:.2f}x}}"
-		for t in chunk_timings
-	)
-	logger.info("[L1A] 各块耗时: %s", timing_parts)
-	logger.info("[L1A] 完成 annotations=%d → %s", len(light_doc["annotations"]), run.manifest_path)
-
-
-def compute_l1b_aligned_annotations(
-	run: PipelineRun,
-	manifest_data: dict[str, Any],
-	*,
-	forced_aligner_path: Path,
-	config: AppConfig,
-	backend: str = "transformers",
-	device: str = "cuda:0",
-	dtype: str = "float16",
-	language: str | None = None,
-	gpu_memory_utilization: float = 0.8,
-	split_pause_threshold: float | None = None,
-	silence_threshold: float | None = None,
-	max_chars: int | None = None,
-	segmentation_mode: str | None = None,
-) -> list[dict[str, Any]]:
-	"""纯计算：强制对齐并回填时间轴；不写盘。返回 ``compact_annotations`` 后的列表。"""
-	raw_text = str(manifest_data.get("raw_text", ""))
-	annotations = manifest_data.get("annotations")
-	if not isinstance(annotations, list) or not annotations:
-		raise ValueError("L1B 需要非空 annotations[]")
-
-	_split_pause, _silence_thr, max_c, sentence_endings, seg_mode = _resolve_perception_params(
-		config,
-		split_pause_threshold=split_pause_threshold,
-		silence_threshold=silence_threshold,
-		max_chars=max_chars,
-		segmentation_mode=segmentation_mode,
-	)
-	contract = manifest_data.get("l1_contract")
-	if isinstance(contract, dict):
-		mc = contract.get("max_chars")
-		if mc is not None and int(mc) != int(max_c):
-			raise ValueError("manifest l1_contract.max_chars 与当前配置不一致，拒绝 L1B")
-		se = contract.get("sentence_endings")
-		if isinstance(se, list):
-			if set(str(x) for x in se) != set(str(x) for x in sentence_endings):
-				raise ValueError("manifest l1_contract.sentence_endings 与当前配置不一致，拒绝 L1B")
-		sm = contract.get("segmentation_mode")
-		if sm is not None and str(sm) != seg_mode:
-			raise ValueError("manifest l1_contract.segmentation_mode 与当前配置不一致，拒绝 L1B")
-		if language is None and contract.get("asr_language"):
-			language = str(contract["asr_language"])
-	if language is None:
-		language = str(manifest_data.get("language") or "Chinese")
-
-	if seg_mode != "punctuation":
-		raise ValueError("L1A/L1B 解耦路径暂仅支持 segmentation_mode=punctuation")
-	if not forced_aligner_path.exists():
-		raise FileNotFoundError(f"Forced aligner 目录不存在: {forced_aligner_path}")
-
-	spans = segment_raw_text_only(raw_text, sentence_endings, max_c)
-	ann_work = copy.deepcopy(annotations)
+	ann_work = _sentence_annos_from_spans(spans)
 	validate_index_text_against_spans(ann_work, spans)
 
-	wav_path = run.output_dir / AUDIO_16K_WAV_NAME
-	if not wav_path.is_file():
-		raise FileNotFoundError(f"L1B 需要 L1A 产出的缓存音轨: {wav_path}")
-	audio_arr, audio_sr = read_audio_16k_wav(wav_path)
-
-	torch_dtype = _torch_dtype(dtype)
-	with log_stage(
-		"l1b.load_aligner",
-		backend=backend,
-		device=device,
-		forced_aligner_path=str(forced_aligner_path),
-	):
-		aligner = _build_forced_aligner_only(
-			forced_aligner_path=forced_aligner_path,
-			device=device,
-			dtype=torch_dtype,
-			backend=backend,
-		)
-
-	with log_stage("l1b.forced_align", language=language):
-		l1a_chunks = manifest_data.get("l1a_chunks")
-		if isinstance(l1a_chunks, list) and l1a_chunks:
-			# F 方案：直接用 L1A 的分块信息，文字和音频块天然对应，不再按字符比例切分
-			logger.info("[L1B] 使用 L1A 分块信息对齐（%d 块）", len(l1a_chunks))
-			align_items = _forced_align_with_l1a_chunks(
-				aligner, l1a_chunks, audio_arr, audio_sr, language
-			)
-		else:
-			# 兜底：无分块信息时退回原有逻辑（单独跑 L1B 的场景）
-			logger.info("[L1B] 无 L1A 分块信息，使用字符比例切分对齐")
-			align_items = _forced_align_chunked(
-				aligner, raw_text, audio_arr, audio_sr, language
-			)
 	validate_alignment_kept_match(raw_text, align_items)
 	validate_align_items_monotonic(align_items)
 
 	timings = assign_times_to_spans(spans, align_items)
 	if len(timings) != len(ann_work):
 		raise ValueError("句级时间条数与 annotations 不一致")
-
-	video_path = Path(str(manifest_data.get("source") or run.video_path))
-	if not video_path.is_file():
-		sm = manifest_data.get("source_media")
-		if isinstance(sm, dict) and sm.get("path"):
-			vp = Path(str(sm["path"]))
-			if vp.is_file():
-				video_path = vp
-	duration = duration_seconds(video_path) if video_path.is_file() else 0.0
 
 	for ann, tm in zip(ann_work, timings):
 		if int(ann.get("index", -1)) != tm.index:
@@ -1333,60 +903,58 @@ def compute_l1b_aligned_annotations(
 		else:
 			ann["gap_after"] = 0.0
 
-	return compact_annotations(ann_work)
+	postprocess_sec = _time.monotonic() - t5
+	_emit("postprocess_done", {
+		"elapsed_sec": postprocess_sec,
+		"sentence_count": len(ann_work),
+		"raw_text_length": len(raw_text),
+	})
 
-
-def run_l1b_align_only(
-	run: PipelineRun,
-	*,
-	forced_aligner_path: Path,
-	config: AppConfig | None = None,
-	backend: str = "transformers",
-	device: str = "cuda:0",
-	dtype: str = "float16",
-	language: str | None = None,
-	gpu_memory_utilization: float = 0.8,
-	split_pause_threshold: float | None = None,
-	silence_threshold: float | None = None,
-	max_chars: int | None = None,
-	segmentation_mode: str | None = None,
-) -> None:
-	"""L1B：仅强制对齐，回填 ``t_start``/``t_end``/``gap_after``，不改 index/content。"""
-	setup_logging_for_manifest(run.manifest_path, verbose=False)
-	if config is None:
-		from autosmartcut.config import load_config
-
-		config = load_config()
-	validate_manifest_for_l1b(run.manifest_path)
+	light_doc = {
+		"source": str(run.video_path),
+		"language": lang_out,
+		"raw_text": raw_text,
+		"annotations": compact_annotations(ann_work),
+	}
 	data = load_manifest(run.manifest_path)
-
-	aligned = compute_l1b_aligned_annotations(
-		run,
-		data,
-		forced_aligner_path=forced_aligner_path,
-		config=config,
-		backend=backend,
-		device=device,
-		dtype=dtype,
-		language=language,
-		gpu_memory_utilization=gpu_memory_utilization,
-		split_pause_threshold=split_pause_threshold,
-		silence_threshold=silence_threshold,
-		max_chars=max_chars,
-		segmentation_mode=segmentation_mode,
-	)
-
-	data["annotations"] = aligned
-	with log_stage("l1b.persist_manifest", manifest=str(run.manifest_path)):
+	data["source"] = light_doc["source"]
+	data["language"] = light_doc["language"]
+	data["raw_text"] = light_doc["raw_text"]
+	data["annotations"] = light_doc["annotations"]
+	sm = data.setdefault("source_media", {})
+	if isinstance(sm, dict):
+		sm["path"] = light_doc["source"]
+		sm["duration"] = float(duration)
+		sm["audio_16k_path"] = AUDIO_16K_WAV_NAME
+	with log_stage("l1.persist_manifest", manifest=str(run.manifest_path)):
+		touch_layer_status(data, "l1a")
 		touch_layer_status(data, "l1b")
 		touch_layer_status(data, "l1")
 		save_manifest(run.manifest_path, data, atomic=True)
 
-	log_stage_result(
-		"l1b.output",
-		summary=f"annotations={len(data['annotations'])} manifest={run.manifest_path}",
+	total_sec = (
+		transcode_sec + vad_sec + plan_sec + asr_only_sum + align_total_sec + postprocess_sec
 	)
-	logger.info("[L1B] 完成 → %s", run.manifest_path)
+	logger.info(
+		"[L1] 耗时报告: 转码=%.2fs VAD=%.2fs 规划=%.3fs ASR=%.2fs 对齐=%.2fs 后处理=%.3fs 总计=%.2fs",
+		transcode_sec, vad_sec, plan_sec, asr_only_sum, align_total_sec, postprocess_sec, total_sec,
+	)
+	timing_parts = " ".join(
+		(
+			f"{{chunk_id={t['chunk_id']}: audio={t['audio_sec']:.1f}s "
+			f"asr={t['asr_sec']:.1f}s align={t['align_sec']:.1f}s "
+			f"speed={t['audio_sec']/t['asr_sec']:.2f}x}}"
+		)
+		if t["asr_sec"] > 0
+		else f"{{chunk_id={t['chunk_id']}: audio={t['audio_sec']:.1f}s asr=0s align={t['align_sec']:.1f}s}}"
+		for t in chunk_timings
+	)
+	logger.info("[L1] 各块耗时: %s", timing_parts)
+	logger.info(
+		"[L1] 完成 annotations=%d → %s",
+		len(light_doc["annotations"]),
+		run.manifest_path,
+	)
 
 
 def plan_chunks(
@@ -1474,16 +1042,16 @@ def run_perception_layer(
 	max_chars: int | None = None,
 	segmentation_mode: str | None = None,
 ) -> None:
-	"""L1 端到端：``run_l1a_asr_only`` + ``run_l1b_align_only``，写入完整句级时间轴。
+	"""L1 端到端：``run_l1_chunked``，写入完整句级时间轴。
 
-	``include_char_timestamps`` 保留为兼容参数；L1A/L1B 路径下不落盘字级时间戳。
+	``include_char_timestamps`` 保留为兼容参数；当前路径不落盘字级时间戳。
 	"""
 	_ = include_char_timestamps
 	if config is None:
 		from autosmartcut.config import load_config
 
 		config = load_config()
-	_, _, max_c, _, seg_mode = _resolve_perception_params(
+	_, _, _max_c, _, seg_mode = _resolve_perception_params(
 		config,
 		split_pause_threshold=split_pause_threshold,
 		silence_threshold=silence_threshold,
@@ -1497,22 +1065,9 @@ def run_perception_layer(
 	if not forced_aligner_path.exists():
 		raise FileNotFoundError(f"Forced aligner 目录不存在: {forced_aligner_path}")
 
-	run_l1a_asr_only(
+	run_l1_chunked(
 		run,
 		asr_model_path=asr_model_path,
-		config=config,
-		backend=backend,
-		device=device,
-		dtype=dtype,
-		language=language,
-		gpu_memory_utilization=gpu_memory_utilization,
-		split_pause_threshold=split_pause_threshold,
-		silence_threshold=silence_threshold,
-		max_chars=max_chars,
-		segmentation_mode=segmentation_mode,
-	)
-	run_l1b_align_only(
-		run,
 		forced_aligner_path=forced_aligner_path,
 		config=config,
 		backend=backend,
@@ -1520,6 +1075,7 @@ def run_perception_layer(
 		dtype=dtype,
 		language=language,
 		gpu_memory_utilization=gpu_memory_utilization,
+		progress_callback=None,
 		split_pause_threshold=split_pause_threshold,
 		silence_threshold=silence_threshold,
 		max_chars=max_chars,

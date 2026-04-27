@@ -173,25 +173,12 @@ class SchedulerAction:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class L1aOutput:
-    """L1aNode 完成摘要。"""
+class L1Output:
+    """L1Node 完成摘要（识别 + 对齐）。"""
     annotation_count: int
+    aligned_count: int
     raw_text_length: int
     duration_seconds: float
-
-
-@dataclass
-class L1bOutput:
-    """L1bNode 完成摘要。"""
-    annotation_count: int
-    aligned_count: int  # t_start/t_end 非 None 的条数
-
-
-@dataclass
-class L3PrecomputeOutput:
-    """L3PrecomputeNode 完成摘要。"""
-    clip_count: int
-    sidecar_dir: str
 
 
 @dataclass
@@ -238,9 +225,7 @@ class L3Output:
 
 # 联合类型
 StageOutput = Union[
-    L1aOutput,
-    L1bOutput,
-    L3PrecomputeOutput,
+    L1Output,
     L2aOutput,
     L2bOutput,
     L2cOutput,

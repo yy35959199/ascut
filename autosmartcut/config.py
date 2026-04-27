@@ -39,8 +39,6 @@ class ExecutionConfig:
 	vad_speech_pad_ms: int = 10
 	# L1A 完成后 L1B 与 L2 是否并行（--stage 含 1a* 且含 2；可用 CLI 关闭）
 	parallel_l1b_l2_enabled: bool = True
-	# L3 是否尝试 seam_index + ffmpeg concat 快速成片（失败自动回退 smartcut）
-	sentence_tile_cache_enabled: bool = True
 
 
 @dataclass
@@ -126,12 +124,6 @@ def load_config(path: Path | None = None) -> AppConfig:
 			execution.get(
 				"parallel_l1b_l2_enabled",
 				config.execution.parallel_l1b_l2_enabled,
-			)
-		),
-		sentence_tile_cache_enabled=bool(
-			execution.get(
-				"sentence_tile_cache_enabled",
-				config.execution.sentence_tile_cache_enabled,
 			)
 		),
 	)

@@ -1,10 +1,6 @@
-"""L1aNode — ASR 转录节点（渐进式分块推理）。
+"""L1Node — 识别层（分块 ASR + 逐块强制对齐 + 单次分句与时间回填）。
 
-薄包装 perception.run_l1a_asr_chunked()。
-- 转码 → VAD → 切块 → 逐块 ASR，每块完成后发布结构化 ProgressEvent
-- 并发运行 progress_ticker 协程，每秒插值伪进度（块内平滑）
-- 完成后将 manifest["annotations"] 复制到 manifest["annotations_l1a"]
-  并从 annotations_l1a 派生 manifest["tokens"]
+薄包装 perception.run_l1_chunked()。
 """
 from __future__ import annotations
 
@@ -18,9 +14,9 @@ from typing import TYPE_CHECKING, Any
 from autosmartcut.annotation_tokens import tokens_from_annotations
 from autosmartcut.manifest_io import load_manifest, save_manifest
 from autosmartcut.pipeline_events import ProgressEvent
-from autosmartcut.pipeline_models import L1aOutput, StageResult, StageStatus
+from autosmartcut.pipeline_models import L1Output, StageResult, StageStatus
 from autosmartcut.pipeline_run import PipelineRun
-from autosmartcut.progress_utils import SpeedEstimator, format_duration
+from autosmartcut.progress_utils import SpeedEstimator
 
 if TYPE_CHECKING:
     from autosmartcut.config import AppConfig
@@ -29,21 +25,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class L1aNode:
-    """L1A：ASR 文本定稿节点（渐进式分块推理）。"""
+class L1Node:
+    """L1：ASR + 强制对齐，产出带时间戳的 annotations。"""
 
-    id = "l1a_asr"
+    id = "l1_perception"
     reads = frozenset({"source_media"})
-    writes = frozenset({"annotations_l1a", "raw_text"})
+    writes = frozenset({"annotations", "raw_text"})
     phase = 1
-    resumable = False  # ASR 结果不稳定，始终重跑
+    resumable = False
 
     def __init__(self, config: "AppConfig") -> None:
         self._config = config
 
     async def run(self, ctx: "StageContext") -> StageResult:
-        """渐进式 ASR：转码 → VAD → 切块 → 逐块推理，并发运行伪进度 ticker。"""
-        from autosmartcut.perception import run_l1a_asr_chunked
+        from autosmartcut.perception import run_l1_chunked
 
         manifest = ctx.manifest
         params = ctx.params
@@ -87,11 +82,9 @@ class L1aNode:
             video_path=video_path,
         )
 
-        # ── 共享状态（工作线程写，ticker 协程读）────────────────────────────
-        # 只存简单标量，依赖 CPython GIL 保证原子性
         state: dict[str, Any] = {
             "done": False,
-            "phase": "idle",          # "idle" | "chunk_0" | "asr_running"
+            "phase": "idle",
             "chunk_id": 0,
             "total_chunks": 0,
             "chunk_start_time": 0.0,
@@ -103,7 +96,6 @@ class L1aNode:
         estimator = SpeedEstimator()
 
         def on_progress(event: ProgressEvent) -> None:
-            """工作线程回调：更新共享状态 + 转发事件到 EventBus。"""
             ctx.emit(event)
             p = event.payload
             phase = event.phase
@@ -130,7 +122,6 @@ class L1aNode:
                 state["phase"] = "idle"
 
         async def progress_ticker() -> None:
-            """每秒 tick，发布块内伪进度事件。"""
             while not state["done"]:
                 await asyncio.sleep(1.0)
                 if state["done"]:
@@ -166,22 +157,22 @@ class L1aNode:
                         },
                     ))
 
-        # ── 启动 ticker，运行工作线程 ────────────────────────────────────────
         ticker_task = asyncio.create_task(progress_ticker())
         try:
             await asyncio.to_thread(
-                run_l1a_asr_chunked,
+                run_l1_chunked,
                 run,
                 asr_model_path=self._config.models.asr_model_path,
+                forced_aligner_path=self._config.models.forced_aligner_path,
                 config=self._config,
                 backend=self._config.models.backend,
                 progress_callback=on_progress,
             )
         except Exception as e:
-            logger.exception("[L1aNode] run_l1a_asr_chunked 失败: %s", e)
+            logger.exception("[L1Node] run_l1_chunked 失败: %s", e)
             return StageResult(
                 status=StageStatus.FAILED,
-                summary=f"L1A ASR 失败: {e}",
+                summary=f"L1 失败: {e}",
                 error=e,
             )
         finally:
@@ -192,22 +183,20 @@ class L1aNode:
             except asyncio.CancelledError:
                 pass
 
-        # ── 重新加载 manifest，派生 annotations_l1a 和 tokens ────────────────
         updated = load_manifest(manifest_path)
         manifest.update(updated)
-        manifest["annotations_l1a"] = list(updated.get("annotations", []))
-
+        anns = manifest.get("annotations", [])
         try:
-            manifest["tokens"] = tokens_from_annotations(manifest["annotations_l1a"])
+            manifest["tokens"] = tokens_from_annotations(anns)
         except Exception as e:
-            logger.warning("[L1aNode] tokens_from_annotations 失败: %s，跳过", e)
+            logger.warning("[L1Node] tokens_from_annotations 失败: %s，跳过", e)
 
         try:
             save_manifest(manifest_path, manifest, atomic=True)
         except Exception as e:
-            logger.warning("[L1aNode] 保存 annotations_l1a/tokens 到磁盘失败: %s", e)
+            logger.warning("[L1Node] 保存 tokens 到磁盘失败: %s", e)
 
-        ann_count = len(manifest["annotations_l1a"])
+        ann_count = len(anns)
         raw_text_len = len(manifest.get("raw_text", ""))
 
         return StageResult(
@@ -215,10 +204,12 @@ class L1aNode:
             summary=f"annotations={ann_count} raw_text_len={raw_text_len}",
         )
 
-    def summarize(self, manifest: dict) -> L1aOutput:
-        anns = manifest.get("annotations_l1a", [])
-        return L1aOutput(
+    def summarize(self, manifest: dict) -> L1Output:
+        anns = manifest.get("annotations", [])
+        aligned_count = sum(1 for a in anns if a.get("t_start") is not None)
+        return L1Output(
             annotation_count=len(anns),
+            aligned_count=aligned_count,
             raw_text_length=len(manifest.get("raw_text", "")),
             duration_seconds=float(
                 manifest.get("source_media", {}).get("duration", 0.0)

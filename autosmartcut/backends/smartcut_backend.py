@@ -6,13 +6,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from autosmartcut.backends.smartcut_core.media_utils import VideoExportMode, VideoExportQuality
-from autosmartcut.l3_errors import L3EncodeError
 
 if TYPE_CHECKING:  # pragma: no cover
     from autosmartcut.backends.smartcut_core.media_container import MediaContainer
 
 
-class SmartcutBackendError(L3EncodeError):
+class SmartcutBackendError(RuntimeError):
     """Raised when smartcut backend fails."""
 
 

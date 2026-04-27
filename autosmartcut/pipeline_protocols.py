@@ -41,7 +41,7 @@ class StageNode(Protocol):
     """流水线阶段节点协议。所有 8 个节点必须实现此协议。"""
 
     id: str
-    """节点唯一标识符，如 "l1a_asr"、"l2b_decision"。"""
+    """节点唯一标识符，如 "l1_perception"、"l2b_decision"。"""
 
     reads: "frozenset[str]"
     """节点从 TimelineManifest 读取的字段名集合。
@@ -58,7 +58,7 @@ class StageNode(Protocol):
     resumable: bool
     """是否支持断点续跑。
     True：若 manifest.layer_status 中有完成标记，跳过执行。
-    False（仅 l1a_asr）：始终重新执行。"""
+    False（如 l1_perception）：始终重新执行。"""
 
     async def run(self, ctx: "StageContext") -> "StageResult":
         """节点主逻辑。异步执行，通过 ctx 读写 manifest 并发布事件。"""

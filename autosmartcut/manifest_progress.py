@@ -19,7 +19,7 @@ from autosmartcut.manifest_io import MANIFEST_FILENAME
 @dataclass
 class NodeProgress:
     """单个节点的进度状态。"""
-    node_id: str            # "l1a_asr", "l2b_decision", ...
+    node_id: str            # "l1_perception", "l2b_decision", ...
     display_name: str       # "L1A (ASR 转写)"
     phase: int              # 1, 2, 3
     completed: bool
@@ -38,7 +38,7 @@ class ProgressReport:
     duration: float | None
     nodes: list[NodeProgress]
     all_completed: bool
-    suggested_stage: str | None     # "3" / "23" / "1b23" / None
+    suggested_stage: str | None     # "3" / "23" / "123" / None
     goal_needed: bool               # 续跑 L2 时需要 goal 但当前为空
     warnings: list[str] = field(default_factory=list)
 
@@ -48,14 +48,12 @@ class ProgressReport:
 # ---------------------------------------------------------------------------
 
 _NODE_DEFS: list[tuple[str, str, int]] = [
-    ("l1a_asr",            "L1A (ASR 转写)",    1),
-    ("l1b_align",          "L1B (字级对齐)",    1),
+    ("l1_perception",      "L1 (识别与对齐)",   1),
     ("l2a_comprehension",  "L2A (语义理解)",    2),
     ("l2b_decision",       "L2B (保留决策)",    2),
     ("l2c_review",         "L2C (审核)",        2),
     ("l2d_human",          "L2D (人工确认)",    2),
-    ("l3_precompute",      "L3预 (预计算)",     3),
-    ("l3",                 "L3  (执行出片)",    3),
+    ("l3_execute",         "L3 (执行出片)",     3),
 ]
 
 
@@ -117,8 +115,12 @@ def infer_progress(data: dict[str, Any], manifest_path: Path) -> ProgressReport:
     # ── 逐节点推断 ──────────────────────────────────────────────
     nodes: list[NodeProgress] = []
     for node_id, display, phase in _NODE_DEFS:
-        ls_key = f"{node_id}_completed_at"
-        completed_at = ls.get(ls_key)
+        if node_id == "l3_execute":
+            # 调度器写 l3_execute_completed_at；run_execution_layer 曾写 l3_completed_at
+            completed_at = ls.get("l3_execute_completed_at") or ls.get("l3_completed_at")
+        else:
+            ls_key = f"{node_id}_completed_at"
+            completed_at = ls.get(ls_key)
         completed = completed_at is not None
 
         data_valid, summary = _validate_node(
@@ -176,22 +178,19 @@ def _validate_node(
 ) -> tuple[bool, str]:
     """校验节点对应的数据完整性，返回 (data_valid, summary)。"""
     match node_id:
-        case "l1a_asr":
-            has = len(anns) > 0 and bool(anns[0].get("content"))
-            count = len(anns)
-            if has:
-                return True, f"{count} 条 annotations"
-            return False, "无 annotations"
-
-        case "l1b_align":
+        case "l1_perception":
             has = (
                 len(anns) > 0
+                and bool(anns[0].get("content"))
                 and anns[0].get("t_start") is not None
                 and anns[0].get("t_end") is not None
             )
+            count = len(anns)
             if has:
-                return True, "时间戳已回填"
-            return False, "无时间戳"
+                return True, f"{count} 条 annotations（含时间轴）"
+            if len(anns) > 0 and bool(anns[0].get("content")):
+                return False, "annotations 无时间戳"
+            return False, "无 annotations"
 
         case "l2a_comprehension":
             comp = current.get("comprehension", {})
@@ -230,13 +229,7 @@ def _validate_node(
                 return True, "已确认"
             return False, "未确认"
 
-        case "l3_precompute":
-            # 预计算产物是 sidecar 缓存，不在清单内，只看 layer_status
-            if completed:
-                return True, "缓存已生成"
-            return False, "未预计算"
-
-        case "l3":
+        case "l3_execute":
             if completed:
                 return True, "成片已生成"
             return False, "未出片"
@@ -255,25 +248,20 @@ def _suggest_stage(
     Returns:
         建议的 stage 字符串，或 None（全部完成 / 需要从头开始）。
     """
-    has_l1a = "l1a_asr" in completed
-    has_l1b = "l1b_align" in completed
+    has_l1 = "l1_perception" in completed
     has_l2d = "l2d_human" in completed
-    has_l3  = "l3" in completed
+    has_l3 = "l3_execute" in completed or "l3" in completed
 
     if has_l3:
-        return None  # 全部完成
+        return None
 
     if has_l2d:
-        return "3"   # L2 全部完成，只需出片
+        return "3"
 
-    if has_l1a and has_l1b:
-        return "23"  # L1 完成，跑 L2+L3
+    if has_l1:
+        return "23"
 
-    if has_l1a and not has_l1b:
-        return "1b23"  # 只有 L1A，需要对齐 + L2 + L3
-
-    # 什么都没完成或清单是空骨架
     if len(anns) == 0:
-        return None  # 需要 --input 从头开始，resume 不适用
+        return None
 
-    return "123"  # 兜底：有 annotations 但无任何 layer_status
+    return "123"

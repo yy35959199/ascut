@@ -10,9 +10,10 @@ from typing import Any
 from autosmartcut.annotation_tokens import video_path_from_manifest
 from autosmartcut.backends.smartcut_backend import (
     probe_duration_seconds as probe_duration_seconds_by_smartcut,
+    render_segments,
 )
 from autosmartcut.config import AppConfig, load_config
-from autosmartcut.l3_orchestrator import run_l3_orchestration
+from autosmartcut.l3_errors import L3InputError
 from autosmartcut.log import log_stage, log_stage_result, setup_logging_for_manifest
 from autosmartcut.manifest_io import load_manifest, save_manifest, touch_layer_status
 from autosmartcut.pipeline_run import PipelineRun
@@ -146,6 +147,27 @@ def positive_segments_from_annotations(
     return positive, video, duration
 
 
+def _validate_l3_manifest_for_execution(data: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """校验 L3 所需清单字段（原 l3_planner.validate_l3_manifest 逻辑）。"""
+    annotations = data.get("annotations")
+    if not isinstance(annotations, list):
+        raise L3InputError("清单缺少 annotations[]")
+    for ann in annotations:
+        if not isinstance(ann, dict):
+            continue
+        if ann.get("t_start") is None or ann.get("t_end") is None:
+            raise L3InputError(
+                "清单中 annotations 缺少 t_start/t_end，无法执行 L3；请先运行 ascut run --stage 1b 或完整 --stage 1"
+            )
+    cur = data.get("current")
+    if not isinstance(cur, dict):
+        raise L3InputError("清单缺少 current")
+    keep_mask = cur.get("keep_mask")
+    if not isinstance(keep_mask, list):
+        raise L3InputError("清单缺少 current.keep_mask[]")
+    return annotations, keep_mask
+
+
 def run_execution_layer(
     run: PipelineRun,
     *,
@@ -155,8 +177,8 @@ def run_execution_layer(
     min_duration: float = 1.0,
     gap_after_cap: float | None = None,
     vad_snap_disabled_by_cli: bool = False,
-) -> Path:
-    """L3 端到端：清单 ``annotations`` + ``current.keep_mask`` → 输出视频。"""
+) -> tuple[Path, int]:
+    """L3 端到端：清单 ``annotations`` + ``current.keep_mask`` → 输出视频。返回 (输出路径, 保留段数量)。"""
     setup_logging_for_manifest(run.manifest_path, verbose=False)
 
     if gap_after_cap is None:
@@ -167,24 +189,46 @@ def run_execution_layer(
     mp = run.manifest_path
     data = load_manifest(mp)
     out = run.output_video
+
+    annotations, keep_mask = _validate_l3_manifest_for_execution(data)
+    video = video_path_from_manifest(data, mp)
+    audio_16k_path = resolved_audio_16k_path(data, mp)
+
     with log_stage("l3.orchestrate", out_path=str(out)):
-        out, segment_count = run_l3_orchestration(
-            run_id=run.run_id,
-            manifest_data=data,
-            manifest_path=mp,
-            output_video=out,
-            config=config,
+        positive, video_resolved, _duration = positive_segments_from_annotations(
+            annotations,
+            keep_mask,
+            video,
             pre_pad=pre_pad,
             post_pad=post_pad,
             min_duration=min_duration,
             gap_after_cap=gap_after_cap,
+            config=config,
             vad_snap_disabled_by_cli=vad_snap_disabled_by_cli,
+            audio_16k_path=audio_16k_path,
+        )
+        if not positive:
+            raise L3InputError("keep_mask 解析后无保留区间")
+        try:
+            if out.resolve() == video_resolved.resolve():
+                raise L3InputError(
+                    "输出视频路径与源视频解析为同一路径，已中止以免覆盖原始文件；"
+                    "请使用默认 ascut_out_* 目录或指定与源文件不同的 --output-dir / --output-name。"
+                )
+        except OSError:
+            pass
+
+        render_segments(
+            source_video=video_resolved,
+            output_video=out,
+            positive_segments=positive,
         )
 
     with log_stage("l3.persist_manifest", manifest=str(mp)):
         touch_layer_status(data, "l3")
         save_manifest(mp, data, atomic=True)
 
+    segment_count = len(positive)
     log_stage_result("l3.output", summary=f"video={out} segments={segment_count}")
     logger.info("[L3] 完成 → %s", out)
-    return out
+    return out, segment_count

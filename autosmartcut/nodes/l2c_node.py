@@ -25,7 +25,7 @@ class L2cNode:
     """L2C：审核子阶段（checklist 生成 + 逐条判断）。"""
 
     id = "l2c_review"
-    reads = frozenset({"keep_mask", "comprehension", "annotations_l1a", "goal"})
+    reads = frozenset({"keep_mask", "comprehension", "annotations", "goal"})
     writes = frozenset({"review_report"})
     phase = 2
     resumable = True
@@ -41,14 +41,14 @@ class L2cNode:
         params = ctx.params
         review_round = int(params.get("review_round", 0))
 
-        annotations_l1a = manifest.get("annotations_l1a", [])
+        annotations = manifest.get("annotations", [])
         keep_mask = manifest.get("keep_mask", [])
 
-        if not annotations_l1a:
+        if not annotations:
             return StageResult(
                 status=StageStatus.FAILED,
-                summary="annotations_l1a 为空，无法执行 L2C 审核",
-                error=ValueError("annotations_l1a 为空"),
+                summary="annotations 为空，无法执行 L2C 审核",
+                error=ValueError("annotations 为空"),
             )
 
         if not keep_mask:
@@ -58,15 +58,15 @@ class L2cNode:
                 error=ValueError("keep_mask 为空"),
             )
 
-        # 确保 tokens 存在（从 annotations_l1a 派生）
+        # 确保 tokens 存在（从 annotations 派生）
         if "tokens" not in manifest:
             try:
-                manifest["tokens"] = tokens_from_annotations(annotations_l1a)
+                manifest["tokens"] = tokens_from_annotations(annotations)
             except Exception as e:
                 logger.warning("[L2cNode] tokens_from_annotations 失败: %s", e)
                 manifest["tokens"] = [
                     {"index": int(ann.get("index", i)), "text": str(ann.get("content", ""))}
-                    for i, ann in enumerate(annotations_l1a)
+                    for i, ann in enumerate(annotations)
                 ]
 
         ctx.emit(ProgressEvent(node_id=self.id, phase="review_start", payload={
