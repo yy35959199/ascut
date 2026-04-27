@@ -293,6 +293,19 @@ class TestHandleReflow:
         asyncio.run(session._handle_reflow("l2b_decision", manifest))
         assert session._reflow_count == 1
 
+    def test_reflow_clears_launched_set(self, tmp_path: Path) -> None:
+        """回流应从 _launched 集合中移除被重置的节点，使调度循环可以重新启动它们。"""
+        session, manifest = self._make_session_with_dag(tmp_path)
+        # 模拟这些节点已被 start_async 标记为已启动
+        session._launched = {"l2b_decision", "l2c_review", "l2d_human", "l2a_comprehension"}
+        asyncio.run(session._handle_reflow("l2b_decision", manifest))
+        # 被重置的节点应从 _launched 中移除
+        assert "l2b_decision" not in session._launched
+        assert "l2c_review" not in session._launched
+        assert "l2d_human" not in session._launched
+        # 未被重置的节点应保留
+        assert "l2a_comprehension" in session._launched
+
 
 # ---------------------------------------------------------------------------
 # 5. EventBus

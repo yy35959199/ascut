@@ -94,6 +94,9 @@ class PipelineSession:
         # 供 abort() 使用的当前 manifest 引用
         self._current_manifest: dict = {}
 
+        # 已启动节点集合（start_async 调度循环使用，回流时需清除被重置的节点）
+        self._launched: set[str] = set()
+
     # -----------------------------------------------------------------------
     # 节点注册
     # -----------------------------------------------------------------------
@@ -305,7 +308,8 @@ class PipelineSession:
         # running: task → node_id，追踪所有正在运行的节点任务
         running: dict[asyncio.Task, str] = {}
         # launched: 已启动的 node_id 集合，防止同一节点被重复启动
-        launched: set[str] = set()
+        # 使用实例变量 self._launched，以便 _handle_reflow 在回流时清除被重置的节点
+        self._launched = set()
 
         while not self._abort_flag:
             # ── 暂停检查 ────────────────────────────────────────────────────
@@ -332,8 +336,8 @@ class PipelineSession:
 
             # 启动所有新的可调度节点（跳过已启动的）
             for node_id in (action.node_ids or []):
-                if node_id not in launched:
-                    launched.add(node_id)
+                if node_id not in self._launched:
+                    self._launched.add(node_id)
                     task = asyncio.create_task(
                         self._run_node(node_id, manifest, action.params)
                     )
@@ -538,6 +542,8 @@ class PipelineSession:
         nodes_to_reset = self._get_downstream_nodes(reflow_target, inclusive=True)
         for node_id in nodes_to_reset:
             self._node_states[node_id] = NodeState(node_id=node_id, status="pending")
+            # 从 launched 集合中移除，使调度循环可以重新启动这些节点
+            self._launched.discard(node_id)
             # 清除 manifest 中该节点写出的字段
             if node_id in self._nodes:
                 node = self._nodes[node_id]

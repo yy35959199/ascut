@@ -22,7 +22,7 @@ try:
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal
-    from textual.widgets import Footer, Header
+    from textual.widgets import Header
 
     _TEXTUAL_AVAILABLE = True
 except ImportError:
@@ -31,7 +31,7 @@ except ImportError:
 
 
 if _TEXTUAL_AVAILABLE:
-    from autosmartcut.tui.widgets import LogArea, MainArea, PipelineSidebar
+    from autosmartcut.tui.widgets import CommandBar, LogArea, MainArea, PipelineSidebar
 
     class PipelineApp(App):
         """Textual App 主体：三区域布局。
@@ -205,7 +205,7 @@ if _TEXTUAL_AVAILABLE:
                 yield PipelineSidebar(id="sidebar")
                 yield MainArea(id="main-area")
             yield LogArea(id="log-area")
-            yield Footer()
+            yield CommandBar(ctrl=self._ctrl, id="cmd-bar")
 
         # ── 控制器回调（在 asyncio 线程触发，通过 call_later 投递到 Textual 主线程）──
 
@@ -308,8 +308,11 @@ if _TEXTUAL_AVAILABLE:
             self.push_screen(LogScreen())
 
         def action_quit_app(self) -> None:
-            from autosmartcut.tui.screens import QuitDialog
-            self.push_screen(QuitDialog(ctrl=self._ctrl))
+            try:
+                cmd_bar = self.query_one("#cmd-bar", CommandBar)
+                cmd_bar.enter_confirm_mode()
+            except Exception as e:
+                logger.warning("action_quit_app: 无法找到 CommandBar: %s", e)
 
 else:
     class PipelineApp:  # type: ignore[no-redef]
