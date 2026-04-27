@@ -232,7 +232,7 @@ if _TEXTUAL_AVAILABLE:
                 _format_review_summary(dd.review_report)
             )
             self.query_one("#decision-list", Static).update(
-                _format_decision_list(dd)
+                _format_decision_list(dd, use_markup=True)
             )
             self.query_one("#stats-bar", Static).update(
                 _format_stats(dd.stats)

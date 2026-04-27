@@ -89,7 +89,11 @@ def format_review_summary(review_report: dict) -> str:
     return "\n".join(lines)
 
 
-def format_decision_list(display_data: "DisplayData") -> str:
+def format_decision_list(
+    display_data: "DisplayData",
+    *,
+    use_markup: bool = False,
+) -> str:
     """格式化决策列表为文本，按 outline_blocks 分组。"""
     tokens = display_data.tokens
     mask = display_data.effective_mask
@@ -106,7 +110,10 @@ def format_decision_list(display_data: "DisplayData") -> str:
             lines.append(f"\n── {block_label} [{start}-{end}] ──")
             for i in range(start, min(end + 1, len(tokens))):
                 keep = mask[i]["keep"] if i < len(mask) else True
-                status = "[保留]" if keep else "[删除]"
+                if keep:
+                    status = "[green][保留][/green]" if use_markup else "[保留]"
+                else:
+                    status = "[删除]"
                 text = tokens[i].get("text", "")
                 preview = (text[:60] + "…") if len(text) > 63 else text
                 if not preview:
@@ -115,7 +122,10 @@ def format_decision_list(display_data: "DisplayData") -> str:
     else:
         for i, tok in enumerate(tokens):
             keep = mask[i]["keep"] if i < len(mask) else True
-            status = "[保留]" if keep else "[删除]"
+            if keep:
+                status = "[green][保留][/green]" if use_markup else "[保留]"
+            else:
+                status = "[删除]"
             text = tok.get("text", "")
             preview = (text[:60] + "…") if len(text) > 63 else text
             if not preview:
