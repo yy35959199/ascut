@@ -1,7 +1,7 @@
 """Layer 1（识别层 / perception）单测。依赖 torch 等 L1 运行时。"""
 
-from autosmartcut.annotation_tokens import tokens_from_annotations
-from autosmartcut.perception import (
+from autosmartcut.nodes.l2.annotation_tokens import tokens_from_annotations
+from autosmartcut.nodes.l1.perception import (
     SpeechSegment,
     compact_annotations,
     _annotations_from_segments,

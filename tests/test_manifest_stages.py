@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from autosmartcut.pipeline_session import PipelineSession
-from autosmartcut.runner import _resolve_stages, _validate_cli_args
+from autosmartcut.pipeline.pipeline_session import PipelineSession
+from autosmartcut.cli.runner import _resolve_stages, _validate_cli_args
 
 
 # ---------------------------------------------------------------------------

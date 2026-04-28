@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from autosmartcut.pipeline_models import (
+from autosmartcut.pipeline.pipeline_models import (
     NodeState,
     PipelineSnapshot,
     SchedulerAction,
@@ -27,8 +27,8 @@ from autosmartcut.pipeline_models import (
     StageResult,
     StageStatus,
 )
-from autosmartcut.pipeline_protocols import CyclicDependencyError
-from autosmartcut.pipeline_session import PipelineSession
+from autosmartcut.pipeline.pipeline_protocols import CyclicDependencyError
+from autosmartcut.pipeline.pipeline_session import PipelineSession
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,7 @@ class StubNode:
 
 def _make_session(tmp_path: Path, nodes: list[StubNode] | None = None) -> PipelineSession:
     """构造一个带最小 manifest 的 PipelineSession，注入 stub 节点。"""
-    from autosmartcut.manifest_io import make_manifest_skeleton, save_manifest
+    from autosmartcut.manifest.manifest_io import make_manifest_skeleton, save_manifest
 
     mp = tmp_path / "timeline_manifest.json"
     sk = make_manifest_skeleton("test-run", "goal", str(tmp_path / "v.mp4"))
@@ -203,7 +203,8 @@ class TestStageFilter:
         n = StubNode("n1", reads=frozenset(), writes=frozenset({"a"}), resumable=True)
         session.register(n)
         session._build_dag()
-        manifest = {"layer_status": {"n1_completed_at": "2026-01-01T00:00:00"}}
+        # 使用新格式：layer_status[node_id] = {completed_at: "..."}
+        manifest = {"layer_status": {"n1": {"completed_at": "2026-01-01T00:00:00"}}}
         session._apply_resumable_skip(manifest)
         assert session._node_states["n1"].status == "skipped"
 
@@ -224,7 +225,7 @@ class TestStageFilter:
 
 class TestHandleReflow:
     def _make_session_with_dag(self, tmp_path: Path) -> tuple[PipelineSession, dict]:
-        from autosmartcut.manifest_io import make_manifest_skeleton, save_manifest
+        from autosmartcut.manifest.manifest_io import make_manifest_skeleton, save_manifest
 
         mp = tmp_path / "timeline_manifest.json"
         sk = make_manifest_skeleton("r", "", str(tmp_path / "v.mp4"))
@@ -317,7 +318,7 @@ class TestEventBus:
         received = []
         session.subscribe(received.append)
 
-        from autosmartcut.pipeline_events import ProgressEvent
+        from autosmartcut.pipeline.pipeline_events import ProgressEvent
         evt = ProgressEvent(node_id="test", phase="test_phase", payload={"msg": "hello"})
         session._emit(evt)
         assert len(received) == 1
@@ -331,7 +332,7 @@ class TestEventBus:
             raise RuntimeError("handler error")
 
         session.subscribe(bad_handler)
-        from autosmartcut.pipeline_events import ProgressEvent
+        from autosmartcut.pipeline.pipeline_events import ProgressEvent
         # 不应抛异常
         session._emit(ProgressEvent(node_id="x", phase="test", payload={}))
 
@@ -342,7 +343,7 @@ class TestEventBus:
 
 class TestFixedScheduler:
     def _make_scheduler(self):
-        from autosmartcut.pipeline_scheduler import FixedScheduler
+        from autosmartcut.pipeline.pipeline_scheduler import FixedScheduler
         cfg = MagicMock()
         cfg.intelligence.two_c_max_review_rounds = 2
         cfg.intelligence.two_b_mode = "single"
@@ -424,9 +425,9 @@ class TestFixedScheduler:
 class TestPipelineIntegration:
     def test_two_node_pipeline_completes(self, tmp_path: Path) -> None:
         """两个串行节点的流水线应正常完成并发布 pipeline_complete 事件。"""
-        from autosmartcut.manifest_io import make_manifest_skeleton, save_manifest
-        from autosmartcut.pipeline_events import PipelineCompleteEvent
-        from autosmartcut.pipeline_scheduler import FixedScheduler
+        from autosmartcut.manifest.manifest_io import make_manifest_skeleton, save_manifest
+        from autosmartcut.pipeline.pipeline_events import PipelineCompleteEvent
+        from autosmartcut.pipeline.pipeline_scheduler import FixedScheduler
 
         mp = tmp_path / "timeline_manifest.json"
         sk = make_manifest_skeleton("r", "", str(tmp_path / "v.mp4"))
@@ -453,9 +454,9 @@ class TestPipelineIntegration:
 
     def test_failed_node_aborts_pipeline(self, tmp_path: Path) -> None:
         """节点失败应中止流水线并发布 error 事件。"""
-        from autosmartcut.manifest_io import make_manifest_skeleton, save_manifest
-        from autosmartcut.pipeline_events import ErrorEvent
-        from autosmartcut.pipeline_scheduler import FixedScheduler
+        from autosmartcut.manifest.manifest_io import make_manifest_skeleton, save_manifest
+        from autosmartcut.pipeline.pipeline_events import ErrorEvent
+        from autosmartcut.pipeline.pipeline_scheduler import FixedScheduler
 
         mp = tmp_path / "timeline_manifest.json"
         sk = make_manifest_skeleton("r", "", str(tmp_path / "v.mp4"))

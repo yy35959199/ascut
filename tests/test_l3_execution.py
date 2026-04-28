@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 
 from autosmartcut.backends.smartcut_backend import SmartcutBackendError
-from autosmartcut.l3_errors import L3InputError
-from autosmartcut.pipeline_run import PipelineRun
-from autosmartcut.timeline_segments import collect_kept_intervals
+from autosmartcut.nodes.l3.l3_errors import L3InputError
+from autosmartcut.pipeline.pipeline_run import PipelineRun
+from autosmartcut.nodes.l3.timeline_segments import collect_kept_intervals
 
 
 def test_run_execution_layer_rejects_same_input_output_path(

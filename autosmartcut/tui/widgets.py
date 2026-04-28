@@ -14,8 +14,8 @@ import logging
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
-    from autosmartcut.intelligence_2d_core import DisplayData
-    from autosmartcut.pipeline_events import PipelineEvent
+    from autosmartcut.nodes.l2.intelligence_2d_core import DisplayData
+    from autosmartcut.pipeline.pipeline_events import PipelineEvent
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ except ImportError:
 
 
 if _TEXTUAL_AVAILABLE:
-    from autosmartcut.formatters import (
+    from autosmartcut.cli.formatters import (
         format_decision_list,
         format_progress,
         format_review_summary,
@@ -140,13 +140,16 @@ if _TEXTUAL_AVAILABLE:
 
         def _redraw_text_log(self) -> None:
             try:
+                from rich.text import Text
                 log = self.query_one("#l1a-text-log", RichLog)
                 log.clear()
                 if not self._texts:
                     return
                 for text in self._texts[:-1]:
                     log.write(text)
-                log.write(f"[green]{self._texts[-1]}[/green]")
+                # 使用 Rich Text 对象来正确应用自定义绿色样式 (128,255,181)
+                latest_text = Text(self._texts[-1], style="rgb(128,255,181)")
+                log.write(latest_text)
                 log.scroll_end(animate=False)
             except Exception:
                 pass
@@ -395,8 +398,7 @@ if _TEXTUAL_AVAILABLE:
             self._refresh_display()
 
         def on_input_submitted(self, event: Input.Submitted) -> None:
-            from autosmartcut.intelligence_2d_shell import HELP_TEXT, parse_command
-            from autosmartcut.tui.screens import LogScreen
+            from autosmartcut.nodes.l2.intelligence_2d_shell import HELP_TEXT, parse_command
 
             raw = event.value.strip()
             try:
@@ -433,6 +435,46 @@ if _TEXTUAL_AVAILABLE:
 
             self._on_action(parsed)
 
+    # -----------------------------------------------------------------------
+    # LogScreen（全屏日志界面，从 screens.py 移入以消除互指）
+    # -----------------------------------------------------------------------
+
+    from textual.screen import Screen as _Screen
+    from textual.app import ComposeResult as _ComposeResult
+    from textual.binding import Binding as _Binding
+
+    class LogScreen(_Screen):
+        """全屏日志界面。通过 L 键推入，Esc 返回。"""
+
+        BINDINGS = [_Binding("escape", "app.pop_screen", "返回", show=True)]
+
+        def compose(self) -> _ComposeResult:
+            from textual.widgets import Footer, Header, RichLog
+            yield Header()
+            yield RichLog(id="log-screen-rich", max_lines=2000, wrap=True)
+            yield Footer()
+
+        def on_mount(self) -> None:
+            try:
+                log_area = self.app.query_one("#log-area", LogArea)
+                src = log_area.query_one("#log-rich", RichLog)
+                dst = self.query_one("#log-screen-rich", RichLog)
+                lines = getattr(src, "_lines", None)
+                if lines:
+                    for line in lines:
+                        dst.write(line)
+                dst.scroll_end(animate=False)
+                log_area._log_screen_ref = dst
+            except Exception as e:
+                logger.warning("LogScreen.on_mount 复制日志失败: %s", e)
+
+        def on_unmount(self) -> None:
+            try:
+                log_area = self.app.query_one("#log-area", LogArea)
+                log_area._log_screen_ref = None
+            except Exception:
+                pass
+
 else:
     # Textual 不可用时提供占位类
     class PipelineSidebar:  # type: ignore[no-redef]
@@ -451,4 +493,7 @@ else:
         pass
 
     class ReviewScreen:  # type: ignore[no-redef]
+        pass
+
+    class LogScreen:  # type: ignore[no-redef]
         pass

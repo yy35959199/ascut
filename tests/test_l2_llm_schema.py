@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from autosmartcut.config import AppConfig, LLMConfig, LLMStageConfig
-from autosmartcut.intelligence_llm import (
+from autosmartcut.nodes.l2.intelligence_llm import (
     LLMJSONParseError,
     build_messages,
     call_structured,

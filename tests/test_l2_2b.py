@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from autosmartcut.intelligence_2b import run_2b_decision
-from autosmartcut.intelligence_llm import StructuredResult
+from autosmartcut.nodes.l2.intelligence_2b import run_2b_decision
+from autosmartcut.nodes.l2.intelligence_llm import StructuredResult
 
 
 def _sr(data: dict) -> StructuredResult:

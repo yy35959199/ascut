@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from autosmartcut.config import AppConfig, LLMConfig, LLMStageConfig
-from autosmartcut.intelligence_llm import (
+from autosmartcut.nodes.l2.intelligence_llm import (
     _build_chat_kwargs,
     call_structured,
     prepare_next_turn_messages,

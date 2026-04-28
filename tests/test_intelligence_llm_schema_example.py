@@ -2,9 +2,9 @@
 
 import json
 
-from autosmartcut import intelligence_llm as illm
-from autosmartcut.intelligence_2a import _get_r1_schema, _get_r2_schema
-from autosmartcut.intelligence_2b import _get_schema as get_2b_schema
+from autosmartcut.nodes.l2 import intelligence_llm as illm
+from autosmartcut.nodes.l2.intelligence_2a import _get_r1_schema, _get_r2_schema
+from autosmartcut.nodes.l2.intelligence_2b import _get_schema as get_2b_schema
 
 
 def test_r1_example_contains_outline_block_keys():

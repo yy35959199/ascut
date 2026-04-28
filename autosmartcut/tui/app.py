@@ -13,8 +13,8 @@ import sys
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from autosmartcut.app_controller import AppController, AppState
-    from autosmartcut.pipeline_events import PipelineEvent
+    from autosmartcut.cli.app_controller import AppController, AppState
+    from autosmartcut.pipeline.pipeline_events import PipelineEvent
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ if _TEXTUAL_AVAILABLE:
             )
 
             # 根据控制器状态决定初始界面
-            from autosmartcut.app_controller import AppState
+            from autosmartcut.cli.app_controller import AppState
             if self._ctrl.state == AppState.READY:
                 self._start_pipeline()
             elif self._ctrl.state == AppState.DIAGNOSING:
@@ -215,7 +215,7 @@ if _TEXTUAL_AVAILABLE:
 
         def _handle_state_change(self, state: "AppState") -> None:
             """在 Textual 主线程中处理状态变化。"""
-            from autosmartcut.app_controller import AppState
+            from autosmartcut.cli.app_controller import AppState
             match state:
                 case AppState.READY:
                     self._start_pipeline()
@@ -304,7 +304,7 @@ if _TEXTUAL_AVAILABLE:
             self.push_screen(PauseDialog(ctrl=self._ctrl))
 
         def action_show_log(self) -> None:
-            from autosmartcut.tui.screens import LogScreen
+            from autosmartcut.tui.widgets import LogScreen
             self.push_screen(LogScreen())
 
         def action_quit_app(self) -> None:

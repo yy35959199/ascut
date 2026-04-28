@@ -8,8 +8,8 @@ import pytest
 
 sys.modules.setdefault("av", types.ModuleType("av"))
 
-from autosmartcut.intelligence_2a import run_2a_comprehension
-from autosmartcut.intelligence_llm import StructuredResult
+from autosmartcut.nodes.l2.intelligence_2a import run_2a_comprehension
+from autosmartcut.nodes.l2.intelligence_llm import StructuredResult
 
 
 def test_run_2a_outputs_dense_cleaned_annotations_with_corrections(monkeypatch):

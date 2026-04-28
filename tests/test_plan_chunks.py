@@ -14,7 +14,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from autosmartcut.vad_silence import plan_chunks
+from autosmartcut.nodes.l1.vad_silence import plan_chunks
 
 
 # ---------------------------------------------------------------------------

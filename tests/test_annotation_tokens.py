@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from autosmartcut.annotation_tokens import (
+from autosmartcut.nodes.l2.annotation_tokens import (
     tokens_from_annotations,
     validate_annotations,
     validate_tokens,

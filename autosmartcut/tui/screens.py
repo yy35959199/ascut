@@ -1,10 +1,11 @@
 """tui/screens.py — Textual Screen 组件。
 
 包含：
-- ResumeScreen  诊断界面（新增）：展示进度报告，提供参数选择
-- LogScreen     全屏日志界面
-- QuitDialog    退出对话框（增加"修改参数重跑"选项）
+- ResumeScreen  诊断界面：展示进度报告，提供参数选择
+- QuitDialog    退出对话框（含"修改参数重跑"选项）
 - PauseDialog   暂停对话框
+
+注意：LogScreen 已移至 tui/widgets.py（与 LogArea 同文件，消除互指）。
 """
 from __future__ import annotations
 
@@ -12,9 +13,9 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from autosmartcut.app_controller import AppController
-    from autosmartcut.manifest_progress import ProgressReport
-    from autosmartcut.pipeline_session import PipelineSession
+    from autosmartcut.cli.app_controller import AppController
+    from autosmartcut.manifest.manifest_progress import ProgressReport
+    from autosmartcut.pipeline.pipeline_session import PipelineSession
 
 logger = logging.getLogger(__name__)
 
@@ -138,43 +139,6 @@ if _TEXTUAL_AVAILABLE:
                     pass
 
     # -----------------------------------------------------------------------
-    # LogScreen
-    # -----------------------------------------------------------------------
-
-    class LogScreen(Screen):
-        """全屏日志界面。通过 L 键推入，Esc 返回。"""
-
-        BINDINGS = [Binding("escape", "app.pop_screen", "返回", show=True)]
-
-        def compose(self) -> ComposeResult:
-            yield Header()
-            yield RichLog(id="log-screen-rich", max_lines=2000, wrap=True)
-            yield Footer()
-
-        def on_mount(self) -> None:
-            from autosmartcut.tui.widgets import LogArea
-            try:
-                log_area = self.app.query_one("#log-area", LogArea)
-                src = log_area.query_one("#log-rich", RichLog)
-                dst = self.query_one("#log-screen-rich", RichLog)
-                lines = getattr(src, "_lines", None)
-                if lines:
-                    for line in lines:
-                        dst.write(line)
-                dst.scroll_end(animate=False)
-                log_area._log_screen_ref = dst
-            except Exception as e:
-                logger.warning("LogScreen.on_mount 复制日志失败: %s", e)
-
-        def on_unmount(self) -> None:
-            from autosmartcut.tui.widgets import LogArea
-            try:
-                log_area = self.app.query_one("#log-area", LogArea)
-                log_area._log_screen_ref = None
-            except Exception:
-                pass
-
-    # -----------------------------------------------------------------------
     # QuitDialog（增加"修改参数重跑"选项）
     # -----------------------------------------------------------------------
 
@@ -262,9 +226,6 @@ if _TEXTUAL_AVAILABLE:
 
 else:
     class ResumeScreen:  # type: ignore[no-redef]
-        pass
-
-    class LogScreen:  # type: ignore[no-redef]
         pass
 
     class QuitDialog:  # type: ignore[no-redef]

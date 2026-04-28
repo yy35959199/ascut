@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from autosmartcut.dual_track_merge import merge_partials_into_manifest
+from autosmartcut.nodes.l2.dual_track_merge import merge_partials_into_manifest
 
 
 def test_merge_partials_order_l1b_then_l2() -> None:

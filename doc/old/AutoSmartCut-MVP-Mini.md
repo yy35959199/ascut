@@ -1,5 +1,7 @@
 # AutoSmartCut — MVP-mini 方案说明
 
+> **勘误 / 状态（仓库当前树）**：独立示例脚本目录与 `tools` 下一次性对齐校验脚本已从主仓库移除。Layer1/2/3 对照与日常验证请以 **[`../cli-and-config.md`](../cli-and-config.md)** 中的 **`ascut run` / `ascut tui` / `ascut resume`** 为准。本文中出现的旧路径示例为**历史描述**，不再与仓库文件一一对应。
+
 > 本文档描述 **MVP-mini**：以 **单一 `timeline_manifest.json`（TimelineManifest）** 为唯一持久化载体，贯通 L1→L2→L3；**不**以 JSON1 / JSON2 / JSON3 作为正式层间契约，**不**为兼容旧路径而长期保留双写或平行主 API。  
 > 架构愿景见 [AutoSmartCut.md](AutoSmartCut.md)；全局 MVP 与检查点叙事见 [AutoSmartCut-MVP.md](AutoSmartCut-MVP.md)（§10 为摘要，**字段级最小落盘与实现顺序以本文为准**）；2a/2b 的 LLM 契约见 [intelligence-layer2-mvp.md](intelligence-layer2-mvp.md)。
 
@@ -190,6 +192,8 @@ if 3 in stages: run_execution_layer(...)   # 要求每条 annotation 含 t_start
 ## 12. 迁移策略：`demos` / 测试 / 文档同一批次
 
 **原则：不为「旧 Demo 仍能走三 JSON 主路径」而长期保留平行实现。**
+
+**仓库现状**：独立示例脚本目录已从主仓库删除；下表中「与 CLI/清单对齐」一类要求对当前树视为**已完成或作废**；后续验证请以 `ascut` CLI 与 `tests/` 为准，勿再依赖本文列举的历史文件名。
 
 | 范围 | 要求 |
 |------|------|
