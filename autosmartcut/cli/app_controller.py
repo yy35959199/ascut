@@ -226,6 +226,7 @@ class AppController(SessionController):
         self,
         stage: str,
         goal: str,
+        force_rerun_phases: "frozenset[int] | None" = None,
         **overrides: object,
     ) -> None:
         """用户确认参数，构造 session，进入 READY 状态。
@@ -237,6 +238,7 @@ class AppController(SessionController):
         Args:
             stage: stage 规格字符串（如 "3"、"23"、"123"）。
             goal: 剪辑意图。
+            force_rerun_phases: 强制重跑的 phase 集合（如 frozenset({2})）。
             **overrides: 其他 PipelineParams 字段覆盖。
         """
         if self._resolved_input is None:
@@ -246,7 +248,7 @@ class AppController(SessionController):
         if manifest_path is None:
             raise RuntimeError("当前输入不是清单文件，无法续跑")
 
-        self._setup_from_manifest(manifest_path, stage, goal, **overrides)
+        self._setup_from_manifest(manifest_path, stage, goal, force_rerun_phases=force_rerun_phases, **overrides)
         self._set_state(AppState.READY)
 
     def reconfigure(self) -> "ProgressReport":
@@ -346,6 +348,7 @@ class AppController(SessionController):
         manifest_path: Path,
         stage: str,
         goal: str,
+        force_rerun_phases: "frozenset[int] | None" = None,
         **overrides: object,
     ) -> None:
         """清单续跑：组装 PipelineParams 并 setup（不改变 AppState）。"""
@@ -355,6 +358,7 @@ class AppController(SessionController):
             manifest_path=manifest_path,
             stage=stage,
             goal=goal,
+            force_rerun_phases=force_rerun_phases,
             **overrides,  # type: ignore[arg-type]
         )
         self.setup(params)
