@@ -78,6 +78,12 @@ class PipelineParams:
     interactive_2d: bool = False
     verbose: bool = False
 
+    # ── 强制重跑 ────────────────────────────────────────────────────────────
+    force_rerun_phases: frozenset[int] | None = None
+    """强制重跑指定 phase 的节点，忽略 resumable skip。
+    例如 frozenset({2}) 表示即使 L2 各节点已完成，也清除其 completed 标记并重新执行。
+    """
+
 
 # ---------------------------------------------------------------------------
 # build_session — 工厂函数
@@ -139,6 +145,7 @@ def build_session(
         config=cfg,
         stage_filter=stage_filter,
         max_reflows=cfg.intelligence.two_d_max_reflows,
+        force_rerun_phases=params.force_rerun_phases,
     )
     session.register_default_nodes()
 

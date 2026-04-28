@@ -72,6 +72,12 @@ if _TEXTUAL_AVAILABLE:
                 placeholder="剪辑意图（L2 需要）",
                 id="goal-input",
             )
+            yield Static("强制重跑 (Force Rerun):", id="force-rerun-label")
+            yield Input(
+                value="",
+                placeholder="留空=续跑；填 2 或 23 = 从头重跑对应 phase",
+                id="force-rerun-input",
+            )
             yield Button("继续执行", id="btn-confirm", variant="primary")
             yield Button("取消", id="btn-cancel", variant="default")
             yield Footer()
@@ -124,12 +130,31 @@ if _TEXTUAL_AVAILABLE:
             try:
                 stage = self.query_one("#stage-input", Input).value.strip() or "123"
                 goal = self.query_one("#goal-input", Input).value.strip()
+                force_rerun_raw = self.query_one("#force-rerun-input", Input).value.strip()
             except Exception:
                 stage = "123"
                 goal = ""
+                force_rerun_raw = ""
+
+            # 解析 force_rerun_phases
+            force_rerun_phases: "frozenset[int] | None" = None
+            if force_rerun_raw:
+                try:
+                    phases: set[int] = set()
+                    for ch in force_rerun_raw:
+                        if ch not in ("1", "2", "3"):
+                            raise ValueError(f"非法字符: {ch!r}，只接受 1/2/3 的组合")
+                        phases.add(int(ch))
+                    force_rerun_phases = frozenset(phases) if phases else None
+                except ValueError as e:
+                    try:
+                        self.query_one("#resume-warnings", Static).update(f"错误: {e}")
+                    except Exception:
+                        pass
+                    return
 
             try:
-                self._ctrl.confirm_resume(stage=stage, goal=goal)
+                self._ctrl.confirm_resume(stage=stage, goal=goal, force_rerun_phases=force_rerun_phases)
                 self.app.pop_screen()
             except Exception as e:
                 logger.warning("ResumeScreen confirm_resume 失败: %s", e)

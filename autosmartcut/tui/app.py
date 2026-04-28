@@ -121,7 +121,7 @@ if _TEXTUAL_AVAILABLE:
             color: $text;
             margin-bottom: 1;
         }
-        #stage-label, #goal-label {
+        #stage-label, #goal-label, #force-rerun-label {
             color: $text-muted;
         }
         """
