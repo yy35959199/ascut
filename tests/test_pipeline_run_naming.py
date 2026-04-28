@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from autosmartcut.manifest_io import make_manifest_skeleton, save_manifest
-from autosmartcut.pipeline_run import (
+from autosmartcut.manifest.manifest_io import make_manifest_skeleton, save_manifest
+from autosmartcut.pipeline.pipeline_run import (
     PipelineRun,
     allocate_unique_dir,
     allocate_unique_file,

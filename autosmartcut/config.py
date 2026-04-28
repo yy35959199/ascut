@@ -38,8 +38,6 @@ class ExecutionConfig:
 	vad_threshold: float = 0.35
 	vad_min_silence_ms: int = 80
 	vad_speech_pad_ms: int = 10
-	# L1A 完成后 L1B 与 L2 是否并行（--stage 含 1a* 且含 2；可用 CLI 关闭）
-	parallel_l1b_l2_enabled: bool = True
 
 
 @dataclass
@@ -179,12 +177,6 @@ def load_config(path: Path | None = None) -> AppConfig:
 		vad_speech_pad_ms=int(
 			execution.get(
 				"vad_speech_pad_ms", config.execution.vad_speech_pad_ms
-			)
-		),
-		parallel_l1b_l2_enabled=bool(
-			execution.get(
-				"parallel_l1b_l2_enabled",
-				config.execution.parallel_l1b_l2_enabled,
 			)
 		),
 	)

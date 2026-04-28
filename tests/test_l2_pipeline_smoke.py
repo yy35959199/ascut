@@ -8,9 +8,9 @@ import pytest
 
 sys.modules.setdefault("av", types.ModuleType("av"))
 
-from autosmartcut.intelligence_2a import run_2a_comprehension
-from autosmartcut.intelligence_2b import run_2b_decision
-from autosmartcut.intelligence_llm import StructuredResult
+from autosmartcut.nodes.l2.intelligence_2a import run_2a_comprehension
+from autosmartcut.nodes.l2.intelligence_2b import run_2b_decision
+from autosmartcut.nodes.l2.intelligence_llm import StructuredResult
 
 
 def test_run_2a_and_2b_with_mocked_llm(monkeypatch):

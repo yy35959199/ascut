@@ -21,8 +21,6 @@ vad_snap_radius = 0.12
 vad_threshold = 0.35
 vad_min_silence_ms = 80
 vad_speech_pad_ms = 10
-# L1A 后 L1B 与 L2 双轨并行（false 时恢复为仅串行 L2；CLI 可用 --no-parallel-l1b-l2 覆盖）
-parallel_l1b_l2_enabled = true
 
 # DeepSeek V4：阶段化 LLM 参数；未在 stages 中指定的字段继承 [llm.default]
 [llm]
@@ -67,7 +65,7 @@ temperature = 0.1
 # 智能层
 [intelligence]
 # 2b 模式："single"（全文一次调用）或 "block"（每个 outline 块一次调用，不二次拆分）
-two_b_mode = "single"
+two_b_mode = "block"
 # block 模式下，单块句数超过此值时记录警告（0 = 不限制/不警告；正整数 = chat 模型兜底阈值）
 two_b_block_size_limit = 0
 # 2c 审核：最大修正轮次（0=占位透传，1=审核+最多1轮修正，2=最多2轮修正）

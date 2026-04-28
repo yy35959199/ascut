@@ -1,5 +1,7 @@
 # AutoSmartCut — MVP 落地规划文档
 
+> **勘误 / 状态（仓库当前树）**：独立示例脚本目录与 `tools` 下一次性对齐校验脚本已从主仓库移除。Layer1/2/3 对照与日常验证请以 **[`../cli-and-config.md`](../cli-and-config.md)** 中的 **`ascut run` / `ascut tui` / `ascut resume`** 为准。本文中出现的旧路径示例为**历史描述**，不再与仓库文件一一对应。
+
 > 本文档是 [AutoSmartCut.md](AutoSmartCut.md) 的配套落地规划。
 > AutoSmartCut.md 描述架构愿景与长期可能性；本文档聚焦于 **MVP 的具体实现设计、技术决策记录、Demo 验证方案**，是开发阶段的直接参考基准。
 

@@ -20,8 +20,8 @@ from typing import Any
 
 from loguru import logger as loguru_logger
 
-from autosmartcut.manifest_io import load_manifest
-from autosmartcut.pipeline_run import (
+from autosmartcut.manifest.manifest_io import load_manifest
+from autosmartcut.pipeline.pipeline_run import (
     PipelineRun,
     allocate_unique_file,
     format_label_ts,
@@ -142,6 +142,16 @@ def setup_logging(run: PipelineRun, *, verbose: bool = False) -> None:
     _install_sinks(file_path=run.log_path, verbose=verbose, banner=banner)
 
 
+def _silence_noisy_loggers() -> None:
+    """静默第三方库直接写 stderr 的 warning，避免穿透 Textual alternate screen buffer。"""
+    for noisy_logger in (
+        "transformers.generation.utils",
+        "transformers.modeling_utils",
+        "torch.nn.modules.module",
+    ):
+        logging.getLogger(noisy_logger).setLevel(logging.ERROR)
+
+
 def setup_logging_tui(run: PipelineRun, *, verbose: bool = False) -> None:
     """TUI 模式：仅写文件，不挂 stderr sink。
 
@@ -163,14 +173,38 @@ def setup_logging_tui(run: PipelineRun, *, verbose: bool = False) -> None:
         banner=banner,
         suppress_stderr=True,
     )
-    # TUI 模式下静默第三方库直接写 stderr 的 warning，
-    # 避免穿透 Textual alternate screen buffer。
-    for noisy_logger in (
-        "transformers.generation.utils",
-        "transformers.modeling_utils",
-        "torch.nn.modules.module",
-    ):
-        logging.getLogger(noisy_logger).setLevel(logging.ERROR)
+    _silence_noisy_loggers()
+
+
+def setup_logging_tui_for_manifest(manifest_path: Path, *, verbose: bool = False) -> None:
+    """TUI + DIAGNOSING 模式：清单路径已知但 PipelineRun 尚未构造时使用。
+
+    与 setup_logging_tui 的区别：log_path 从清单路径推导，而非从 PipelineRun 取得。
+    用于 ``ascut tui <manifest>`` 路径：ctrl.open() 进入 DIAGNOSING 状态后、
+    asyncio.run() 启动 TUI 之前调用，确保 stderr sink 在 TUI 启动前已移除，
+    stdlib bridge 已配置，日志文件已就绪。
+
+    用户在 ResumeScreen 确认参数后，pipeline 直接使用此处已配置好的日志，
+    无需再次初始化。
+    """
+    lp = log_path_for_manifest(manifest_path)
+    mp = Path(manifest_path).resolve()
+    rid = "unknown"
+    if mp.is_file():
+        try:
+            rid = str(load_manifest(mp).get("run_id") or "unknown")
+        except (OSError, ValueError):
+            pass
+    banner = (
+        f"=== AutoSmartCut TUI(清单) | run_id={rid} | manifest={mp} | log={lp} ==="
+    )
+    _install_sinks(
+        file_path=lp,
+        verbose=verbose,
+        banner=banner,
+        suppress_stderr=True,
+    )
+    _silence_noisy_loggers()
 
 
 def setup_logging_for_manifest(manifest_path: Path, *, verbose: bool = False) -> None:

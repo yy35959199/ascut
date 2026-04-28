@@ -6,8 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from autosmartcut.app_controller import AppController, AppState, SessionController
-from autosmartcut.session_factory import PipelineParams
+from autosmartcut.cli.app_controller import AppController, AppState, SessionController
+from autosmartcut.pipeline.session_factory import PipelineParams
 
 
 # ---------------------------------------------------------------------------

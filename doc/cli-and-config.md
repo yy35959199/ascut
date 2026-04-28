@@ -178,7 +178,6 @@ CLI：`--two-b-mode` 覆盖 `two_b_mode`。
 | `vad_threshold` | `0.35` | Silero 阈值 |
 | `vad_min_silence_ms` | `80` | 最小静音 |
 | `vad_speech_pad_ms` | `10` | 语音垫音 |
-| `parallel_l1b_l2_enabled` | `true` | **当前编排未使用**；保留兼容旧配置文件 |
 
 CLI：`--no-vad-snap` 关闭 `vad_snap_enabled`。`--pre-pad` / `--post-pad` / `--min-duration` 仅 CLI → L3，无对应 config 键。
 

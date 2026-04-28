@@ -4,7 +4,7 @@
 """
 from __future__ import annotations
 
-from autosmartcut.formatters import (
+from autosmartcut.cli.formatters import (
     L1aChunkDoneState,
     L1aChunkProgressState,
     format_decision_list,

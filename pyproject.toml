@@ -32,4 +32,4 @@ where = ["."]
 include = ["autosmartcut*"]
 
 [project.scripts]
-ascut = "autosmartcut.runner:main"
+ascut = "autosmartcut.cli.runner:main"

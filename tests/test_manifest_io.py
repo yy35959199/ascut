@@ -4,10 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from autosmartcut.manifest_io import (
+from autosmartcut.manifest.manifest_io import (
     MANIFEST_FILENAME,
     MANIFEST_VERSION,
     load_manifest,
+    ls_clear_node,
+    ls_get_run_status,
+    ls_mark_completed,
+    ls_mark_failed,
+    ls_mark_started,
     make_manifest_skeleton,
     save_manifest,
     strip_volatile_fields,
@@ -141,3 +146,123 @@ def test_touch_layer_status(tmp_path: Path) -> None:
 def test_load_manifest_not_found(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         load_manifest(tmp_path / "missing.json")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 新的三态模型测试
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_ls_mark_started() -> None:
+    """测试标记节点开始执行。"""
+    d = make_manifest_skeleton("r", "", "v.mp4")
+    ls_mark_started(d, "l2a_comprehension")
+    assert "l2a_comprehension" in d["layer_status"]
+    assert "started_at" in d["layer_status"]["l2a_comprehension"]
+    assert "completed_at" not in d["layer_status"]["l2a_comprehension"]
+
+
+def test_ls_mark_completed() -> None:
+    """测试标记节点完成执行。"""
+    d = make_manifest_skeleton("r", "", "v.mp4")
+    ls_mark_started(d, "l2a_comprehension")
+    ls_mark_completed(d, "l2a_comprehension")
+    assert "started_at" in d["layer_status"]["l2a_comprehension"]
+    assert "completed_at" in d["layer_status"]["l2a_comprehension"]
+
+
+def test_ls_mark_failed() -> None:
+    """测试标记节点执行失败。"""
+    d = make_manifest_skeleton("r", "", "v.mp4")
+    ls_mark_started(d, "l2a_comprehension")
+    ls_mark_failed(d, "l2a_comprehension")
+    assert "started_at" in d["layer_status"]["l2a_comprehension"]
+    assert "failed_at" in d["layer_status"]["l2a_comprehension"]
+    assert "completed_at" not in d["layer_status"]["l2a_comprehension"]
+
+
+def test_ls_clear_node() -> None:
+    """测试清除节点状态记录。"""
+    d = make_manifest_skeleton("r", "", "v.mp4")
+    ls_mark_started(d, "l2a_comprehension")
+    ls_mark_completed(d, "l2a_comprehension")
+    ls_clear_node(d, "l2a_comprehension")
+    assert "l2a_comprehension" not in d["layer_status"]
+
+
+def test_ls_get_run_status_never_started() -> None:
+    """测试获取未开始的节点状态。"""
+    d = make_manifest_skeleton("r", "", "v.mp4")
+    status = ls_get_run_status(d, "l2a_comprehension")
+    assert status == "never_started"
+
+
+def test_ls_get_run_status_started() -> None:
+    """测试获取已开始但未完成的节点状态（中断）。"""
+    d = make_manifest_skeleton("r", "", "v.mp4")
+    ls_mark_started(d, "l2a_comprehension")
+    status = ls_get_run_status(d, "l2a_comprehension")
+    assert status == "started"
+
+
+def test_ls_get_run_status_completed() -> None:
+    """测试获取已完成的节点状态。"""
+    d = make_manifest_skeleton("r", "", "v.mp4")
+    ls_mark_started(d, "l2a_comprehension")
+    ls_mark_completed(d, "l2a_comprehension")
+    status = ls_get_run_status(d, "l2a_comprehension")
+    assert status == "completed"
+
+
+def test_ls_get_run_status_failed() -> None:
+    """测试获取已失败的节点状态。"""
+    d = make_manifest_skeleton("r", "", "v.mp4")
+    ls_mark_started(d, "l2a_comprehension")
+    ls_mark_failed(d, "l2a_comprehension")
+    status = ls_get_run_status(d, "l2a_comprehension")
+    assert status == "failed"
+
+
+def test_ls_get_run_status_backward_compat_completed_only() -> None:
+    """测试向后兼容：仅有 completed_at（来自旧格式迁移）也视为完成。"""
+    d = make_manifest_skeleton("r", "", "v.mp4")
+    # 模拟旧格式迁移后的状态：仅有 completed_at，无 started_at
+    d["layer_status"]["l2a_comprehension"] = {"completed_at": "2026-01-01T00:00:00"}
+    status = ls_get_run_status(d, "l2a_comprehension")
+    assert status == "completed"
+
+
+def test_migrate_layer_status_old_format() -> None:
+    """测试旧格式迁移到新格式。"""
+    from autosmartcut.manifest.manifest_io import migrate_layer_status
+    
+    d = {
+        "layer_status": {
+            "l2a_comprehension_completed_at": "2026-01-01T00:00:00",
+            "l2b_decision_started_at": "2026-01-01T00:00:01",
+            "l2b_decision_failed_at": "2026-01-01T00:00:02",
+        }
+    }
+    migrate_layer_status(d)
+    
+    # 验证迁移后的格式
+    assert d["layer_status"]["l2a_comprehension"]["completed_at"] == "2026-01-01T00:00:00"
+    assert d["layer_status"]["l2b_decision"]["started_at"] == "2026-01-01T00:00:01"
+    assert d["layer_status"]["l2b_decision"]["failed_at"] == "2026-01-01T00:00:02"
+
+
+def test_migrate_layer_status_idempotent() -> None:
+    """测试迁移是幂等的（多次调用结果相同）。"""
+    from autosmartcut.manifest.manifest_io import migrate_layer_status
+    
+    d = {
+        "layer_status": {
+            "l2a_comprehension_completed_at": "2026-01-01T00:00:00",
+        }
+    }
+    migrate_layer_status(d)
+    first_result = dict(d["layer_status"])
+    
+    migrate_layer_status(d)
+    second_result = dict(d["layer_status"])
+    
+    assert first_result == second_result

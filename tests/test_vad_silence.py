@@ -1,8 +1,8 @@
 """VAD 静音补集与切点吸附（snap）纯逻辑测试，不加载 Silero 权重。"""
 from __future__ import annotations
 
-from autosmartcut.timeline_segments import keep_mask_to_positive_segments
-from autosmartcut.vad_silence import (
+from autosmartcut.nodes.l3.timeline_segments import keep_mask_to_positive_segments
+from autosmartcut.nodes.l1.vad_silence import (
     snap_interval_edges_to_silence,
     speech_segments_to_silence_intervals,
 )
