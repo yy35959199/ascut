@@ -1,8 +1,9 @@
 """tui/screens.py — Textual Screen 组件。
 
 包含：
-- ResumeScreen  诊断界面：展示进度报告，提供参数选择
+- ResumeScreen  诊断界面（新增）：展示进度报告，提供参数选择
 - LogScreen     全屏日志界面
+- QuitDialog    退出对话框（增加"修改参数重跑"选项）
 - PauseDialog   暂停对话框
 """
 from __future__ import annotations
@@ -22,7 +23,7 @@ try:
     from textual.binding import Binding
     from textual.containers import VerticalScroll
     from textual.screen import Screen
-    from textual.widgets import Button, Header, Input, Label, RichLog, Static
+    from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static
 
     _TEXTUAL_AVAILABLE = True
 except ImportError:
@@ -174,6 +175,59 @@ if _TEXTUAL_AVAILABLE:
                 pass
 
     # -----------------------------------------------------------------------
+    # QuitDialog（增加"修改参数重跑"选项）
+    # -----------------------------------------------------------------------
+
+    class QuitDialog(Screen):
+        """退出对话框：提供五种选项（含修改参数重跑）。"""
+
+        def __init__(self, ctrl: "AppController", **kwargs) -> None:
+            super().__init__(**kwargs)
+            self._ctrl = ctrl
+
+        def compose(self) -> ComposeResult:
+            yield Label("退出选项：")
+            yield Button("取消（继续执行）", id="btn-cancel", variant="default")
+            yield Button("强制退出（不保存）", id="btn-force-quit", variant="error")
+            yield Button("保存并退出", id="btn-save-quit", variant="warning")
+            yield Button(
+                "等待当前阶段完成后退出",
+                id="btn-graceful-quit",
+                variant="primary",
+            )
+            yield Button(
+                "修改参数重跑",
+                id="btn-reconfigure",
+                variant="default",
+            )
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            match event.button.id:
+                case "btn-cancel":
+                    self.app.pop_screen()
+                case "btn-force-quit":
+                    self.app._force_exit = True
+                    self._ctrl.abort(save=False)
+                    self.app.exit()
+                case "btn-save-quit":
+                    self.app._force_exit = True
+                    self._ctrl.abort(save=True)
+                    self.app.exit()
+                case "btn-graceful-quit":
+                    self._ctrl.pause()
+                    self.app._graceful_quit = True
+                    self.app.pop_screen()
+                case "btn-reconfigure":
+                    try:
+                        self._ctrl.reconfigure()
+                        # AppController 状态变为 DIAGNOSING
+                        # PipelineApp._on_ctrl_state_change 会自动 push ResumeScreen
+                        self.app.pop_screen()
+                    except Exception as e:
+                        logger.warning("reconfigure 失败: %s", e)
+                        self.app.pop_screen()
+
+    # -----------------------------------------------------------------------
     # PauseDialog
     # -----------------------------------------------------------------------
 
@@ -211,6 +265,9 @@ else:
         pass
 
     class LogScreen:  # type: ignore[no-redef]
+        pass
+
+    class QuitDialog:  # type: ignore[no-redef]
         pass
 
     class PauseDialog:  # type: ignore[no-redef]

@@ -6,7 +6,6 @@
 - L1aProgressView  L1A 专用进度视图
 - MainArea         主区域（切换视图）
 - LogArea          日志区域
-- CommandBar       底边命令栏（替代 Footer，支持退出确认模式）
 - ReviewScreen     L2D 人工审阅界面（Widget，嵌入 MainArea）
 """
 from __future__ import annotations
@@ -22,8 +21,6 @@ logger = logging.getLogger(__name__)
 
 try:
     from textual.containers import VerticalScroll
-    from textual.events import Key
-    from textual.reactive import reactive
     from textual.screen import Screen
     from textual.widget import Widget
     from textual.widgets import Button, Input, RichLog, Static
@@ -341,142 +338,6 @@ if _TEXTUAL_AVAILABLE:
     # ReviewScreen（Widget，嵌入 MainArea，用于 L2D 人工审阅）
     # -----------------------------------------------------------------------
 
-    # -----------------------------------------------------------------------
-    # CommandBar（替代 Footer，底边命令栏）
-    # -----------------------------------------------------------------------
-
-    class CommandBar(Widget, can_focus=True):
-        """底边命令栏，替代 Textual 原生 Footer。
-
-        正常模式：显示快捷键提示（p 暂停 / l 日志 / q 退出）。
-        退出确认模式：显示退出选项，等待单键输入。
-        颜色：黄棕色，类似 Vim statusline。
-        """
-
-        DEFAULT_CSS = """
-        CommandBar {
-            dock: bottom;
-            height: 1;
-            background: #5f4b00;
-            color: #e8d5a0;
-            layout: horizontal;
-            padding: 0 1;
-        }
-        CommandBar.-confirm {
-            background: #7a5f00;
-        }
-        CommandBar > Static {
-            height: 1;
-            background: transparent;
-            color: #e8d5a0;
-        }
-        CommandBar > Static.key-hint {
-            background: #3a2e00;
-            color: #ffd700;
-            text-style: bold;
-            padding: 0 1;
-            margin-right: 1;
-            width: auto;
-        }
-        CommandBar > Static.key-desc {
-            color: #e8d5a0;
-            margin-right: 2;
-            width: auto;
-        }
-        CommandBar > Static#confirm-bar {
-            color: #ffd700;
-            width: 1fr;
-        }
-        """
-
-        _confirm_mode: reactive[bool] = reactive(False)
-
-        def __init__(self, ctrl: "AppController | None" = None, **kwargs) -> None:  # type: ignore[name-defined]
-            super().__init__(**kwargs)
-            self._ctrl = ctrl
-
-        def compose(self):
-            # 正常模式：三组快捷键提示
-            yield Static("p", classes="key-hint", id="hint-p-key")
-            yield Static("暂停", classes="key-desc", id="hint-p-desc")
-            yield Static("l", classes="key-hint", id="hint-l-key")
-            yield Static("日志", classes="key-desc", id="hint-l-desc")
-            yield Static("q", classes="key-hint", id="hint-q-key")
-            yield Static("退出", classes="key-desc", id="hint-q-desc")
-            # 确认模式：单行提示（默认隐藏）
-            yield Static(
-                "退出? [f]强制  [s]保存退出  [g]等待完成  [r]重配  [Esc]取消",
-                id="confirm-bar",
-            )
-
-        def on_mount(self) -> None:
-            self._set_mode(False)
-
-        def _set_mode(self, confirm: bool) -> None:
-            """切换正常/确认模式的显示状态。"""
-            normal_ids = ["hint-p-key", "hint-p-desc", "hint-l-key",
-                          "hint-l-desc", "hint-q-key", "hint-q-desc"]
-            for wid in normal_ids:
-                try:
-                    self.query_one(f"#{wid}", Static).display = not confirm
-                except Exception:
-                    pass
-            try:
-                self.query_one("#confirm-bar", Static).display = confirm
-            except Exception:
-                pass
-            self.set_class(confirm, "-confirm")
-
-        def enter_confirm_mode(self) -> None:
-            """进入退出确认模式，抢占键盘焦点。"""
-            self._confirm_mode = True
-            self._set_mode(True)
-            self.focus()
-
-        def exit_confirm_mode(self) -> None:
-            """退出确认模式，恢复正常显示。"""
-            self._confirm_mode = False
-            self._set_mode(False)
-
-        def on_key(self, event: Key) -> None:
-            if not self._confirm_mode:
-                return
-            event.stop()
-            key = event.key
-            ctrl = self._ctrl
-            if key == "escape":
-                self.exit_confirm_mode()
-            elif key == "f":
-                self.exit_confirm_mode()
-                if ctrl:
-                    self.app._force_exit = True
-                    ctrl.abort(save=False)
-                    self.app.exit()
-            elif key == "s":
-                self.exit_confirm_mode()
-                if ctrl:
-                    self.app._force_exit = True
-                    ctrl.abort(save=True)
-                    self.app.exit()
-            elif key == "g":
-                self.exit_confirm_mode()
-                if ctrl:
-                    ctrl.pause()
-                    self.app._graceful_quit = True
-            elif key == "r":
-                self.exit_confirm_mode()
-                if ctrl:
-                    try:
-                        ctrl.reconfigure()
-                        # AppController 状态变为 DIAGNOSING
-                        # PipelineApp._on_ctrl_state_change 会自动 push ResumeScreen
-                    except Exception as e:
-                        logger.warning("CommandBar reconfigure 失败: %s", e)
-
-    # -----------------------------------------------------------------------
-    # ReviewScreen（Widget，嵌入 MainArea，用于 L2D 人工审阅）
-    # -----------------------------------------------------------------------
-
     class ReviewScreen(Widget):
         """2d 人工审阅界面，嵌入主区域。"""
 
@@ -587,9 +448,6 @@ else:
         pass
 
     class LogArea:  # type: ignore[no-redef]
-        pass
-
-    class CommandBar:  # type: ignore[no-redef]
         pass
 
     class ReviewScreen:  # type: ignore[no-redef]

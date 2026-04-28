@@ -3,7 +3,7 @@
 子模块：
 - formatters.py  兼容重导出（实现见 ``autosmartcut.formatters``）
 - widgets.py     Textual Widget 组件（PipelineSidebar、MainArea、LogArea 等）
-- screens.py     Textual Screen（ResumeScreen、PauseDialog、LogScreen）
+- screens.py     Textual Screen（ResumeScreen、QuitDialog、PauseDialog、LogScreen）
 - app.py         PipelineApp 主体
 """
 from __future__ import annotations
