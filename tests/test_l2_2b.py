@@ -11,6 +11,11 @@ from __future__ import annotations
 import pytest
 
 from autosmartcut.intelligence_2b import run_2b_decision
+from autosmartcut.intelligence_llm import StructuredResult
+
+
+def _sr(data: dict) -> StructuredResult:
+    return StructuredResult(data=data, assistant_content="{}", usage={}, request_messages=[])
 
 
 def test_run_2b_rejects_non_dense_cleaned_annotations():
@@ -99,10 +104,10 @@ def test_run_2b_chunked_two_blocks_merges_keep_mask(monkeypatch):
         ]
     )
 
-    def _fake_llm(**_kwargs):
-        return next(responses)
+    def _fake_llm(*_a, **_kw):
+        return _sr(next(responses))
 
-    monkeypatch.setattr("autosmartcut.intelligence_2b.call_llm_structured", _fake_llm)
+    monkeypatch.setattr("autosmartcut.intelligence_2b.call_structured", _fake_llm)
     out = run_2b_decision(manifest, mode="block")
     assert out["keep_mask"][0] == {"index": 0, "keep": False}
     assert out["keep_mask"][1] == {"index": 1, "keep": True}
@@ -121,12 +126,12 @@ def test_run_2b_chunked_empty_outline_falls_back_to_single(monkeypatch):
     }
     n_calls = 0
 
-    def _fake_llm(**_kwargs):
+    def _fake_llm(*_a, **_kw):
         nonlocal n_calls
         n_calls += 1
-        return {"decisions": [{"index": 0, "keep": False}]}
+        return _sr({"decisions": [{"index": 0, "keep": False}]})
 
-    monkeypatch.setattr("autosmartcut.intelligence_2b.call_llm_structured", _fake_llm)
+    monkeypatch.setattr("autosmartcut.intelligence_2b.call_structured", _fake_llm)
     out = run_2b_decision(manifest, mode="block")
     assert n_calls == 1
     assert out["keep_mask"][0]["keep"] is False
@@ -160,10 +165,10 @@ def test_run_2b_chunked_splits_outline_block_by_config_limit(monkeypatch):
         ]
     )
 
-    def _fake_llm(**_kwargs):
-        return next(responses)
+    def _fake_llm(*_a, **_kw):
+        return _sr(next(responses))
 
-    monkeypatch.setattr("autosmartcut.intelligence_2b.call_llm_structured", _fake_llm)
+    monkeypatch.setattr("autosmartcut.intelligence_2b.call_structured", _fake_llm)
     out = run_2b_decision(manifest, mode="block")
     assert out["keep_mask"][0]["keep"] is True
     assert out["keep_mask"][1]["keep"] is False
@@ -195,10 +200,10 @@ def test_run_2b_chunked_gap_block_for_uncovered_index(monkeypatch):
         ]
     )
 
-    def _fake_llm(**_kwargs):
-        return next(responses)
+    def _fake_llm(*_a, **_kw):
+        return _sr(next(responses))
 
-    monkeypatch.setattr("autosmartcut.intelligence_2b.call_llm_structured", _fake_llm)
+    monkeypatch.setattr("autosmartcut.intelligence_2b.call_structured", _fake_llm)
     out = run_2b_decision(manifest, mode="block")
     assert out["keep_mask"][0]["keep"] is True
     assert out["keep_mask"][1]["keep"] is False

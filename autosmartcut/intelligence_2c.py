@@ -42,19 +42,9 @@ import logging
 from typing import Any
 
 from autosmartcut.config import load_config
-from autosmartcut.intelligence_llm import call_llm_structured
+from autosmartcut.intelligence_llm import build_messages, call_structured
 
 logger = logging.getLogger(__name__)
-
-# ============================================================================
-# 模型参数
-# ============================================================================
-
-# 2c 审核需要逐条推理，启用 reasoner 模式
-ENABLE_REASONING = True
-
-# 温度：偏低，审核需要确定性
-TEMPERATURE = 0.2
 
 
 # ============================================================================
@@ -134,12 +124,8 @@ def _run_2c_real(
     prompt = _build_review_prompt(tokens, comprehension, keep_mask, goal)
     schema = _get_review_schema()
 
-    response = call_llm_structured(
-        prompt=prompt,
-        schema=schema,
-        temperature=TEMPERATURE,
-        enable_reasoning=ENABLE_REASONING,
-    )
+    llm_result = call_structured(build_messages(prompt, schema), schema, "review")
+    response = llm_result.data
 
     checklist = response.get("checklist", [])
     judgments = response.get("judgments", [])
@@ -173,7 +159,7 @@ def _run_2c_real(
         "judgments": judgments,
         "fix_instructions": fix_instructions,
         "must_pass_rate": f"{must_passed}/{must_total}",
-        "token_spent": 0,  # call_llm_structured 不返回 usage，后续可扩展
+        "token_spent": int(llm_result.usage.get("total_tokens", 0)),
     }
 
     logger.info(

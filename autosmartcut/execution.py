@@ -157,7 +157,7 @@ def _validate_l3_manifest_for_execution(data: dict[str, Any]) -> tuple[list[dict
             continue
         if ann.get("t_start") is None or ann.get("t_end") is None:
             raise L3InputError(
-                "清单中 annotations 缺少 t_start/t_end，无法执行 L3；请先运行 ascut run --stage 1b 或完整 --stage 1"
+                "清单中 annotations 缺少 t_start/t_end，无法执行 L3；请先运行 ascut run --stage 1（完整识别）"
             )
     cur = data.get("current")
     if not isinstance(cur, dict):

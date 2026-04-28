@@ -3,6 +3,7 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.toml"
@@ -64,12 +65,72 @@ class IntelligenceConfig:
 	two_d_max_reflows: int = 3
 
 
+_LLM_STAGE_DEFAULTS: dict[str, Any] = {
+	"model": "deepseek-v4-flash",
+	"thinking": False,
+	"reasoning_effort": "high",
+	"temperature": 0.3,
+	"max_tokens": 65536,
+}
+
+
+@dataclass(frozen=True)
+class LLMStageConfig:
+	"""单阶段 LLM 参数（已由 default + stage 合并）。"""
+
+	model: str
+	thinking: bool
+	reasoning_effort: str
+	temperature: float
+	max_tokens: int
+
+
+@dataclass
+class LLMConfig:
+	"""[llm] 段完整配置。"""
+
+	api_key: str
+	base_url: str
+	default: LLMStageConfig
+	stages: dict[str, LLMStageConfig]
+
+	def for_stage(self, stage: str) -> LLMStageConfig:
+		"""未知 stage 使用 default。"""
+		return self.stages.get(stage, self.default)
+
+
+def _coerce_llm_stage(merged: dict[str, Any]) -> LLMStageConfig:
+	model = str(merged.get("model", _LLM_STAGE_DEFAULTS["model"]))
+	thinking = bool(merged.get("thinking", _LLM_STAGE_DEFAULTS["thinking"]))
+	reasoning_effort = str(
+		merged.get("reasoning_effort", _LLM_STAGE_DEFAULTS["reasoning_effort"])
+	).lower()
+	if reasoning_effort not in ("high", "max"):
+		raise ValueError(
+			f"reasoning_effort 须为 high 或 max，实际: {reasoning_effort!r}"
+		)
+	temperature = float(merged.get("temperature", _LLM_STAGE_DEFAULTS["temperature"]))
+	if not 0.0 <= temperature <= 2.0:
+		raise ValueError(f"temperature 须在 0~2 内，实际: {temperature}")
+	max_tokens = int(merged.get("max_tokens", _LLM_STAGE_DEFAULTS["max_tokens"]))
+	if max_tokens <= 0:
+		raise ValueError(f"max_tokens 须为正整数，实际: {max_tokens}")
+	return LLMStageConfig(
+		model=model,
+		thinking=thinking,
+		reasoning_effort=reasoning_effort,
+		temperature=temperature,
+		max_tokens=max_tokens,
+	)
+
+
 @dataclass
 class AppConfig:
 	perception: PerceptionConfig = field(default_factory=PerceptionConfig)
 	execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 	models: ModelConfig = field(default_factory=ModelConfig)
 	intelligence: IntelligenceConfig = field(default_factory=IntelligenceConfig)
+	llm: LLMConfig | None = None
 
 
 def load_config(path: Path | None = None) -> AppConfig:
@@ -169,4 +230,37 @@ def load_config(path: Path | None = None) -> AppConfig:
 			config.intelligence.two_d_max_reflows,
 		))),
 	)
+
+	llm_raw = raw.get("llm")
+	if isinstance(llm_raw, dict) and llm_raw:
+		api_key = str(llm_raw.get("api_key", "")).strip()
+		base_url = str(llm_raw.get("base_url", "")).strip()
+		if not api_key:
+			raise ValueError("config.toml [llm] 缺少 api_key")
+		if not base_url:
+			raise ValueError("config.toml [llm] 缺少 base_url")
+
+		default_tbl = llm_raw.get("default", {})
+		if not isinstance(default_tbl, dict):
+			default_tbl = {}
+		default_merged = {**_LLM_STAGE_DEFAULTS, **default_tbl}
+		default_cfg = _coerce_llm_stage(default_merged)
+
+		stages_tbl = llm_raw.get("stages", {})
+		if not isinstance(stages_tbl, dict):
+			stages_tbl = {}
+		stages: dict[str, LLMStageConfig] = {}
+		for name, stage_raw in stages_tbl.items():
+			if not isinstance(stage_raw, dict):
+				continue
+			merged_stage = {**default_merged, **stage_raw}
+			stages[str(name)] = _coerce_llm_stage(merged_stage)
+
+		config.llm = LLMConfig(
+			api_key=api_key,
+			base_url=base_url,
+			default=default_cfg,
+			stages=stages,
+		)
+
 	return config

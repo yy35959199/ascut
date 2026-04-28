@@ -24,13 +24,45 @@ vad_speech_pad_ms = 10
 # L1A 后 L1B 与 L2 双轨并行（false 时恢复为仅串行 L2；CLI 可用 --no-parallel-l1b-l2 覆盖）
 parallel_l1b_l2_enabled = true
 
+# DeepSeek V4：阶段化 LLM 参数；未在 stages 中指定的字段继承 [llm.default]
 [llm]
-api_key = "sk-f46d082357234fd2977e400835892f35"                       
-base_url = "https://api.deepseek.com/v1"    # API Base URL
-model = "deepseek-chat"                     # 默认模型
-reasoner_model = "deepseek-reasoner"        # Reasoner 模型
-default_temperature = 0.3                   # 默认温度
-default_max_tokens = 65536                  # 默认最大 tokens（模型支持最大 384K 输出）
+api_key = "YOUR_DEEPSEEK_API_KEY"
+base_url = "https://api.deepseek.com"
+
+[llm.default]
+model = "deepseek-v4-flash"
+thinking = false
+reasoning_effort = "high"
+temperature = 0.3
+max_tokens = 65536
+
+# 2a Round 1：粗理解 + ASR 误识候选
+[llm.stages.r1]
+thinking = false
+temperature = 0.5
+
+# 2a Round 2：精化主旨 + 纠错
+[llm.stages.r2]
+thinking = false
+temperature = 0.2
+
+# 2b：逐句 keep/cut 决策
+[llm.stages.decision]
+model = "deepseek-v4-pro"
+thinking = true
+reasoning_effort = "high"
+temperature = 0.2
+
+# 2c：审核校验
+[llm.stages.review]
+thinking = true
+reasoning_effort = "high"
+temperature = 0.2
+
+# 轻量布尔判断（如 2d 回流）
+[llm.stages.light]
+thinking = false
+temperature = 0.1
 
 # 智能层
 [intelligence]

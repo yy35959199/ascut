@@ -28,7 +28,7 @@ from autosmartcut.intelligence_2b import run_2b_decision
 from autosmartcut.intelligence_2c import run_2c_review
 from autosmartcut.intelligence_2d import run_2d_human_review
 from autosmartcut.intelligence_2d_core import Signal
-from autosmartcut.intelligence_llm import call_llm_structured
+from autosmartcut.intelligence_llm import build_messages, call_structured
 from autosmartcut.manifest_io import (
     load_manifest,
     save_manifest,
@@ -51,7 +51,7 @@ def _check_correction_affects_purpose(
 ) -> bool:
     """轻量 LLM 判断：F2 纠错是否影响 purpose 的准确性。
 
-    使用非 reasoner 模型（enable_reasoning=False, temperature=0.1），
+    使用 ``call_structured(..., stage="light")``（参数见 config.toml），
     单次调用，判断空间为 true/false。
 
     Preconditions:
@@ -75,12 +75,9 @@ def _check_correction_affects_purpose(
         },
         "required": ["affects_purpose"],
     }
-    result = call_llm_structured(
-        prompt=prompt,
-        schema=schema,
-        temperature=0.1,
-        enable_reasoning=False,
-    )
+    result = call_structured(
+        build_messages(prompt, schema), schema, "light"
+    ).data
     return bool(result.get("affects_purpose", False))
 
 
@@ -569,7 +566,7 @@ def run_intelligence_layer(
     log_lazy_json(
         "L2",
         "comprehension 完整输出",
-        lambda: manifest_dict.get("comprehension", {}),
+        lambda: result.get("comprehension", {}),
     )
     log_stage_result(
         "l2.output",

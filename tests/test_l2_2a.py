@@ -9,7 +9,7 @@ import pytest
 sys.modules.setdefault("av", types.ModuleType("av"))
 
 from autosmartcut.intelligence_2a import run_2a_comprehension
-from autosmartcut.intelligence_llm import StructuredLLMResult
+from autosmartcut.intelligence_llm import StructuredResult
 
 
 def test_run_2a_outputs_dense_cleaned_annotations_with_corrections(monkeypatch):
@@ -33,25 +33,30 @@ def test_run_2a_outputs_dense_cleaned_annotations_with_corrections(monkeypatch):
         "corrections": [{"index": 0, "old": "减辑", "nth": 1, "new": "剪辑"}],
     }
 
-    def _fake_once_raw(*args, **kwargs):
-        return StructuredLLMResult(
-            data=r1_data,
-            assistant_content=json.dumps(r1_data, ensure_ascii=False),
-            usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            request_messages=[
-                {"role": "system", "content": "s"},
-                {"role": "user", "content": "u1"},
-            ],
-        )
-
-    def _fake_turn(*args, **kwargs):
-        return r2_data
+    def _fake_call_structured(messages, schema, stage, **kwargs):
+        if stage == "r1":
+            return StructuredResult(
+                data=r1_data,
+                assistant_content=json.dumps(r1_data, ensure_ascii=False),
+                usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                request_messages=[
+                    {"role": "system", "content": "s"},
+                    {"role": "user", "content": "u1"},
+                ],
+            )
+        if stage == "r2":
+            return StructuredResult(
+                data=r2_data,
+                assistant_content=json.dumps(r2_data, ensure_ascii=False),
+                usage={},
+                request_messages=[],
+            )
+        raise AssertionError(f"unexpected stage {stage}")
 
     monkeypatch.setattr(
-        "autosmartcut.intelligence_2a.call_once_structured_with_raw_content",
-        _fake_once_raw,
+        "autosmartcut.intelligence_2a.call_structured",
+        _fake_call_structured,
     )
-    monkeypatch.setattr("autosmartcut.intelligence_2a.call_turn_structured", _fake_turn)
 
     out_2a = run_2a_comprehension(manifest)
     cleaned = out_2a["comprehension"]["cleaned_annotations"]

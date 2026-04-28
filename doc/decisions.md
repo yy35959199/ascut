@@ -198,3 +198,61 @@
 **决策**：2c 的 `verdict`（`pass` 或 `fix_decision`）由程序根据 must 项通过率计算，不在 LLM 输出 schema 中包含 `verdict` 字段。
 
 **理由**：LLM 生成 verdict 时可能与自己的 judgments 矛盾（3 条 must 未通过但仍输出 pass）。程序计算是确定性的，消除了这一层随机性。阈值（`two_c_must_pass_rate`）可配置，不需要改 prompt 就能调整审核严格度。
+
+---
+
+## D25：编排收敛为单节点 L1 与六值 `--stage`
+
+**决策**：对外编排不再暴露 `L1A`/`L1B` 独立节点与 `1a`/`1b` 等 `--stage` 组合；识别由单一节点 `l1_perception` 完成；CLI 仅接受 `1`、`2`、`3`、`12`、`23`、`123`。
+
+**理由**：降低用户与文档心智负担；实现以 `runner.py` 白名单与 `PipelineSession.parse_stage_arg()` 为准。历史双轨与分阶段 stage 已移出主编排路径。
+
+**Supersedes（叙事层面）**：旧文档中「8 节点」「L1A+L1B 并行 stage」等对外描述。
+
+---
+
+## D26：ASR 依赖与默认推理后端
+
+**决策**：Python 依赖通过 `pyproject.toml` 引入 `qwen-asr` 等包；默认 `[models].backend` 为 `transformers`；可选 `vllm`。不再将工作区内 `pip install -e "./Qwen3-ASR[vllm]"` 作为默认安装前提。
+
+**理由**：与当前仓库布局及默认配置一致；vLLM 仍可通过 `backend` 与运行环境启用。
+
+**Supersedes（安装说明层面）**：D3、D15 中「默认 vLLM + 本地 editable Qwen3-ASR 子目录」仅保留为可选方案，不作为默认前提。
+
+---
+
+## D27：无 L3 预处理 DAG 节点
+
+**决策**：执行层仅 `l3_execute` 一个 StageNode；时间轴解析、VAD 吸附、smartcut 出片均在 `execution.run_execution_layer` 及其调用链内完成，不注册独立的「L3 预处理」并行节点。
+
+**理由**：与当前 DAG 及测试约定一致（L1 完成后下一可调度节点为 `l2a_comprehension`）。
+
+---
+
+## D28：2a 持久化 `comprehension` 的形态
+
+**决策**：`run_2a_comprehension` 将 `purpose`、`outline_blocks` 与稠密 `cleaned_annotations` 写入 `manifest["comprehension"]`；R2 的 `corrections` 由程序消费并物化为 `cleaned_annotations`。发布物可再调用 `strip_volatile_fields` 剥离 `current` 侧部分瞬时字段（**不**删除顶层 `manifest["tokens"]`，见 **D29**）。
+
+**理由**：与 `intelligence_2a.py` 实现一致；避免文档声称「仅持久化 purpose/outline/corrections 三元组」而与代码不符。
+
+**Supersedes（文档契约层面）**：D13 中「持久化 comprehension 仅 purpose/outline/corrections」的简化说法。
+
+---
+
+## D29：清单顶层 `tokens` 与 `strip_volatile_fields` 实际范围
+
+**决策**（澄清现行实现）：`PipelineSession` 在节点成功后会将整份 manifest 原子保存；过程中 L1/L2 等节点常写入顶层 `manifest["tokens"]`，因此该字段**可能出现于落盘清单**中。`manifest_io.strip_volatile_fields()` 当前实现会删除：`l1a_chunks`、`l1_contract`、`annotations_l1a` 等顶层历史键，以及 `current` 下的 `tokens`、`l2_checkpoints`、`comprehension.cleaned_annotations` 等；**不会**删除顶层 `manifest["tokens"]`。
+
+**Supersedes（叙事精度）**：D18 中「`tokens[]` 不落盘」的绝对化表述；以 `manifest_io.strip_volatile_fields` 与各节点写 manifest 的行为为准。
+
+**理由**：对外运维与发布脚本需知剥离函数边界，避免误信调用后即无顶层 `tokens`。
+
+---
+
+## D30：`human_feedback_history` 压缩（D9）未在主路径实现
+
+**决策**（澄清现行实现）：当前主编排路径下 `human_feedback_history` 为追加记录；**未**实现 D9 所述「超过 N 轮压缩为摘要」及可配置 N（Demo 阶段 N=1）。
+
+**Supersedes（实现状态）**：D9 将压缩机制描述为既定能力时的预期；在实现落地前，读者应以 `intelligence_2d_core` 等代码为准。
+
+**理由**：避免排障时误以为历史会被自动摘要裁剪。

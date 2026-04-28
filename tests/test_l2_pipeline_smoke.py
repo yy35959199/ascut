@@ -10,7 +10,7 @@ sys.modules.setdefault("av", types.ModuleType("av"))
 
 from autosmartcut.intelligence_2a import run_2a_comprehension
 from autosmartcut.intelligence_2b import run_2b_decision
-from autosmartcut.intelligence_llm import StructuredLLMResult
+from autosmartcut.intelligence_llm import StructuredResult
 
 
 def test_run_2a_and_2b_with_mocked_llm(monkeypatch):
@@ -41,31 +41,45 @@ def test_run_2a_and_2b_with_mocked_llm(monkeypatch):
             {"index": 2, "keep": False},
         ]
     }
-    step = iter([r2_data, decision_data])
+    post_r1 = iter([r2_data, decision_data])
 
-    def _fake_once_raw(*args, **kwargs):
-        return StructuredLLMResult(
-            data=r1_data,
-            assistant_content=json.dumps(r1_data, ensure_ascii=False),
+    def _fake_call_structured_2a(messages, schema, stage, **kwargs):
+        if stage == "r1":
+            return StructuredResult(
+                data=r1_data,
+                assistant_content=json.dumps(r1_data, ensure_ascii=False),
+                usage={},
+                request_messages=[
+                    {"role": "system", "content": "s"},
+                    {"role": "user", "content": "u1"},
+                ],
+            )
+        if stage == "r2":
+            return StructuredResult(
+                data=next(post_r1),
+                assistant_content="{}",
+                usage={},
+                request_messages=[],
+            )
+        raise AssertionError(stage)
+
+    def _fake_call_structured_2b(messages, schema, stage, **kwargs):
+        assert stage == "decision"
+        return StructuredResult(
+            data=next(post_r1),
+            assistant_content="{}",
             usage={},
-            request_messages=[
-                {"role": "system", "content": "s"},
-                {"role": "user", "content": "u1"},
-            ],
+            request_messages=[],
         )
 
-    def _fake_turn(*args, **kwargs):
-        return next(step)
-
-    def _fake_2b_llm(*args, **kwargs):
-        return next(step)
-
     monkeypatch.setattr(
-        "autosmartcut.intelligence_2a.call_once_structured_with_raw_content",
-        _fake_once_raw,
+        "autosmartcut.intelligence_2a.call_structured",
+        _fake_call_structured_2a,
     )
-    monkeypatch.setattr("autosmartcut.intelligence_2a.call_turn_structured", _fake_turn)
-    monkeypatch.setattr("autosmartcut.intelligence_2b.call_llm_structured", _fake_2b_llm)
+    monkeypatch.setattr(
+        "autosmartcut.intelligence_2b.call_structured",
+        _fake_call_structured_2b,
+    )
 
     out_2a = run_2a_comprehension(manifest)
     assert out_2a["comprehension"]["purpose"] == "讲解自动剪辑的核心步骤与决策思路。"

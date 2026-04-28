@@ -9,7 +9,7 @@
 4. **程序**：按 `corrections` 在 **只读句面**（``tokens[].text``）上替换，生成稠密
    `cleaned_annotations[]`；**不**改写 ``tokens``（Append-only）。
 
-LLM 调用封装：R1 ``call_once_structured_with_raw_content``；R2 ``call_turn_structured``（真多轮，前缀与 R1 共享以利缓存）。
+LLM 调用封装：R1/R2 均通过 ``call_structured`` + ``build_messages`` / ``prepare_next_turn_messages``（真多轮，前缀与 R1 共享以利缓存）。
 
 ## 输入（manifest 片段）
 - `tokens[]`：句级句面（index、text）。
@@ -38,32 +38,14 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from autosmartcut.intelligence_llm import (
-    StructuredLLMResult,
-    call_llm_structured,
-    call_once_structured_with_raw_content,
-    call_turn_structured,
+    StructuredResult,
+    build_messages,
+    call_structured,
     prepare_next_turn_messages,
 )
 from autosmartcut.annotation_tokens import validate_tokens
 
 logger = logging.getLogger(__name__)
-
-# ============================================================================
-# 模型参数（便于调试）
-# ============================================================================
-
-# R1：全局压缩 + 分段，默认非思考模式（见 doc/专家角色提示与模型性能关系.md）
-ENABLE_REASONING_R1 = False
-
-# R2：纠错 / 一致性，可按需单独开 reasoner
-ENABLE_REASONING_R2 = False
-
-# R1 温度：略高，允许一定创造性（主旨概括）
-R1_TEMPERATURE = 0.5
-
-# R2 温度：偏低，消歧和分块需要确定性
-R2_TEMPERATURE = 0.2
-
 
 # ============================================================================
 # 纠错数据结构
@@ -105,7 +87,7 @@ def run_2a_comprehension(
     # 用户剪辑目标，原样进入 R1/R2 提示词首行「用户目标：…」
     goal = manifest_dict.get("goal", "")
 
-    # Round 1：内部会 `_build_r1_prompt` + `call_once_structured_with_raw_content`（见 intelligence_llm）
+    # Round 1：内部会 `_build_r1_prompt` + `call_structured(..., "r1")`（见 intelligence_llm）
     purpose_rough, outline_blocks_rough, candidate_misrecognitions, r1_completion = (
         _run_round1(tokens, goal)
     )
@@ -121,7 +103,7 @@ def run_2a_comprehension(
             },
         )
 
-    # Round 2：`prepare_next_turn_messages` 接上 R1 的 assistant JSON，再 `call_turn_structured` 追加 schema
+    # Round 2：`prepare_next_turn_messages` 接上 R1 的 assistant JSON，再 `call_structured(..., "r2")` 追加 schema
     purpose, outline_blocks, raw_corrections = _run_round2(
         tokens,
         goal,
@@ -166,7 +148,7 @@ def run_2a_comprehension(
 def _run_round1(
     tokens: list[dict],
     goal: str,
-) -> tuple[str, list[dict], list[dict], StructuredLLMResult]:
+) -> tuple[str, list[dict], list[dict], StructuredResult]:
     """Round 1: 粗理解 + ASR 误识候选
 
     Returns:
@@ -180,16 +162,11 @@ def _run_round1(
     # R1 输出结构的 jsonschema，用于生成「示例 JSON」尾缀 + 校验模型返回
     schema = _get_r1_schema()
 
-    # intelligence_llm.call_once_structured_with_raw_content：
-    # - 内部 _build_messages → system=SYSTEM_PROMPT，user=prompt+JSON 示例+纪律说明
-    # - _call_api 带 response_format=json_object；失败按 max_retries 重试
-    # - 返回 StructuredLLMResult：含解析后 dict、assistant 原文 JSON、请求快照（供 R2 多轮前缀）
-    r1_completion = call_once_structured_with_raw_content(
-        prompt=prompt,  # 本模块构造的 R1 中文任务描述
-        schema=schema,  # 与 prompt 对齐的字段约束
-        temperature=R1_TEMPERATURE,  # 2a 文件头常量，略高以利粗分块/候选
-        enable_reasoning=ENABLE_REASONING_R1,  # False 时走 chat 采样路径
-    )
+    # intelligence_llm.call_structured（stage=r1）：
+    # - 内部 build_messages → system=SYSTEM_PROMPT，user=prompt+JSON 示例+纪律说明
+    # - 失败按 max_retries 重试
+    # - 返回 StructuredResult：含解析后 dict、assistant 原文 JSON、请求快照（供 R2 多轮前缀）
+    r1_completion = call_structured(build_messages(prompt, schema), schema, "r1")
     # 已通过 jsonschema 校验的结构化对象（可直接按键取值）
     response = r1_completion.data
 
@@ -298,7 +275,7 @@ def _run_round2(
     tokens: list[dict],
     goal: str,
     candidate_misrecognitions: list[dict],
-    r1_completion: StructuredLLMResult,
+    r1_completion: StructuredResult,
 ) -> tuple[str, list[dict], list[dict]]:
     """Round 2: 精化主旨 + 分块 + 纠错列表（多轮第二跳）
 
@@ -322,15 +299,9 @@ def _run_round2(
         next_user_content=r2_user,  # 本函数构造的第二轮 user 任务说明
     )
 
-    # intelligence_llm.call_turn_structured：
-    # - 在**最后一条** user 末尾再拼 R2 的 JSON 示例 + Schema 说明（augment_last_user=True）
-    # - 其余与单轮类似：json_object、校验、重试
-    response = call_turn_structured(
-        r2_messages,  # 已含 R1 全前缀 + assistant + 第二轮 user
-        schema,  # R2 schema；位置参数与 intelligence_llm 签名一致
-        temperature=R2_TEMPERATURE,  # 低于 R1，偏确定性的纠错/分块
-        enable_reasoning=ENABLE_REASONING_R2,
-    )
+    # intelligence_llm.call_structured（stage=r2）：
+    # - 在**最后一条** user 末尾再拼 R2 的 JSON 示例 + Schema 说明
+    response = call_structured(r2_messages, schema, "r2").data
 
     # R2 精化主旨（schema required）
     purpose = response["purpose"]
@@ -706,7 +677,7 @@ def run_2a_comprehension_reflow(
 
     purpose_drift（F1）：
         - 不重跑 R1，不重建 cleaned_annotations
-        - 单轮 LLM 调用（call_llm_structured），将用户反馈注入 prompt
+        - 单轮 LLM 调用（call_structured / stage=r2），将用户反馈注入 prompt
         - 仅更新 comprehension.purpose 和 comprehension.outline_blocks
 
     keyword_correction（F2）：
@@ -743,12 +714,9 @@ def run_2a_comprehension_reflow(
         )
         schema = _get_r2_schema()
 
-        response = call_llm_structured(
-            prompt=prompt,
-            schema=schema,
-            temperature=R2_TEMPERATURE,
-            enable_reasoning=ENABLE_REASONING_R2,
-        )
+        response = call_structured(
+            build_messages(prompt, schema), schema, "r2"
+        ).data
 
         # 仅更新 purpose 和 outline_blocks；cleaned_annotations 不变
         comprehension["purpose"] = response["purpose"]

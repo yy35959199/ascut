@@ -113,7 +113,7 @@
 
 ### 4. 无句面 / 空 `tokens` 禁止进入 2b
 
-- 在 `run_2b_decision` 入口（或更早在 `run_intelligence_layer`）：**`tokens` 缺失、类型非法或 `len(tokens)==0`** 须在进 2a/2b 前 **直接拒绝**（`raise`），不调用 LLM、不写 `keep_mask`。（现行实现从清单 **`annotations[]`** 派生 `manifest["tokens"]`。）
+- 在 `run_2b_decision` 入口（或更早在 `run_intelligence_layer`）：`**tokens` 缺失、类型非法或 `len(tokens)==0`** 须在进 2a/2b 前 **直接拒绝**（`raise`），不调用 LLM、不写 `keep_mask`。（现行实现从清单 `**annotations[]`** 派生 `manifest["tokens"]`。）
 
 ### 5. 运行日志：推荐方案与记录内容
 
@@ -145,6 +145,5 @@
 
 ## 文档对齐任务
 
-- 主路径文档已与 **单清单 `timeline_manifest.json`**、内存 **`tokens[]`**（`index`+`text`）及 **`current.keep_mask`** 对齐；后续若 CLI 或字段变更，同步 README 与 MVP 文档族。
-- 统一仓库文档命名：`outline_blocks`（理解分块）与 **`current.keep_mask`**（及历史文档中的 `segments.keep_mask` 嵌套表述）的术语使用。
-
+- 主路径文档已与 **单清单 `timeline_manifest.json`**、内存 `**tokens[]**`（`index`+`text`）及 `**current.keep_mask**` 对齐；后续若 CLI 或字段变更，同步 README 与 MVP 文档族。
+- 统一仓库文档命名：`outline_blocks`（理解分块）与 `**current.keep_mask**`（及历史文档中的 `segments.keep_mask` 嵌套表述）的术语使用。

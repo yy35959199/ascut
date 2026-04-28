@@ -7,6 +7,7 @@ output/op
 pycache/
 *.egg-info/
 .eggs/
+.kiro/
 dist/
 build/
 *.pyc

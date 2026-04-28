@@ -65,22 +65,11 @@ import logging
 from typing import Literal
 
 from autosmartcut.config import load_config
-from autosmartcut.intelligence_llm import call_llm_structured
+from autosmartcut.intelligence_llm import build_messages, call_structured
 
 TwoBMode = Literal["single", "block"]
 
 logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# 模型参数（便于调试）
-# ============================================================================
-
-# 2b：开启思考链，便于按检查清单逐句比对后再输出 decisions
-ENABLE_REASONING = True
-
-# 温度：偏低，决策需要确定性和稳定性（非 reasoner 路径下生效）
-TEMPERATURE = 0.2
 
 
 def _two_b_shared_task_and_output_instructions() -> str:
@@ -211,12 +200,9 @@ def _generate_keep_mask(
     prompt = _build_prompt_single(tokens, comprehension, goal, review_fixes=review_fixes, selection_opinion=selection_opinion)
     schema = _get_schema()
 
-    response = call_llm_structured(
-        prompt=prompt,
-        schema=schema,
-        temperature=TEMPERATURE,
-        enable_reasoning=ENABLE_REASONING,
-    )
+    response = call_structured(
+        build_messages(prompt, schema), schema, "decision"
+    ).data
 
     llm_decisions = response.get("decisions", [])
     keep_mask = _build_keep_mask_from_llm_decisions(tokens, llm_decisions)
@@ -372,12 +358,9 @@ def _generate_keep_mask_block(
             review_fixes=review_fixes,
             selection_opinion=selection_opinion,
         )
-        response = call_llm_structured(
-            prompt=prompt,
-            schema=schema,
-            temperature=TEMPERATURE,
-            enable_reasoning=ENABLE_REASONING,
-        )
+        response = call_structured(
+            build_messages(prompt, schema), schema, "decision"
+        ).data
         llm_decisions = response.get("decisions", [])
         allowed = {int(tokens[i]["index"]) for i in positions}
         chunk_map = _merge_chunk_decisions(llm_decisions, allowed)
