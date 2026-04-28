@@ -54,7 +54,7 @@ def test_run_2a_outputs_dense_cleaned_annotations_with_corrections(monkeypatch):
         raise AssertionError(f"unexpected stage {stage}")
 
     monkeypatch.setattr(
-        "autosmartcut.intelligence_2a.call_structured",
+        "autosmartcut.nodes.l2.intelligence_2a.call_structured",
         _fake_call_structured,
     )
 

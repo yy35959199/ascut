@@ -12,6 +12,8 @@ from autosmartcut.nodes.l2.intelligence_llm import (
     _validate_json,
 )
 
+_MODULE = "autosmartcut.nodes.l2.intelligence_llm"
+
 
 def _dummy_llm_app_config() -> AppConfig:
     stage = LLMStageConfig(
@@ -48,6 +50,38 @@ def _decision_schema() -> dict:
         },
         "required": ["decisions"],
     }
+
+
+def _make_stream_chunks(content: str):
+    """构造模拟流式 chunk 列表（content delta + usage chunk）。"""
+    # content delta chunk
+    yield SimpleNamespace(
+        usage=None,
+        choices=[SimpleNamespace(
+            finish_reason=None,
+            delta=SimpleNamespace(content=content, reasoning_content=None),
+        )],
+    )
+    # finish chunk
+    yield SimpleNamespace(
+        usage=None,
+        choices=[SimpleNamespace(
+            finish_reason="stop",
+            delta=SimpleNamespace(content=None, reasoning_content=None),
+        )],
+    )
+    # usage chunk（stream_options.include_usage=True）
+    yield SimpleNamespace(
+        usage=SimpleNamespace(
+            prompt_tokens=1,
+            completion_tokens=1,
+            total_tokens=2,
+            prompt_cache_hit_tokens=None,
+            prompt_cache_miss_tokens=None,
+            completion_tokens_details=None,
+        ),
+        choices=[],
+    )
 
 
 def test_validate_json_passes_for_valid_instance() -> None:
@@ -89,38 +123,16 @@ def test_validate_json_fails_on_invalid_schema() -> None:
 
 
 def test_call_structured_schema_error_fail_fast(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(f"{_MODULE}.load_config", _dummy_llm_app_config)
+    monkeypatch.setattr(f"{_MODULE}.OpenAI", lambda **kwargs: SimpleNamespace())
     monkeypatch.setattr(
-        "autosmartcut.intelligence_llm.load_config",
-        _dummy_llm_app_config,
-    )
-    monkeypatch.setattr(
-        "autosmartcut.intelligence_llm.OpenAI",
-        lambda **kwargs: SimpleNamespace(),
-    )
-    monkeypatch.setattr(
-        "autosmartcut.intelligence_llm._call_api",
+        f"{_MODULE}._call_api",
         lambda *args, **kwargs: (
-            SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        message=SimpleNamespace(content='{"x": 1}'),
-                        finish_reason="stop",
-                    )
-                ],
-                usage=SimpleNamespace(
-                    prompt_tokens=1,
-                    completion_tokens=1,
-                    total_tokens=2,
-                ),
-            ),
-            {
-                "model": "deepseek-v4-flash",
-                "messages": [],
-                "max_tokens": 1024,
-                "response_format": {"type": "json_object"},
-                "extra_body": {"thinking": {"type": "disabled"}},
-                "temperature": 0.3,
-            },
+            _make_stream_chunks('{"x": 1}'),
+            {"model": "deepseek-v4-flash", "messages": [], "max_tokens": 1024,
+             "response_format": {"type": "json_object"}, "stream": True,
+             "stream_options": {"include_usage": True},
+             "extra_body": {"thinking": {"type": "disabled"}}, "temperature": 0.3},
         ),
     )
 
@@ -130,15 +142,9 @@ def test_call_structured_schema_error_fail_fast(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_call_structured_instance_error_retries(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "autosmartcut.intelligence_llm.load_config",
-        _dummy_llm_app_config,
-    )
-    monkeypatch.setattr(
-        "autosmartcut.intelligence_llm.OpenAI",
-        lambda **kwargs: SimpleNamespace(),
-    )
-    monkeypatch.setattr("autosmartcut.intelligence_llm.time.sleep", lambda _: None)
+    monkeypatch.setattr(f"{_MODULE}.load_config", _dummy_llm_app_config)
+    monkeypatch.setattr(f"{_MODULE}.OpenAI", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setattr(f"{_MODULE}.time.sleep", lambda _: None)
 
     call_count = {"n": 0}
 
@@ -148,30 +154,19 @@ def test_call_structured_instance_error_retries(monkeypatch: pytest.MonkeyPatch)
             content = '{"decisions":[{"index":0,"keep":"true"}]}'
         else:
             content = '{"decisions":[{"index":0,"keep":true}]}'
-        resp = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content=content),
-                    finish_reason="stop",
-                )
-            ],
-            usage=SimpleNamespace(
-                prompt_tokens=1,
-                completion_tokens=1,
-                total_tokens=2,
-            ),
-        )
         api_kw = {
             "model": cfg.model,
             "messages": messages,
             "max_tokens": cfg.max_tokens,
             "response_format": {"type": "json_object"},
+            "stream": True,
+            "stream_options": {"include_usage": True},
             "extra_body": {"thinking": {"type": "disabled"}},
             "temperature": cfg.temperature,
         }
-        return resp, api_kw
+        return _make_stream_chunks(content), api_kw
 
-    monkeypatch.setattr("autosmartcut.intelligence_llm._call_api", _fake_call_api)
+    monkeypatch.setattr(f"{_MODULE}._call_api", _fake_call_api)
 
     schema = _decision_schema()
     out = call_structured(build_messages("test", schema), schema, "r1", max_retries=3).data

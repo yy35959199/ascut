@@ -12,6 +12,8 @@ from autosmartcut.nodes.l2.intelligence_llm import (
     sanitize_messages_for_api,
 )
 
+_MODULE = "autosmartcut.nodes.l2.intelligence_llm"
+
 
 def _dummy_llm_app_config(
     *,
@@ -35,6 +37,35 @@ def _dummy_llm_app_config(
         },
     )
     return AppConfig(llm=llm)
+
+
+def _make_stream_chunks(content: str):
+    """构造模拟流式 chunk 列表（content delta + usage chunk）。"""
+    yield SimpleNamespace(
+        usage=None,
+        choices=[SimpleNamespace(
+            finish_reason=None,
+            delta=SimpleNamespace(content=content, reasoning_content=None),
+        )],
+    )
+    yield SimpleNamespace(
+        usage=None,
+        choices=[SimpleNamespace(
+            finish_reason="stop",
+            delta=SimpleNamespace(content=None, reasoning_content=None),
+        )],
+    )
+    yield SimpleNamespace(
+        usage=SimpleNamespace(
+            prompt_tokens=1,
+            completion_tokens=1,
+            total_tokens=2,
+            prompt_cache_hit_tokens=None,
+            prompt_cache_miss_tokens=None,
+            completion_tokens_details=None,
+        ),
+        choices=[],
+    )
 
 
 def test_sanitize_messages_strips_reasoning_content() -> None:
@@ -79,7 +110,7 @@ def test_call_structured_augment_last_user_and_parse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "autosmartcut.intelligence_llm.load_config",
+        f"{_MODULE}.load_config",
         lambda: _dummy_llm_app_config(thinking=False),
     )
 
@@ -88,26 +119,15 @@ def test_call_structured_augment_last_user_and_parse(
     class _FakeCompletions:
         def create(self, **kwargs):
             captured["kwargs"] = kwargs
-            return SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        message=SimpleNamespace(content='{"x": 42}'),
-                        finish_reason="stop",
-                    )
-                ],
-                usage=SimpleNamespace(
-                    prompt_tokens=1,
-                    completion_tokens=1,
-                    total_tokens=2,
-                ),
-            )
+            # 返回流式 chunk 迭代器
+            return _make_stream_chunks('{"x": 42}')
 
     class _FakeClient:
         def __init__(self, **kw):
             self.chat = SimpleNamespace(completions=_FakeCompletions())
 
-    monkeypatch.setattr("autosmartcut.intelligence_llm._get_client", lambda ak, bu: _FakeClient())
-    monkeypatch.setattr("autosmartcut.intelligence_llm.time.sleep", lambda _: None)
+    monkeypatch.setattr(f"{_MODULE}._get_client", lambda ak, bu: _FakeClient())
+    monkeypatch.setattr(f"{_MODULE}.time.sleep", lambda _: None)
 
     schema = {
         "type": "object",
@@ -127,6 +147,9 @@ def test_call_structured_augment_last_user_and_parse(
     assert "示例 JSON" in last_user or "JSON" in last_user
     assert captured["kwargs"]["extra_body"]["thinking"]["type"] == "disabled"
     assert "temperature" in captured["kwargs"]
+    # 验证始终流式
+    assert captured["kwargs"]["stream"] is True
+    assert captured["kwargs"]["stream_options"] == {"include_usage": True}
 
 
 def test_build_chat_kwargs_omits_temperature_when_thinking() -> None:
@@ -146,3 +169,5 @@ def test_build_chat_kwargs_omits_temperature_when_thinking() -> None:
     assert kw["reasoning_effort"] == "high"
     assert kw["extra_body"]["thinking"]["type"] == "enabled"
     assert kw["response_format"] == {"type": "json_object"}
+    assert kw["stream"] is True
+    assert kw["stream_options"] == {"include_usage": True}

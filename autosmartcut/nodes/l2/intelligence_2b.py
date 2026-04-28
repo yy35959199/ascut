@@ -62,6 +62,7 @@ manifest_dict["keep_mask"] = [
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Literal
 
 from autosmartcut.config import load_config
@@ -116,6 +117,7 @@ def run_2b_decision(
     *,
     mode: TwoBMode = "single",
     review_fixes: list[dict] | None = None,
+    on_chunk: Callable | None = None,
 ) -> dict:
     """2b 决策子阶段：输出 keep_mask
 
@@ -125,6 +127,7 @@ def run_2b_decision(
         review_fixes: 2c 审核返回的修正指令列表（修正重跑时由编排层传入）。
             每项含 ``requirement``、``missing_indices``、``note``。
             为 None 或空列表时表示首次调用，不注入审核反馈。
+        on_chunk: 可选；透传给 ``call_structured``，每个流式 StreamChunk 事件调用一次。
 
     Returns:
         追加了 keep_mask 字段的 manifest_dict
@@ -151,12 +154,12 @@ def run_2b_decision(
     if mode == "block":
         keep_mask = _generate_keep_mask_block(
             tokens, comprehension, goal, review_fixes=review_fixes,
-            selection_opinion=selection_opinion,
+            selection_opinion=selection_opinion, on_chunk=on_chunk,
         )
     else:
         keep_mask = _generate_keep_mask(
             tokens, comprehension, goal, review_fixes=review_fixes,
-            selection_opinion=selection_opinion,
+            selection_opinion=selection_opinion, on_chunk=on_chunk,
         )
 
     # 验证 keep_mask 格式
@@ -195,6 +198,7 @@ def _generate_keep_mask(
     *,
     review_fixes: list[dict] | None = None,
     selection_opinion: str = "",
+    on_chunk: Callable | None = None,
 ) -> list[dict]:
     """调用 LLM 生成 keep_mask（single 模式：全文一次调用）"""
     n_tokens = len(tokens)
@@ -206,7 +210,7 @@ def _generate_keep_mask(
     logger.info("[2b] single prompt 长度: %d 字符", len(prompt))
 
     response = call_structured(
-        build_messages(prompt, schema), schema, "decision"
+        build_messages(prompt, schema), schema, "decision", on_chunk=on_chunk,
     ).data
 
     llm_decisions = response.get("decisions", [])
@@ -303,6 +307,7 @@ def _generate_keep_mask_block(
     *,
     review_fixes: list[dict] | None = None,
     selection_opinion: str = "",
+    on_chunk: Callable | None = None,
 ) -> list[dict]:
     """按 outline_blocks 整块调用 LLM，每块一次，不做子块拆分，合并为完整 keep_mask。"""
     outline_blocks = comprehension.get("outline_blocks", [])
@@ -313,7 +318,7 @@ def _generate_keep_mask_block(
         logger.info("[2b] block：outline_blocks 为空，回退为 single 单次调用")
         return _generate_keep_mask(
             tokens, comprehension, goal, review_fixes=review_fixes,
-            selection_opinion=selection_opinion,
+            selection_opinion=selection_opinion, on_chunk=on_chunk,
         )
 
     partitions = _partition_token_indices_by_blocks(tokens, outline_blocks)
@@ -366,7 +371,7 @@ def _generate_keep_mask_block(
             len(prompt),
         )
         response = call_structured(
-            build_messages(prompt, schema), schema, "decision"
+            build_messages(prompt, schema), schema, "decision", on_chunk=on_chunk,
         ).data
         llm_decisions = response.get("decisions", [])
         logger.info("[2b] block 块 %d/%d LLM 返回 %d 条决策", ord1, n_blocks, len(llm_decisions))
@@ -604,12 +609,14 @@ def _get_schema() -> dict:
     """2b 决策的输出 JSON Schema：供 intelligence_llm 生成示例尾缀 + 解析后校验。"""
     return {
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "decisions": {
                 "type": "array",
                 "description": "对每个 speech 标注的决策列表",
                 "items": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "index": {
                             "type": "integer",

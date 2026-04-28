@@ -6,6 +6,13 @@
 - 结构化 JSON 输出与 jsonschema 校验
 - 思考模式通过 extra_body.thinking；reasoning_effort 为顶层参数
 - 客户端单例复用、重试与缓存友好（R1+R2 共享前缀）
+- 流式输出（stream=True + stream_options.include_usage）：
+  - 内部始终走流式路径，通过 on_chunk 回调推送 StreamChunk 事件
+  - on_chunk 可选；不传则静默收集，行为与原非流式一致
+  - 重试时推送 retry chunk，通知消费方清空已显示内容
+
+# TODO: 未来 TUI async 消费时，考虑实现 call_structured_aiter()
+#       返回 AsyncIterator[StreamChunk]，供 async 事件循环逐 chunk await。
 """
 
 from __future__ import annotations
@@ -14,8 +21,9 @@ import copy
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
@@ -104,6 +112,44 @@ class StructuredResult:
     assistant_content: str
     usage: dict
     request_messages: list[dict]
+
+
+@dataclass
+class StreamChunk:
+    """LLM 流式输出的单个事件。
+
+    event 类型语义：
+    - ``"reasoning_delta"``：thinking 模式下推理过程的增量文本（reasoning_delta 非空）
+    - ``"content_delta"``  ：最终回答的增量文本（content_delta 非空）
+    - ``"usage"``          ：流结束时的 token 用量（stream_options.include_usage）
+    - ``"retry"``          ：本次尝试失败，即将重试（UI 应清空当前显示内容）
+    - ``"result"``         ：调用成功，携带最终 StructuredResult
+
+    delta 类事件只带 delta 字段，不带累积字符串（消费方自行维护 buffer）。
+    usage 和 result 不放入 ProgressEvent.payload——usage 由 _log_llm_call 记录，
+    result 由节点层处理（写 manifest + 发 stage_exit）。
+    """
+
+    stage: str
+    """LLM 阶段标识，与 config.toml [llm.stages.*] 键名一致（r1/r2/decision/review/light）"""
+
+    event: Literal["reasoning_delta", "content_delta", "usage", "retry", "result"]
+
+    # delta 类
+    reasoning_delta: str = ""
+    content_delta: str = ""
+
+    # usage 类
+    usage: dict[str, Any] | None = None
+
+    # retry 类
+    attempt: int = 0
+    """第几次尝试失败（1-based）"""
+    retry_reason: str = ""
+    """失败原因简述"""
+
+    # result 类
+    result: StructuredResult | None = None
 
 
 # ============================================================================
@@ -251,12 +297,14 @@ def _last_user_needs_schema_augment(messages: list[dict]) -> bool:
 
 
 def _build_chat_kwargs(messages: list[dict], cfg: LLMStageConfig) -> dict[str, Any]:
-    """构造 chat.completions.create 的 kwargs（DeepSeek V4）。"""
+    """构造 chat.completions.create 的 kwargs（DeepSeek V4，始终流式）。"""
     kwargs: dict[str, Any] = {
         "model": cfg.model,
         "messages": messages,
         "max_tokens": cfg.max_tokens,
         "response_format": {"type": "json_object"},
+        "stream": True,                                # 始终流式
+        "stream_options": {"include_usage": True},     # 流结束时拿 usage
         "extra_body": {
             "thinking": {"type": "enabled" if cfg.thinking else "disabled"},
         },
@@ -283,52 +331,112 @@ def _call_api(
         raise LLMAPIError(0, str(e))
 
 
-def _response_to_log_dict(response: Any) -> dict[str, Any]:
+def _extract_stream_usage(usage_obj: Any) -> dict[str, Any]:
+    """从流式 usage chunk 提取 token 计数字典。"""
+    usage: dict[str, Any] = {}
+    if usage_obj is None:
+        return usage
+    for attr in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        val = getattr(usage_obj, attr, None)
+        if val is not None:
+            usage[attr] = val
+    for attr in ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
+        val = getattr(usage_obj, attr, None)
+        if val is not None:
+            usage[attr] = val
+    details = getattr(usage_obj, "completion_tokens_details", None)
+    if details is not None:
+        rt = getattr(details, "reasoning_tokens", None)
+        if rt is not None:
+            usage["reasoning_tokens"] = rt
+    return usage
+
+
+def _safe_on_chunk(
+    on_chunk: Callable[[StreamChunk], None],
+    chunk: StreamChunk,
+) -> None:
+    """调用 on_chunk，捕获异常避免回调错误中断 LLM 收集。"""
     try:
-        if hasattr(response, "model_dump"):
-            raw = response.model_dump(mode="python")  # type: ignore[union-attr]
-            return json.loads(json.dumps(raw, default=str))
-    except Exception:
-        pass
-    return {"repr": str(response)[:8000]}
+        on_chunk(chunk)
+    except Exception as e:
+        logger.warning("[LLM] on_chunk 回调异常（忽略）: %s", e)
 
 
-def _parse_response(response: Any, cfg: LLMStageConfig) -> tuple[str, dict[str, Any], str | None]:
-    choice = response.choices[0]
-    finish_reason = getattr(choice, "finish_reason", None)
+def _collect_stream(
+    stream_response: Any,
+    stage: str,
+    cfg: LLMStageConfig,
+    *,
+    on_chunk: Callable[[StreamChunk], None] | None = None,
+) -> tuple[str, str | None, dict[str, Any]]:
+    """消费 SSE 流，返回 (content, reasoning_content, usage)。
+
+    过程中通过 on_chunk 推送每个 delta 和 usage 事件。
+    on_chunk 调用是同步的；_safe_on_chunk 保证回调异常不中断收集。
+
+    finish_reason 检查：
+    - ``length``                    → WARNING（达到 max_tokens 或上下文长度限制）
+    - ``insufficient_system_resource`` → WARNING（系统推理资源不足，生成被打断）
+    - ``content_filter``            → WARNING（触发内容过滤）
+    """
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    usage: dict[str, Any] = {}
+    finish_reason: str | None = None
+
+    for chunk in stream_response:
+        # usage chunk（stream_options.include_usage=True，在 [DONE] 前出现）
+        if getattr(chunk, "usage", None) is not None:
+            usage = _extract_stream_usage(chunk.usage)
+            if on_chunk:
+                _safe_on_chunk(on_chunk, StreamChunk(
+                    stage=stage, event="usage", usage=usage,
+                ))
+            continue
+
+        if not chunk.choices:
+            continue
+
+        choice = chunk.choices[0]
+
+        # 记录最后一个非 None 的 finish_reason
+        fr = getattr(choice, "finish_reason", None)
+        if fr is not None:
+            finish_reason = fr
+
+        delta = choice.delta
+        c = getattr(delta, "content", None) or ""
+        r = getattr(delta, "reasoning_content", None) or ""
+
+        if c:
+            content_parts.append(c)
+        if r:
+            reasoning_parts.append(r)
+
+        if on_chunk:
+            if r:
+                _safe_on_chunk(on_chunk, StreamChunk(
+                    stage=stage, event="reasoning_delta", reasoning_delta=r,
+                ))
+            if c:
+                _safe_on_chunk(on_chunk, StreamChunk(
+                    stage=stage, event="content_delta", content_delta=c,
+                ))
+
+    # finish_reason 检查（与原 _parse_response 行为一致）
     if finish_reason == "length":
         logger.warning("[LLM] finish_reason=length（达到 max_tokens 或上下文长度限制）")
     elif finish_reason == "insufficient_system_resource":
         logger.warning(
             "[LLM] finish_reason=insufficient_system_resource（系统推理资源不足，生成被打断）"
         )
+    elif finish_reason == "content_filter":
+        logger.warning("[LLM] finish_reason=content_filter（触发内容过滤）")
 
-    message = choice.message
-    content = message.content or ""
-
-    reasoning_content = None
-    if hasattr(message, "reasoning_content"):
-        reasoning_content = message.reasoning_content
-
-    usage: dict[str, Any] = {
-        "prompt_tokens": response.usage.prompt_tokens,
-        "completion_tokens": response.usage.completion_tokens,
-        "total_tokens": response.usage.total_tokens,
-    }
-
-    if hasattr(response.usage, "prompt_cache_hit_tokens"):
-        usage["prompt_cache_hit_tokens"] = response.usage.prompt_cache_hit_tokens
-    if hasattr(response.usage, "prompt_cache_miss_tokens"):
-        usage["prompt_cache_miss_tokens"] = response.usage.prompt_cache_miss_tokens
-
-    if hasattr(response.usage, "completion_tokens_details"):
-        details = response.usage.completion_tokens_details
-        if details is not None and hasattr(details, "reasoning_tokens"):
-            rt = details.reasoning_tokens
-            if rt is not None:
-                usage["reasoning_tokens"] = rt
-
-    return content, usage, reasoning_content
+    content = "".join(content_parts)
+    reasoning = "".join(reasoning_parts) if reasoning_parts else None
+    return content, reasoning, usage
 
 
 def _extract_json(content: str) -> dict:
@@ -401,7 +509,6 @@ def _validate_json(data: dict, schema: dict) -> None:
 def _log_llm_call(
     hint: str,
     api_kwargs: dict[str, Any],
-    response: Any,
     parsed_content: str,
     usage: dict[str, Any],
     cfg: LLMStageConfig,
@@ -443,7 +550,7 @@ def _log_llm_call(
     )
 
     def _resp_payload() -> dict[str, Any]:
-        body = _response_to_log_dict(response)
+        body: dict[str, Any] = {}
         body["parsed_content"] = parsed_content
         if reasoning_content is not None:
             body["reasoning_content"] = reasoning_content
@@ -469,8 +576,20 @@ def call_structured(
     stage: str,
     *,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    on_chunk: Callable[[StreamChunk], None] | None = None,
 ) -> StructuredResult:
-    """结构化 JSON 补全（按 config.toml [llm.stages.*]）。"""
+    """结构化 JSON 补全（按 config.toml [llm.stages.*]）。
+
+    内部始终走流式（stream=True + stream_options.include_usage）。
+    on_chunk 可选；传入时，每个流式事件（reasoning_delta / content_delta /
+    usage / retry / result）都会同步调用一次。不传则静默收集。
+
+    重试语义：
+    - 空 content 或 JSON 解析/schema 校验失败时重试（最多 max_retries 次）
+    - 重试前推送 retry chunk（attempt=当前失败次数，1-based），通知消费方清空显示
+    - schema 本身有问题（SCHEMA_ERROR）时不重试，直接抛出
+    - API 级错误（LLMAPIError）不重试，直接抛出
+    """
     app_cfg = load_config()
     if app_cfg.llm is None:
         raise ValueError("config.toml 缺少 [llm] 配置，无法调用 LLM")
@@ -498,14 +617,16 @@ def call_structured(
                 max_retries,
             )
             _t_req = time.monotonic()
-            response, api_kwargs = _call_api(client, msgs, cfg)
+            stream_response, api_kwargs = _call_api(client, msgs, cfg)
+            content, reasoning_content, usage = _collect_stream(
+                stream_response, stage, cfg, on_chunk=on_chunk,
+            )
             _elapsed_req = time.monotonic() - _t_req
             logger.info(
-                "[LLM] stage=%s 响应返回，耗时 %.1fs",
+                "[LLM] stage=%s 流式收集完成，耗时 %.1fs",
                 stage,
                 _elapsed_req,
             )
-            content, usage, reasoning_content = _parse_response(response, cfg)
 
             if not content or content.strip() == "":
                 raise LLMEmptyContentError(usage)
@@ -516,27 +637,39 @@ def call_structured(
             _log_llm_call(
                 hint,
                 api_kwargs,
-                response,
                 content,
                 usage,
                 cfg,
                 reasoning_content,
             )
 
-            return StructuredResult(
+            sr = StructuredResult(
                 data=data,
                 assistant_content=content,
                 usage=usage,
                 request_messages=request_snapshot,
             )
+            # 成功：推 result chunk，通知消费方该 stage 已完成
+            if on_chunk:
+                _safe_on_chunk(on_chunk, StreamChunk(
+                    stage=stage, event="result", result=sr,
+                ))
+            return sr
 
         except LLMEmptyContentError:
             if attempt < max_retries - 1:
+                if on_chunk:
+                    _safe_on_chunk(on_chunk, StreamChunk(
+                        stage=stage,
+                        event="retry",
+                        attempt=attempt + 1,
+                        retry_reason="API 返回空 content",
+                    ))
                 logger.warning(
                     "[LLM] stage=%s 空 content，重试 %d/%d",
                     stage, attempt + 1, max_retries,
                 )
-                time.sleep(RETRY_DELAY_SECONDS * (2**attempt))
+                time.sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
                 continue
             raise
 
@@ -544,11 +677,19 @@ def call_structured(
             if "SCHEMA_ERROR:" in str(e):
                 raise
             if attempt < max_retries - 1:
+                reason = str(e)[:120]
+                if on_chunk:
+                    _safe_on_chunk(on_chunk, StreamChunk(
+                        stage=stage,
+                        event="retry",
+                        attempt=attempt + 1,
+                        retry_reason=reason,
+                    ))
                 logger.warning(
                     "[LLM] stage=%s JSON 解析失败，重试 %d/%d: %s",
                     stage, attempt + 1, max_retries, e,
                 )
-                time.sleep(RETRY_DELAY_SECONDS * (2**attempt))
+                time.sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
                 continue
             raise
 

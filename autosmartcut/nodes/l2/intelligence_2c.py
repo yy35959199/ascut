@@ -39,6 +39,7 @@ manifest_dict["review_report"] = {
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from autosmartcut.config import load_config
@@ -55,6 +56,7 @@ def run_2c_review(
     manifest_dict: dict,
     *,
     review_round: int = 0,
+    on_chunk: Callable | None = None,
 ) -> dict:
     """2c 审核子阶段。
 
@@ -65,6 +67,7 @@ def run_2c_review(
     Args:
         manifest_dict: 包含 tokens、comprehension、keep_mask、goal 的工作数据。
         review_round: 当前审核轮次（0-based），由编排层传入。
+        on_chunk: 可选；透传给 ``call_structured``，每个流式 StreamChunk 事件调用一次。
 
     Returns:
         追加了 review_report 字段的 manifest_dict。
@@ -73,7 +76,7 @@ def run_2c_review(
     if cfg.two_c_max_review_rounds == 0:
         return _run_2c_passthrough(manifest_dict, review_round)
 
-    return _run_2c_real(manifest_dict, review_round=review_round, cfg=cfg)
+    return _run_2c_real(manifest_dict, review_round=review_round, cfg=cfg, on_chunk=on_chunk)
 
 
 # ============================================================================
@@ -105,6 +108,7 @@ def _run_2c_real(
     *,
     review_round: int,
     cfg: Any,
+    on_chunk: Callable | None = None,
 ) -> dict:
     """真实审核：单次 LLM 调用，两阶段输出（checklist → judgments）。"""
     logger.info("[2c] 审核子阶段开始（轮次 %d）", review_round)
@@ -124,7 +128,7 @@ def _run_2c_real(
     prompt = _build_review_prompt(tokens, comprehension, keep_mask, goal)
     schema = _get_review_schema()
 
-    llm_result = call_structured(build_messages(prompt, schema), schema, "review")
+    llm_result = call_structured(build_messages(prompt, schema), schema, "review", on_chunk=on_chunk)
     response = llm_result.data
 
     checklist = response.get("checklist", [])
@@ -352,12 +356,14 @@ def _get_review_schema() -> dict:
     """2c 审核的输出 JSON Schema。verdict 不在此处，由程序计算。"""
     return {
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "checklist": {
                 "type": "array",
                 "description": "审核检查清单（第一步生成）",
                 "items": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "item": {
                             "type": "string",
@@ -381,6 +387,7 @@ def _get_review_schema() -> dict:
                 "description": "逐条判断结果（第二步生成）",
                 "items": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "checklist_index": {
                             "type": "integer",

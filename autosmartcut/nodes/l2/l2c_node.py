@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from autosmartcut.nodes.l2.annotation_tokens import tokens_from_annotations
 from autosmartcut.pipeline.pipeline_events import ProgressEvent
 from autosmartcut.pipeline.pipeline_models import L2cOutput, StageResult, StageStatus
+from autosmartcut.nodes.l2.llm_progress import make_on_chunk
 
 if TYPE_CHECKING:
     from autosmartcut.config import AppConfig
@@ -79,6 +80,7 @@ class L2cNode:
                 run_2c_review,
                 manifest,
                 review_round=review_round,
+                on_chunk=make_on_chunk(ctx.emit, self.id),
             )
         except Exception as e:
             logger.exception("[L2cNode] run_2c_review 失败: %s", e)

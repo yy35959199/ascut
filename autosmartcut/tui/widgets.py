@@ -87,6 +87,87 @@ if _TEXTUAL_AVAILABLE:
                 pass
 
     # -----------------------------------------------------------------------
+    # LLMStreamView
+    # -----------------------------------------------------------------------
+
+    class LLMStreamView(Widget):
+        """LLM 流式输出视图：双面板显示 reasoning 和 content。
+
+        状态栏：当前 stage + 状态（思考中 / 生成中 / 重试中 / 完成）
+        reasoning 面板：thinking 过程（暗色，可滚动）
+        content 面板：最终 JSON 输出（主色调，高度自适应）
+
+        生命周期：
+        - ``reset()``：新 stage 开始时清空所有面板
+        - ``handle_llm_chunk(payload)``：处理 ProgressEvent(phase="llm_stream") 的 payload
+        """
+
+        def compose(self):
+            yield Static("", id="llm-status-bar")
+            yield RichLog(id="llm-reasoning", max_lines=500, wrap=True, auto_scroll=True)
+            yield Static("─" * 40, id="llm-divider")
+            yield RichLog(id="llm-content", max_lines=200, wrap=True, auto_scroll=True)
+
+        def handle_llm_chunk(self, payload: dict) -> None:
+            """处理单个 llm_stream payload，更新对应面板。"""
+            evt = payload.get("event", "")
+            stage = payload.get("stage", "")
+
+            match evt:
+                case "reasoning_delta":
+                    delta = payload.get("reasoning_delta", "")
+                    if delta:
+                        try:
+                            self.query_one("#llm-status-bar", Static).update(
+                                f"🧠 [{stage}] 思考中..."
+                            )
+                            self.query_one("#llm-reasoning", RichLog).write(delta)
+                        except Exception:
+                            pass
+
+                case "content_delta":
+                    delta = payload.get("content_delta", "")
+                    if delta:
+                        try:
+                            self.query_one("#llm-status-bar", Static).update(
+                                f"✍ [{stage}] 生成中..."
+                            )
+                            self.query_one("#llm-content", RichLog).write(delta)
+                        except Exception:
+                            pass
+
+                case "retry":
+                    attempt = payload.get("attempt", 0)
+                    reason = payload.get("retry_reason", "")
+                    reason_short = reason[:50] + "…" if len(reason) > 50 else reason
+                    try:
+                        self.query_one("#llm-status-bar", Static).update(
+                            f"⟳ [{stage}] 重试（第 {attempt} 次）: {reason_short}"
+                        )
+                        # 清空面板，准备接收新一轮输出
+                        self.query_one("#llm-reasoning", RichLog).clear()
+                        self.query_one("#llm-content", RichLog).clear()
+                    except Exception:
+                        pass
+
+                case "result":
+                    try:
+                        self.query_one("#llm-status-bar", Static).update(
+                            f"✓ [{stage}] 完成"
+                        )
+                    except Exception:
+                        pass
+
+        def reset(self) -> None:
+            """新 stage 开始时清空所有面板。"""
+            try:
+                self.query_one("#llm-status-bar", Static).update("")
+                self.query_one("#llm-reasoning", RichLog).clear()
+                self.query_one("#llm-content", RichLog).clear()
+            except Exception:
+                pass
+
+    # -----------------------------------------------------------------------
     # GenericStageView
     # -----------------------------------------------------------------------
 
@@ -196,10 +277,14 @@ if _TEXTUAL_AVAILABLE:
 
         def compose(self):
             yield GenericStageView(id="generic-view")
+            yield LLMStreamView(id="llm-stream-view")
 
         def show_stage_progress(self, node_id: str) -> None:
             if node_id == "l1_perception":
                 self._switch_to_l1a_view()
+            elif node_id.startswith("l2"):
+                # L2 节点：切换到 LLM 流式视图
+                self._switch_to_llm_stream_view()
             else:
                 self._ensure_generic_view()
                 try:
@@ -215,6 +300,21 @@ if _TEXTUAL_AVAILABLE:
             summary_line = f"✓ {node_id}{elapsed_str}"
             if node_id == "l1_perception":
                 self._teardown_l1a_view(summary_line)
+            elif node_id.startswith("l2"):
+                # L2 节点完成：隐藏流式视图，切回 generic 并记录摘要
+                try:
+                    lv = self.query_one("#llm-stream-view", LLMStreamView)
+                    lv.display = False
+                except Exception:
+                    pass
+                self._ensure_generic_view()
+                try:
+                    gv = self.query_one("#generic-view", GenericStageView)
+                    gv.freeze_current()
+                    gv.append_frozen(summary_line)
+                    gv.set_current("")
+                except Exception:
+                    pass
             else:
                 try:
                     gv = self.query_one("#generic-view", GenericStageView)
@@ -230,7 +330,16 @@ if _TEXTUAL_AVAILABLE:
                     self.query_one("#l1a-view", L1aProgressView).handle_progress(event)
                 except Exception:
                     pass
+            elif event.phase == "llm_stream":
+                # LLM 流式 chunk → LLMStreamView
+                try:
+                    self.query_one("#llm-stream-view", LLMStreamView).handle_llm_chunk(
+                        event.payload
+                    )
+                except Exception:
+                    pass
             else:
+                # 其他 progress（decision_start, review_start 等）→ GenericStageView 状态栏
                 try:
                     gv = self.query_one("#generic-view", GenericStageView)
                     gv.set_current(format_progress(event.node_id, event.phase, event.payload))
@@ -249,6 +358,19 @@ if _TEXTUAL_AVAILABLE:
                     self.mount(L1aProgressView(id="l1a-view"))
                 except Exception:
                     pass
+
+        def _switch_to_llm_stream_view(self) -> None:
+            """切换到 LLM 流式视图，清空上次内容。"""
+            try:
+                self.query_one("#generic-view", GenericStageView).display = False
+            except Exception:
+                pass
+            try:
+                lv = self.query_one("#llm-stream-view", LLMStreamView)
+                lv.display = True
+                lv.reset()
+            except Exception:
+                pass
 
         def _teardown_l1a_view(self, summary_line: str) -> None:
             try:
@@ -478,6 +600,9 @@ if _TEXTUAL_AVAILABLE:
 else:
     # Textual 不可用时提供占位类
     class PipelineSidebar:  # type: ignore[no-redef]
+        pass
+
+    class LLMStreamView:  # type: ignore[no-redef]
         pass
 
     class GenericStageView:  # type: ignore[no-redef]

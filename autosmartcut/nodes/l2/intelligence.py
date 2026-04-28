@@ -76,7 +76,7 @@ def _check_correction_affects_purpose(
         "required": ["affects_purpose"],
     }
     result = call_structured(
-        build_messages(prompt, schema), schema, "light"
+        build_messages(prompt, schema), schema, "light",
     ).data
     return bool(result.get("affects_purpose", False))
 

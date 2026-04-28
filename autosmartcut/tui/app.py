@@ -70,6 +70,29 @@ if _TEXTUAL_AVAILABLE:
             height: 1;
             color: $text-muted;
         }
+        LLMStreamView {
+            height: 1fr;
+            layout: vertical;
+            display: none;
+        }
+        #llm-status-bar {
+            height: 1;
+            color: $warning;
+        }
+        #llm-reasoning {
+            height: 1fr;
+            border: none;
+            color: $text-muted;
+        }
+        #llm-divider {
+            height: 1;
+            color: $text-muted;
+        }
+        #llm-content {
+            height: auto;
+            max-height: 8;
+            border: none;
+        }
         L1aProgressView {
             height: 1fr;
             layout: vertical;

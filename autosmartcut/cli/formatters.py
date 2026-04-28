@@ -262,6 +262,21 @@ def format_progress(node_id: str, phase: str, payload: dict) -> str:
         case ("l3_execute", "execute_done"):
             out = p.get("output_path", "")
             return f"  L3 完成 ({p.get('elapsed_sec', 0):.1f}s) → {out}"
+        # ── LLM 流式（所有 L2 节点共用）────────────────────────────────────
+        case (_, "llm_stream"):
+            evt = p.get("event", "")
+            stage = p.get("stage", "")
+            match evt:
+                case "reasoning_delta" | "content_delta":
+                    # CLI 不逐 delta 打印（太碎），静默
+                    return ""
+                case "retry":
+                    attempt = p.get("attempt", 0)
+                    reason = p.get("retry_reason", "")
+                    reason_short = reason[:60] + "…" if len(reason) > 60 else reason
+                    return f"  [LLM] {stage} 第 {attempt} 次失败，重试中... ({reason_short})"
+                case _:
+                    return ""
         # ── 未知 ──────────────────────────────────────────────────────────
         case _:
             return f"  [{node_id}] {phase}"

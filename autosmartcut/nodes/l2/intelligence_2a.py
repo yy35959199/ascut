@@ -67,6 +67,7 @@ def run_2a_comprehension(
     manifest_dict: dict,
     *,
     on_phase_save: Callable[[str, dict], None] | None = None,
+    on_chunk: Callable | None = None,
 ) -> dict:
     """2a 理解子阶段：两轮 LLM + 稀疏纠错 + 稠密回填
 
@@ -74,6 +75,7 @@ def run_2a_comprehension(
         manifest_dict: 包含 ``tokens``（JSON2 句面）、``goal``、可选 ``source`` 的工作数据
         on_phase_save: 可选；``("2a_r1", payload)`` 在 R1 完成后、``("2a_r2", payload)`` 在
             稠密 ``comprehension`` 写入 ``manifest_dict`` 之后调用，用于将 TimelineManifest 落盘。
+        on_chunk: 可选；透传给 ``call_structured``，每个流式 StreamChunk 事件调用一次。
 
     Returns:
         追加了 comprehension 字段的 manifest_dict
@@ -89,7 +91,7 @@ def run_2a_comprehension(
 
     # Round 1：内部会 `_build_r1_prompt` + `call_structured(..., "r1")`（见 intelligence_llm）
     purpose_rough, outline_blocks_rough, candidate_misrecognitions, r1_completion = (
-        _run_round1(tokens, goal)
+        _run_round1(tokens, goal, on_chunk=on_chunk)
     )
     if on_phase_save is not None:
         on_phase_save(
@@ -109,6 +111,7 @@ def run_2a_comprehension(
         goal,
         candidate_misrecognitions,
         r1_completion,
+        on_chunk=on_chunk,
     )
 
     # 程序步骤：只读句面为 tokens[].text，不修改 tokens
@@ -148,6 +151,8 @@ def run_2a_comprehension(
 def _run_round1(
     tokens: list[dict],
     goal: str,
+    *,
+    on_chunk: Callable | None = None,
 ) -> tuple[str, list[dict], list[dict], StructuredResult]:
     """Round 1: 粗理解 + ASR 误识候选
 
@@ -166,7 +171,7 @@ def _run_round1(
     # - 内部 build_messages → system=SYSTEM_PROMPT，user=prompt+JSON 示例+纪律说明
     # - 失败按 max_retries 重试
     # - 返回 StructuredResult：含解析后 dict、assistant 原文 JSON、请求快照（供 R2 多轮前缀）
-    r1_completion = call_structured(build_messages(prompt, schema), schema, "r1")
+    r1_completion = call_structured(build_messages(prompt, schema), schema, "r1", on_chunk=on_chunk)
     # 已通过 jsonschema 校验的结构化对象（可直接按键取值）
     response = r1_completion.data
 
@@ -221,6 +226,7 @@ def _get_r1_schema() -> dict:
     """R1 的 JSON Schema：与 `_build_r1_prompt` 任务字段一一对应；供 intelligence_llm 生成示例尾缀 + 校验。"""
     return {
         "type": "object",  # 根必须为 JSON 对象（json_object 模式）
+        "additionalProperties": False,
         "properties": {  # 允许的顶层键集合
             "purpose_rough": {  # 任务 1：粗糙主旨
                 "type": "string",
@@ -231,6 +237,7 @@ def _get_r1_schema() -> dict:
                 "description": "初步内容分块",
                 "items": {  # 每一块：闭区间 [start_index,end_index] + 主题词 topic
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "start_index": {"type": "integer"},  # 与 tokens 的 index 同坐标系
                         "end_index": {"type": "integer"},
@@ -244,6 +251,7 @@ def _get_r1_schema() -> dict:
                 "description": "ASR 可能误识的词条候选列表",
                 "items": {  # 每条候选绑定到句级 index
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "annotation_index": {
                             "type": "integer",
@@ -276,6 +284,8 @@ def _run_round2(
     goal: str,
     candidate_misrecognitions: list[dict],
     r1_completion: StructuredResult,
+    *,
+    on_chunk: Callable | None = None,
 ) -> tuple[str, list[dict], list[dict]]:
     """Round 2: 精化主旨 + 分块 + 纠错列表（多轮第二跳）
 
@@ -301,7 +311,7 @@ def _run_round2(
 
     # intelligence_llm.call_structured（stage=r2）：
     # - 在**最后一条** user 末尾再拼 R2 的 JSON 示例 + Schema 说明
-    response = call_structured(r2_messages, schema, "r2").data
+    response = call_structured(r2_messages, schema, "r2", on_chunk=on_chunk).data
 
     # R2 精化主旨（schema required）
     purpose = response["purpose"]
@@ -395,6 +405,7 @@ def _get_r2_schema() -> dict:
     """R2 的 JSON Schema：与 `_build_r2_user_followup` 三项任务对齐；多轮第二跳追加校验。"""
     return {
         "type": "object",  # 根对象；与 R1 相同 json_object 契约
+        "additionalProperties": False,
         "properties": {
             "purpose": {  # 任务 1：精化主旨
                 "type": "string",
@@ -405,6 +416,7 @@ def _get_r2_schema() -> dict:
                 "description": "内容分块列表",
                 "items": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "start_index": {"type": "integer"},
                         "end_index": {"type": "integer"},
@@ -418,6 +430,7 @@ def _get_r2_schema() -> dict:
                 "description": "纠错规则列表（仅包含确认的误识，不确定时宁可不输出）",
                 "items": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "index": {
                             "type": "integer",
@@ -670,6 +683,7 @@ def run_2a_comprehension_reflow(
     feedback_text: str = "",
     correction: dict | None = None,
     on_phase_save: Callable[[str, dict], None] | None = None,
+    on_chunk: Callable | None = None,
 ) -> dict:
     """2a 回流入口：根据 reflow_mode 更新 comprehension 的部分字段。
 
@@ -715,7 +729,7 @@ def run_2a_comprehension_reflow(
         schema = _get_r2_schema()
 
         response = call_structured(
-            build_messages(prompt, schema), schema, "r2"
+            build_messages(prompt, schema), schema, "r2", on_chunk=on_chunk,
         ).data
 
         # 仅更新 purpose 和 outline_blocks；cleaned_annotations 不变

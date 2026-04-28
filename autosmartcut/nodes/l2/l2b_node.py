@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from autosmartcut.nodes.l2.annotation_tokens import tokens_from_annotations
 from autosmartcut.pipeline.pipeline_events import ProgressEvent
 from autosmartcut.pipeline.pipeline_models import L2bOutput, StageResult, StageStatus
+from autosmartcut.nodes.l2.llm_progress import make_on_chunk
 
 if TYPE_CHECKING:
     from autosmartcut.config import AppConfig
@@ -114,6 +115,7 @@ class L2bNode:
                 manifest,
                 mode=two_b_mode,
                 review_fixes=review_fixes if review_fixes else None,
+                on_chunk=make_on_chunk(ctx.emit, self.id),
             )
         except Exception as e:
             logger.exception("[L2bNode] run_2b_decision 失败: %s", e)
