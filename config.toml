@@ -24,7 +24,7 @@ vad_speech_pad_ms = 10
 
 # DeepSeek V4：阶段化 LLM 参数；未在 stages 中指定的字段继承 [llm.default]
 [llm]
-api_key = "sk-d3a0bbc89e0c4978b4c1322120bbc355"
+api_key = "YOUR_DEEPSEEK_API_KEY"
 base_url = "https://api.deepseek.com"
 
 [llm.default]
