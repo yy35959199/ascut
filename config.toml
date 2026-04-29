@@ -51,6 +51,20 @@ thinking = true
 reasoning_effort = "high"
 temperature = 0.2
 
+# 2b R1：逐句口语清洗（语气词/重复等）
+[llm.stages.decision_r1]
+model = "deepseek-v4-flash"
+thinking = true
+reasoning_effort = "high"
+temperature = 0.1
+
+# 2b R2：全文内容取舍（离题/冗余等）
+[llm.stages.decision_r2]
+model = "deepseek-v4-flash"
+thinking = true
+reasoning_effort = "max"
+temperature = 0.2
+
 # 2c：审核校验
 [llm.stages.review]
 thinking = true
@@ -74,3 +88,9 @@ two_c_max_review_rounds = 1
 two_c_must_pass_rate = 1.0
 # 2d 人工审阅：最大回流次数（0=禁用回流，仅手动 toggle + 确认）
 two_d_max_reflows = 3
+# R1 后剩余保留句数低于此值时，R2 使用 single；否则 R2 按块并行
+two_b_r2_single_threshold = 300
+
+[tui]
+# 2b TUI：思考区域默认展开
+show_thinking_default = true

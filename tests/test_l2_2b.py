@@ -18,6 +18,9 @@ def _sr(data: dict) -> StructuredResult:
     return StructuredResult(data=data, assistant_content="{}", usage={}, request_messages=[])
 
 
+_PATCH_TARGET = "autosmartcut.nodes.l2.intelligence_2b.call_structured"
+
+
 def test_run_2b_rejects_non_dense_cleaned_annotations():
     manifest = {
         "goal": "提取核心观点",
@@ -97,17 +100,30 @@ def test_run_2b_chunked_two_blocks_merges_keep_mask(monkeypatch):
             ],
         },
     }
+    # R1 块1 → R1 块2 → R2 single（保留句 < 300）
     responses = iter(
         [
-            {"decisions": [{"index": 0, "keep": False}]},
-            {"decisions": [{"index": 1, "keep": True}, {"index": 2, "keep": False}]},
+            {"decisions": [{"index": 0, "keep": False, "reason": "filler"}]},
+            {
+                "decisions": [
+                    {"index": 1, "keep": True, "reason": "ok"},
+                    {"index": 2, "keep": False, "reason": "duplicate"},
+                ]
+            },
+            {
+                "decisions": [
+                    {"index": 0, "keep": False},
+                    {"index": 1, "keep": True},
+                    {"index": 2, "keep": False},
+                ]
+            },
         ]
     )
 
     def _fake_llm(*_a, **_kw):
         return _sr(next(responses))
 
-    monkeypatch.setattr("autosmartcut.intelligence_2b.call_structured", _fake_llm)
+    monkeypatch.setattr(_PATCH_TARGET, _fake_llm)
     out = run_2b_decision(manifest, mode="block")
     assert out["keep_mask"][0] == {"index": 0, "keep": False}
     assert out["keep_mask"][1] == {"index": 1, "keep": True}
@@ -129,16 +145,18 @@ def test_run_2b_chunked_empty_outline_falls_back_to_single(monkeypatch):
     def _fake_llm(*_a, **_kw):
         nonlocal n_calls
         n_calls += 1
+        if n_calls == 1:
+            return _sr({"decisions": [{"index": 0, "keep": False, "reason": "filler"}]})
         return _sr({"decisions": [{"index": 0, "keep": False}]})
 
-    monkeypatch.setattr("autosmartcut.intelligence_2b.call_structured", _fake_llm)
+    monkeypatch.setattr(_PATCH_TARGET, _fake_llm)
     out = run_2b_decision(manifest, mode="block")
-    assert n_calls == 1
+    assert n_calls == 2
     assert out["keep_mask"][0]["keep"] is False
 
 
 def test_run_2b_chunked_splits_outline_block_by_config_limit(monkeypatch):
-    """block 模式下单 outline 块整体一次调用（不再二次拆分）。"""
+    """outline 单块：R1 一次 + R2 single。"""
     manifest = {
         "goal": "g",
         "tokens": [
@@ -152,23 +170,26 @@ def test_run_2b_chunked_splits_outline_block_by_config_limit(monkeypatch):
             ],
         },
     }
-    # block 模式：整块一次调用，返回全部 5 句决策
-    responses = iter(
-        [
-            {"decisions": [
-                {"index": 0, "keep": True},
-                {"index": 1, "keep": False},
-                {"index": 2, "keep": False},
-                {"index": 3, "keep": True},
-                {"index": 4, "keep": False},
-            ]},
+    r1 = {
+        "decisions": [
+            {"index": i, "keep": True, "reason": "ok"} for i in range(5)
         ]
-    )
+    }
+    r2 = {
+        "decisions": [
+            {"index": 0, "keep": True},
+            {"index": 1, "keep": False},
+            {"index": 2, "keep": False},
+            {"index": 3, "keep": True},
+            {"index": 4, "keep": False},
+        ]
+    }
+    responses = iter([r1, r2])
 
     def _fake_llm(*_a, **_kw):
         return _sr(next(responses))
 
-    monkeypatch.setattr("autosmartcut.intelligence_2b.call_structured", _fake_llm)
+    monkeypatch.setattr(_PATCH_TARGET, _fake_llm)
     out = run_2b_decision(manifest, mode="block")
     assert out["keep_mask"][0]["keep"] is True
     assert out["keep_mask"][1]["keep"] is False
@@ -195,15 +216,21 @@ def test_run_2b_chunked_gap_block_for_uncovered_index(monkeypatch):
     }
     responses = iter(
         [
-            {"decisions": [{"index": 0, "keep": True}]},
-            {"decisions": [{"index": 1, "keep": False}]},
+            {"decisions": [{"index": 0, "keep": True, "reason": "ok"}]},
+            {"decisions": [{"index": 1, "keep": False, "reason": "filler"}]},
+            {
+                "decisions": [
+                    {"index": 0, "keep": True},
+                    {"index": 1, "keep": False},
+                ]
+            },
         ]
     )
 
     def _fake_llm(*_a, **_kw):
         return _sr(next(responses))
 
-    monkeypatch.setattr("autosmartcut.intelligence_2b.call_structured", _fake_llm)
+    monkeypatch.setattr(_PATCH_TARGET, _fake_llm)
     out = run_2b_decision(manifest, mode="block")
     assert out["keep_mask"][0]["keep"] is True
     assert out["keep_mask"][1]["keep"] is False

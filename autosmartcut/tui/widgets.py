@@ -31,6 +31,11 @@ except ImportError:
 
 
 if _TEXTUAL_AVAILABLE:
+    import time
+
+    from textual.binding import Binding
+    from textual.containers import Vertical, VerticalScroll
+
     from autosmartcut.cli.formatters import (
         format_decision_list,
         format_progress,
@@ -269,6 +274,346 @@ if _TEXTUAL_AVAILABLE:
                     pass
 
     # -----------------------------------------------------------------------
+    # 2b：BlockProgressBar / BlockChatView / ResultView / TwoBStageView
+    # -----------------------------------------------------------------------
+
+    class BlockProgressBar(Static):
+        """一排块状态指示器（○/⟳/✓/✗），由 TwoBStageView 驱动。"""
+
+        def __init__(self, **kwargs) -> None:
+            super().__init__("", **kwargs)
+
+    class BlockChatView(Widget):
+        """单块摘要 + 思考区 + 决策流。"""
+
+        def compose(self) -> None:
+            yield Static("", id="twob-chat-summary")
+            yield Static("▼ 思考", id="twob-thinking-toggle")
+            yield RichLog(id="twob-thinking-log", max_lines=400, wrap=True, auto_scroll=True)
+            yield Static("[bold]决策流[/bold]", id="twob-decisions-label")
+            yield RichLog(id="twob-decisions-log", max_lines=1200, wrap=True, auto_scroll=True)
+
+    class ResultView(Widget):
+        """与 2d 相同的保留/删除序列展示（依赖 format_decision_list）。"""
+
+        def compose(self) -> None:
+            with VerticalScroll():
+                yield Static("", id="twob-result-body")
+
+        def clear(self) -> None:
+            try:
+                self.query_one("#twob-result-body", Static).update("")
+            except Exception:
+                pass
+
+        def show_result(
+            self,
+            *,
+            tokens: list[dict],
+            keep_mask: list[dict],
+            comprehension: dict,
+        ) -> None:
+            from autosmartcut.nodes.l2.intelligence_2d_core import DisplayData
+
+            kc = sum(1 for e in keep_mask if e.get("keep") is True)
+            cc = sum(1 for e in keep_mask if e.get("keep") is False)
+            total = len(keep_mask)
+            stats = {
+                "keep_count": kc,
+                "cut_count": cc,
+                "total": total,
+                "override_count": 0,
+            }
+            dd = DisplayData(
+                tokens=tokens,
+                effective_mask=keep_mask,
+                overrides=[],
+                comprehension=comprehension,
+                review_report={},
+                goal="",
+                feedback_history=[],
+                stats=stats,
+            )
+            try:
+                body = format_decision_list(dd, use_markup=True)
+                head = (
+                    f"[bold]2b 最终保留/删除（{kc} 保留 / {cc} 删除 / 共 {total}）[/bold]\n"
+                )
+                self.query_one("#twob-result-body", Static).update(head + body)
+            except Exception as e:
+                logger.warning("ResultView.show_result 失败: %s", e)
+
+    class TwoBStageView(Widget):
+        """2b 分块流式主容器：ViewModel + 子部件 + 约 50ms 刷新节流。"""
+
+        can_focus = True
+
+        BINDINGS = [
+            Binding("left", "prev_block", "上一块", show=False),
+            Binding("right", "next_block", "下一块", show=False),
+            Binding("t", "toggle_thinking", "思考", show=False),
+        ]
+
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self._vm: "TwoBViewModel | None" = None
+            self._n_r1_est: int = 1
+            self._last_ui_refresh: float = 0.0
+            self._refresh_scheduled: bool = False
+            self._debounce_until: float = 0.0
+
+        def compose(self) -> None:
+            yield Static("2b 决策（R1 → R2）", id="twob-header")
+            yield BlockProgressBar(id="twob-progress")
+            with Vertical(id="twob-middle"):
+                yield BlockChatView(id="twob-chat")
+            yield ResultView(id="twob-result")
+
+        def reset(self) -> None:
+            self._vm = None
+            self._n_r1_est = 1
+            self._last_ui_refresh = 0.0
+            self._debounce_until = 0.0
+            try:
+                self.query_one("#twob-header", Static).update("2b 决策（R1 → R2）")
+                self.query_one("#twob-progress", BlockProgressBar).update("")
+                self.query_one("#twob-chat-summary", Static).update("")
+                self.query_one("#twob-thinking-toggle", Static).update("▼ 思考")
+                self.query_one("#twob-thinking-log", RichLog).clear()
+                self.query_one("#twob-decisions-log", RichLog).clear()
+                self.query_one("#twob-result", ResultView).display = False
+                self.query_one("#twob-result", ResultView).clear()
+            except Exception:
+                pass
+
+        def on_2b_start(self, payload: dict) -> None:
+            from autosmartcut.nodes.l2.l2b_view_model import TwoBViewModel
+
+            show_th = bool(payload.get("show_thinking_default", True))
+            self._n_r1_est = max(1, int(payload.get("n_blocks_r1_estimate", 1)))
+            self._vm = TwoBViewModel(show_thinking_default=show_th)
+            self.reset_panels()
+            self._refresh_ui_immediate()
+            try:
+                self.focus()
+            except Exception:
+                pass
+
+        def reset_panels(self) -> None:
+            try:
+                self.query_one("#twob-chat-summary", Static).update(
+                    f"R1 口语清洗 · 约 {self._n_r1_est} 块（流式到达后显示各块详情）"
+                )
+            except Exception:
+                pass
+
+        def _build_stream_chunk(self, payload: dict) -> object:
+            from autosmartcut.nodes.l2.intelligence_llm import StreamChunk
+
+            ev = payload.get("event", "content_delta")
+            if ev not in (
+                "reasoning_delta",
+                "content_delta",
+                "usage",
+                "retry",
+                "result",
+            ):
+                ev = "content_delta"
+            return StreamChunk(
+                stage=str(payload.get("stage", "")),
+                event=ev,  # type: ignore[arg-type]
+                reasoning_delta=str(payload.get("reasoning_delta") or ""),
+                content_delta=str(payload.get("content_delta") or ""),
+                attempt=int(payload.get("attempt") or 0),
+                retry_reason=str(payload.get("retry_reason") or ""),
+            )
+
+        def handle_2b_chunk(self, payload: dict) -> None:
+            if self._vm is None:
+                return
+            bo = int(payload.get("block_ordinal", 0))
+            sc = self._build_stream_chunk(payload)
+            self._vm.update_chunk(bo, sc)
+            self._schedule_refresh()
+
+        def _schedule_refresh(self) -> None:
+            now = time.monotonic()
+            if now - self._last_ui_refresh < 0.05:
+                if not self._refresh_scheduled:
+                    self._refresh_scheduled = True
+                    self._debounce_until = now + 0.05
+                    self.set_timer(0.05, self._flush_debounced_refresh)
+                return
+            self._last_ui_refresh = now
+            self._refresh_ui_immediate()
+
+        def _flush_debounced_refresh(self) -> None:
+            self._refresh_scheduled = False
+            now = time.monotonic()
+            if now < self._debounce_until:
+                # 仍可能更晚到达的 chunk
+                self.set_timer(self._debounce_until - now, self._flush_debounced_refresh)
+                return
+            self._last_ui_refresh = now
+            self._refresh_ui_immediate()
+
+        def _format_progress_rich(self) -> str:
+            if self._vm is None:
+                return " ".join("○" for _ in range(self._n_r1_est))
+            active = self._vm.get_active_block()
+            ph = self._vm.get_phase()
+            ordinals = self._vm.get_display_ordinals()
+            if ph == "r1" and not ordinals:
+                ordinals = list(range(1, self._n_r1_est + 1))
+            if ph in ("r2", "done") and not ordinals:
+                return "[dim]R2 启动中…（等待首包）[/dim]"
+
+            parts: list[str] = []
+            for o in ordinals:
+                st = self._vm.get_block_state(o)
+                if st is None:
+                    sym, color = "○", ""
+                else:
+                    if st.status == "failed":
+                        sym, color = "✗", "red"
+                    elif st.status == "done":
+                        sym, color = "✓", "green"
+                    elif st.status == "streaming":
+                        sym, color = "⟳", "dark_orange"
+                    else:
+                        sym, color = "○", "dim"
+                is_active = o == active
+                if is_active:
+                    cell = f"[bold reverse]{sym}[/bold reverse]"
+                elif color:
+                    cell = f"[{color}]{sym}[/{color}]"
+                else:
+                    cell = sym
+                parts.append(cell)
+            label = "R1" if ph == "r1" else ("R2" if ph == "r2" else "完成")
+            return f"[dim]{label}[/dim]  " + " ".join(parts) + f"  [dim]· 活动块 {active} · ←/→ 切换 · t 展开思考[/dim]"
+
+        def _refresh_ui_immediate(self) -> None:
+            if self._vm is None:
+                return
+            try:
+                self.query_one("#twob-progress", BlockProgressBar).update(
+                    self._format_progress_rich()
+                )
+            except Exception:
+                pass
+            self._render_chat_panels()
+
+        def _render_chat_panels(self) -> None:
+            if self._vm is None:
+                return
+            active = self._vm.get_active_block()
+            st = self._vm.get_block_state(active)
+            if st is None:
+                ords = self._vm.list_ordinals()
+                if ords:
+                    self._vm.switch_to(ords[0])
+                    st = self._vm.get_block_state(ords[0])
+            if st is None:
+                return
+            ph = self._vm.get_phase()
+            stage_label = "R1" if st.stage == "decision_r1" else "R2"
+            summ = st.input_summary or f"{stage_label} · 块 {st.block_ordinal}"
+            try:
+                self.query_one("#twob-chat-summary", Static).update(
+                    f"[bold]{summ}[/bold]  [dim]（{ph}）[/dim]"
+                )
+            except Exception:
+                pass
+            exp = st.thinking_expanded
+            arrow = "▼" if exp else "▶"
+            try:
+                self.query_one("#twob-thinking-toggle", Static).update(
+                    f"{arrow} 思考  "
+                    f"{'（已完成）' if st.thinking_done else '（流式中…）'}  "
+                    f"~{st.thinking_token_count} tok"
+                )
+            except Exception:
+                pass
+            try:
+                th = self.query_one("#twob-thinking-log", RichLog)
+                th.clear()
+                if exp and st.thinking_text:
+                    th.write(st.thinking_text)
+            except Exception:
+                pass
+            from autosmartcut.nodes.l2.intelligence_2b import REASON_LABELS
+
+            try:
+                dec = self.query_one("#twob-decisions-log", RichLog)
+                dec.clear()
+                for d in st.decisions:
+                    idx = d.get("index", "?")
+                    keep = d.get("keep")
+                    reason = str(d.get("reason", "ok"))
+                    if "reason" in d and reason in REASON_LABELS:
+                        tag = REASON_LABELS[reason]
+                    else:
+                        tag = "✓" if keep else "✗"
+                    dec.write(f"  [{idx}] {tag}  keep={keep}")
+            except Exception:
+                pass
+
+        def action_prev_block(self) -> None:
+            self._step_active(-1)
+
+        def action_next_block(self) -> None:
+            self._step_active(1)
+
+        def action_toggle_thinking(self) -> None:
+            if self._vm is None:
+                return
+            self._vm.toggle_thinking(self._vm.get_active_block())
+            self._refresh_ui_immediate()
+
+        def _step_active(self, delta: int) -> None:
+            if self._vm is None:
+                return
+            cur = self._ordinals_for_navigation()
+            if not cur:
+                return
+            try:
+                i = cur.index(self._vm.get_active_block())
+            except ValueError:
+                i = 0
+            i = (i + delta) % len(cur)
+            self._vm.switch_to(cur[i])
+            self._refresh_ui_immediate()
+
+        def _ordinals_for_navigation(self) -> list[int]:
+            if self._vm is None:
+                return []
+            xs = self._vm.get_display_ordinals()
+            if xs:
+                return xs
+            return self._vm.list_ordinals()
+
+        def mark_done(self, payload: dict | None = None) -> None:
+            if self._vm is not None:
+                self._vm.mark_done()
+            try:
+                self.query_one("#twob-header", Static).update("2b 决策 · 已完成")
+            except Exception:
+                pass
+            self._refresh_ui_immediate()
+            if payload and payload.get("tokens") and payload.get("keep_mask") is not None:
+                try:
+                    rv = self.query_one("#twob-result", ResultView)
+                    rv.show_result(
+                        tokens=list(payload["tokens"]),
+                        keep_mask=list(payload["keep_mask"]),
+                        comprehension=dict(payload.get("comprehension") or {}),
+                    )
+                    rv.display = True
+                except Exception as e:
+                    logger.warning("TwoBStageView.mark_done 展示结果失败: %s", e)
+
+    # -----------------------------------------------------------------------
     # MainArea
     # -----------------------------------------------------------------------
 
@@ -278,6 +623,7 @@ if _TEXTUAL_AVAILABLE:
         def compose(self):
             yield GenericStageView(id="generic-view")
             yield LLMStreamView(id="llm-stream-view")
+            yield TwoBStageView(id="twob-stage")
 
         def show_stage_progress(self, node_id: str) -> None:
             if node_id == "l1_perception":
@@ -301,10 +647,14 @@ if _TEXTUAL_AVAILABLE:
             if node_id == "l1_perception":
                 self._teardown_l1a_view(summary_line)
             elif node_id.startswith("l2"):
-                # L2 节点完成：隐藏流式视图，切回 generic 并记录摘要
+                # L2 节点完成：隐藏流式视图与 2b 视图，切回 generic 并记录摘要
                 try:
                     lv = self.query_one("#llm-stream-view", LLMStreamView)
                     lv.display = False
+                except Exception:
+                    pass
+                try:
+                    self.query_one("#twob-stage", TwoBStageView).display = False
                 except Exception:
                     pass
                 self._ensure_generic_view()
@@ -335,6 +685,30 @@ if _TEXTUAL_AVAILABLE:
                 try:
                     self.query_one("#llm-stream-view", LLMStreamView).handle_llm_chunk(
                         event.payload
+                    )
+                except Exception:
+                    pass
+            elif event.phase == "2b_start":
+                try:
+                    tw = self.query_one("#twob-stage", TwoBStageView)
+                    tw.reset()
+                    tw.on_2b_start(event.payload or {})
+                    tw.display = True
+                    self.query_one("#llm-stream-view", LLMStreamView).display = False
+                    self.query_one("#generic-view", GenericStageView).display = False
+                except Exception:
+                    pass
+            elif event.phase == "2b_chunk":
+                try:
+                    self.query_one("#twob-stage", TwoBStageView).handle_2b_chunk(
+                        event.payload
+                    )
+                except Exception:
+                    pass
+            elif event.phase == "2b_done":
+                try:
+                    self.query_one("#twob-stage", TwoBStageView).mark_done(
+                        event.payload or {}
                     )
                 except Exception:
                     pass
@@ -612,6 +986,18 @@ else:
         pass
 
     class MainArea:  # type: ignore[no-redef]
+        pass
+
+    class TwoBStageView:  # type: ignore[no-redef]
+        pass
+
+    class BlockProgressBar:  # type: ignore[no-redef]
+        pass
+
+    class BlockChatView:  # type: ignore[no-redef]
+        pass
+
+    class ResultView:  # type: ignore[no-redef]
         pass
 
     class LogArea:  # type: ignore[no-redef]

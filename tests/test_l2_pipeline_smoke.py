@@ -41,7 +41,7 @@ def test_run_2a_and_2b_with_mocked_llm(monkeypatch):
             {"index": 2, "keep": False},
         ]
     }
-    post_r1 = iter([r2_data, decision_data])
+    post_r1 = iter([r2_data])
 
     def _fake_call_structured_2a(messages, schema, stage, **kwargs):
         if stage == "r1":
@@ -64,20 +64,34 @@ def test_run_2a_and_2b_with_mocked_llm(monkeypatch):
         raise AssertionError(stage)
 
     def _fake_call_structured_2b(messages, schema, stage, **kwargs):
-        assert stage == "decision"
-        return StructuredResult(
-            data=next(post_r1),
-            assistant_content="{}",
-            usage={},
-            request_messages=[],
-        )
+        if stage == "decision_r1":
+            return StructuredResult(
+                data={
+                    "decisions": [
+                        {"index": 0, "keep": True, "reason": "ok"},
+                        {"index": 1, "keep": True, "reason": "ok"},
+                        {"index": 2, "keep": True, "reason": "ok"},
+                    ]
+                },
+                assistant_content="{}",
+                usage={},
+                request_messages=[],
+            )
+        if stage == "decision_r2":
+            return StructuredResult(
+                data=decision_data,
+                assistant_content="{}",
+                usage={},
+                request_messages=[],
+            )
+        raise AssertionError(stage)
 
     monkeypatch.setattr(
-        "autosmartcut.intelligence_2a.call_structured",
+        "autosmartcut.nodes.l2.intelligence_2a.call_structured",
         _fake_call_structured_2a,
     )
     monkeypatch.setattr(
-        "autosmartcut.intelligence_2b.call_structured",
+        "autosmartcut.nodes.l2.intelligence_2b.call_structured",
         _fake_call_structured_2b,
     )
 

@@ -55,12 +55,20 @@ class IntelligenceConfig:
 	two_b_mode: str = "single"
 	# 2b block 模式下，单块句数超过此值时记录警告（0 = 不限制/不警告）
 	two_b_block_size_limit: int = 0
+	# R1 后剩余保留句数低于此值时 R2 走 single，否则 R2 按块并行
+	two_b_r2_single_threshold: int = 300
 	# 2c 审核：最大修正轮次（0=占位透传，1=审核+最多1轮修正）
 	two_c_max_review_rounds: int = 1
 	# 2c 审核：must 项通过率阈值（1.0=全部 must 必须通过）
 	two_c_must_pass_rate: float = 1.0
 	# 2d 人工审阅：最大回流次数（0=禁用回流，仅手动 toggle + 确认）
 	two_d_max_reflows: int = 3
+
+
+@dataclass
+class TuiConfig:
+	# 2b 界面：思考区域默认展开
+	show_thinking_default: bool = True
 
 
 _LLM_STAGE_DEFAULTS: dict[str, Any] = {
@@ -128,6 +136,7 @@ class AppConfig:
 	execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 	models: ModelConfig = field(default_factory=ModelConfig)
 	intelligence: IntelligenceConfig = field(default_factory=IntelligenceConfig)
+	tui: TuiConfig = field(default_factory=TuiConfig)
 	llm: LLMConfig | None = None
 
 
@@ -206,9 +215,17 @@ def load_config(path: Path | None = None) -> AppConfig:
 		limit = int(limit_raw)
 	except (TypeError, ValueError):
 		limit = config.intelligence.two_b_block_size_limit
+	try:
+		r2_thr = int(intel.get(
+			"two_b_r2_single_threshold",
+			config.intelligence.two_b_r2_single_threshold,
+		))
+	except (TypeError, ValueError):
+		r2_thr = config.intelligence.two_b_r2_single_threshold
 	config.intelligence = IntelligenceConfig(
 		two_b_mode=str(intel.get("two_b_mode", config.intelligence.two_b_mode)),
 		two_b_block_size_limit=max(0, limit),
+		two_b_r2_single_threshold=max(1, r2_thr),
 		two_c_max_review_rounds=max(0, int(intel.get(
 			"two_c_max_review_rounds",
 			config.intelligence.two_c_max_review_rounds,
@@ -222,6 +239,15 @@ def load_config(path: Path | None = None) -> AppConfig:
 			config.intelligence.two_d_max_reflows,
 		))),
 	)
+
+	tui_raw = raw.get("tui", {})
+	if isinstance(tui_raw, dict) and tui_raw:
+		config.tui = TuiConfig(
+			show_thinking_default=bool(tui_raw.get(
+				"show_thinking_default",
+				config.tui.show_thinking_default,
+			)),
+		)
 
 	llm_raw = raw.get("llm")
 	if isinstance(llm_raw, dict) and llm_raw:

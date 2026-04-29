@@ -109,13 +109,70 @@ class L2bNode:
         }))
 
         try:
-            # run_2b_decision 直接修改 manifest 并返回
+            from autosmartcut.nodes.l2.intelligence_2b_dispatch import BlockStreamCollector
+
+            loop = asyncio.get_running_loop()
+            collector = BlockStreamCollector()
+
+            outline_blocks = comprehension.get("outline_blocks") or []
+            n_blocks_r1_est = max(1, len(outline_blocks)) if outline_blocks else 1
+
+            def _bridge(block_ordinal: int, chunk: object) -> None:
+                from autosmartcut.nodes.l2.intelligence_llm import StreamChunk
+
+                if not isinstance(chunk, StreamChunk):
+                    return
+                loop.call_soon_threadsafe(
+                    ctx.emit,
+                    ProgressEvent(
+                        node_id=self.id,
+                        phase="2b_chunk",
+                        payload={
+                            "block_ordinal": block_ordinal,
+                            "stage": chunk.stage,
+                            "event": chunk.event,
+                            "reasoning_delta": chunk.reasoning_delta,
+                            "content_delta": chunk.content_delta,
+                            "attempt": chunk.attempt,
+                            "retry_reason": chunk.retry_reason,
+                        },
+                    ),
+                )
+
+            collector.subscribe(_bridge)
+
+            ctx.emit(
+                ProgressEvent(
+                    node_id=self.id,
+                    phase="2b_start",
+                    payload={
+                        "collector": collector,
+                        "n_blocks_r1_estimate": n_blocks_r1_est,
+                        "token_count": len(tokens),
+                        "show_thinking_default": self._config.tui.show_thinking_default,
+                    },
+                ),
+            )
+
             await asyncio.to_thread(
                 run_2b_decision,
                 manifest,
                 mode=two_b_mode,
                 review_fixes=review_fixes if review_fixes else None,
                 on_chunk=make_on_chunk(ctx.emit, self.id),
+                collector=collector,
+            )
+
+            ctx.emit(
+                ProgressEvent(
+                    node_id=self.id,
+                    phase="2b_done",
+                    payload={
+                        "tokens": manifest.get("tokens", []),
+                        "keep_mask": manifest.get("keep_mask", []),
+                        "comprehension": manifest.get("comprehension", {}) or {},
+                    },
+                ),
             )
         except Exception as e:
             logger.exception("[L2bNode] run_2b_decision 失败: %s", e)

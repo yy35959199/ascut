@@ -93,6 +93,52 @@ if _TEXTUAL_AVAILABLE:
             max-height: 8;
             border: none;
         }
+        TwoBStageView {
+            height: 1fr;
+            layout: vertical;
+            display: none;
+        }
+        #twob-middle {
+            height: 1fr;
+            layout: vertical;
+        }
+        BlockChatView {
+            height: 1fr;
+            layout: vertical;
+        }
+        #twob-thinking-log {
+            height: 1fr;
+            max-height: 10;
+            border: none;
+            color: $text-muted;
+        }
+        #twob-decisions-label {
+            height: 1;
+            margin-top: 1;
+        }
+        #twob-decisions-log {
+            height: 1fr;
+            border: none;
+        }
+        ResultView {
+            height: auto;
+            max-height: 12;
+            border: solid $primary;
+            margin-top: 1;
+            display: none;
+        }
+        #twob-result-body {
+            width: 100%;
+        }
+        #twob-header {
+            height: 1;
+            color: $warning;
+        }
+        #twob-log {
+            height: 1fr;
+            border: none;
+            color: $text;
+        }
         L1aProgressView {
             height: 1fr;
             layout: vertical;

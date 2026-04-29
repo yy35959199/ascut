@@ -1,116 +1,90 @@
 """Layer 2 / 2b 决策子阶段
 
-## 职责
-基于 2a 的理解结果，对每个 speech 标注做出保留/删除决策，生成 keep_mask。
-这是智能层的核心输出，直接决定最终视频的内容。
-
-## 决策逻辑
-- 输入：2a 产出的稠密消歧文本 + 主旨 + 分块信息 + 用户目标
-- 任务：口语转录精细清洗（重复起句、语气词、离题插入等）并结合用户目标
-- 输出：对每个 annotation index 输出 keep=true 或 keep=false
-
-## 输入 Schema
-manifest_dict = {
-    "tokens": [                 # JSON2 句面（仅 index + text；无时间轴）
-        {
-            "index": int,
-            "text": str,
-        }
-    ],
-    "comprehension": {          # 来自 2a
-        "purpose": str,             # 精化主旨
-        "cleaned_annotations": [    # 稠密消歧文本（与 tokens 等长对齐）
-            {
-                "annotation_index": int,
-                "cleaned_content": str
-            }
-        ],
-        "outline_blocks": [         # 内容分块
-            {
-                "start_index": int,
-                "end_index": int,
-                "summary": str
-            }
-        ]
-    },
-    "goal": str                 # 用户目标
-}
-
-## 输出 Schema
-manifest_dict["keep_mask"] = [
-    {
-        "index": int,           # 对应 tokens[].index
-        "keep": bool           # True=保留, False=删除（MVP 仅布尔，不用 null）
-    },
-    ...
-]
-
-## 注意
-- keep_mask 长度必须等于 tokens 长度
-- keep_mask 与 tokens 通过 index 一一对应
-- 每条 keep 均为 bool，与 JSON3 / intelligence-layer2-mvp 一致
-
-## 2b 模式
-- ``mode="single"``：单次 LLM，传入全文句列。
-- ``mode="block"``：按 ``outline_blocks`` 将句级 index 分区；每个 outline 块整体一次
-  LLM 调用，不做子块拆分；prompt 仍含全文叙事弧。
-  若 ``outline_blocks`` 为空则自动回退为 ``single``。
-  若 ``config.toml`` 中 ``[intelligence].two_b_block_size_limit`` 为正整数且块句数超过
-  该值，仅记录 WARNING，不拆分（chat 模型兜底阈值，reasoner 模型无需关注）。
+两阶段：R1 逐句口语清洗（decision_r1）→ R2 全文内容取舍（decision_r2）。
+分块由 ``outline_blocks`` 驱动；无分块时整段作为单块。R2 在保留句数低于阈值时
+走 single，否则按块并行（与 R1 相同的分区）。
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from autosmartcut.config import load_config
 from autosmartcut.nodes.l2.intelligence_llm import build_messages, call_structured
+
+if TYPE_CHECKING:
+    from autosmartcut.nodes.l2.intelligence_2b_dispatch import (
+        BlockResult,
+        BlockStreamCollector,
+        BlockTask,
+    )
 
 TwoBMode = Literal["single", "block"]
 
 logger = logging.getLogger(__name__)
 
+# R1 reason 枚举与 R2 行首标签共用（唯一来源）
+REASON_LABELS: dict[str, str] = {
+    "ok": "✓",
+    "filler": "✗:语气",
+    "stutter": "✗:重启",
+    "duplicate": "✗:重复",
+    "incomplete": "✗:断句",
+}
+_R1_REASON_ENUM = list(REASON_LABELS.keys())
 
-def _two_b_shared_task_and_output_instructions() -> str:
-    """2b single / chunked 共用的任务说明、检查清单与输出约定（不含阶段定位与句列）。"""
-    return r"""【删除规则·逐句核查清单】
-对「待决策句面」中每一句依次检查；**任一条件命中则 keep=false**（条件不互斥时以最有利于成片连贯性的解释为准）。
 
-1. **纯语气词/填充词**：整句仅为「啊」「嗯」「哎」「呃」「对」「嗯嗯」等，无实质信息。
-   → 删：整句只有一个「啊」且无其它语素。
-   → 留：「不是完全不行」——虽有口语感，但承载转折语义，不是纯语气词。
+def _r1_task_text() -> str:
+    return r"""【逐句清洗规则】
+对「待决策句面」中每一句依次检查，命中以下任一条件则 keep=false：
 
-2. **重复起句 / 口吃重启**：本句与**前后最多 5 句**内某句语义相同或为其更短、更不完整的版本；只保留**最完整**的一句，较短的不完整重启句删。
-   → 删：「我讲一下为什么」而后文有更完整的「我现在讲一下为什么」时，删较短句。
-   → 删：「好好读书」而后文有更完整的「好好读书行不行」时，删较短句。
-   → 留：在同窗口内已是最完整表述的那一句。
+1. **纯语气词/填充词**：整句仅为「啊」「嗯」「哎」「呃」「对」「嗯嗯」「是的」等，无实质语义。
+   判断标准：去掉该句后，前后句的语义连接不受影响。
+   注意：「不是完全不行」虽有口语感，但承载转折语义，keep=true。
 
-3. **连续重复**：相邻句内容几乎完全相同，只保留一句（通常保留较早出现的一句）。
+2. **口吃重启**：本句与前后 5 句内某句表达同一意思，且本句是更短、更不完整的版本。
+   只保留窗口内最完整的一句，其余 keep=false。
 
-4. **离题插入**：回应弹幕、感谢打赏/礼物、与当前论述主线明显无关的穿插。
+3. **连续重复**：相邻句内容几乎完全相同（字面重复或仅差语气词），保留较早的一句。
 
-5. **冗余举例**：同一论点已用 1–2 个例子充分说明后，后续堆叠的同类举例可删减；保留最有力的 1–2 个即可。
+4. **未完成断句**：句子明显说到一半中断，后续有完整版本接续。
 
-【保留原则】
-- **不确定时 keep=true**：误保留比误删更易在后续人工阶段修正。
-- 口语化、句中夹杂语气词但整句仍承载新信息或推进论述，**一般保留**。
-
-【推理要求】
-在输出 JSON 之前完成思考：对「待决策句面」中**每一句**依次执行——读出本句 → 向前最多浏览 5 句、向后最多浏览 5 句并比对 → 对照上述规则 1–5 → 再定 keep。**须逐句完成**，禁止仅凭整体印象批量下结论。思考过程不要写入 JSON 外的正文（最终只输出 JSON）。
+以上四条之外的句子一律 keep=true。不确定时 keep=true。
 
 【输出要求】
-- `decisions` 为数组；每项含 `index`（全文级整数，须与上方列表一致）与 `keep`（布尔）。
-- **必须覆盖**上方「待决策句面」列出的**全部** index，不得遗漏；不得对未列出的 index 输出决策。
-- 句面文字仅出现在用户给出的列表中；你不得在 JSON 中改写、润色或重述原文句子。
+- `decisions` 数组，每项含 `index`（整数）、`keep`（布尔）、`reason`（字符串：
+  `"ok"` / `"filler"` / `"stutter"` / `"duplicate"` / `"incomplete"`）。
+- 必须覆盖上方「待决策句面」的全部 index，不得遗漏。
 
 请以 JSON 格式输出。"""
 
 
-# ============================================================================
-# 主入口
-# ============================================================================
+def _r2_task_text() -> str:
+    return r"""【内容取舍规则】
+每句已标注 R1 清洗结果（行首标签：[✓] 表保留倾向 / [✗:…] 表建议删除）。你须在此基础上做全文级内容取舍。
+
+对 R1 标注为删除倾向的句子：
+- 大部分直接确认 keep=false。
+- 若删除后导致前后语义断裂，或该句实际承载了论述推进，改为 keep=true。
+
+对 R1 标注为保留倾向的句子，检查以下条件（命中则 keep=false）：
+
+1. **离题插入**：回应弹幕、感谢打赏/礼物、与当前论述主线无关的穿插。
+
+2. **冗余举例**：同一论点已用 1–2 个例子充分说明后，后续堆叠的同类举例。保留最有力的 1–2 个。
+
+3. **过渡性重复**：跨段落的总结性重述，若与前文论点完全重复且不引入新信息，可删。
+
+以上条件之外的句子一律 keep=true。不确定时 keep=true。
+
+【输出要求】
+- `decisions` 数组，每项含 `index`（整数）与 `keep`（布尔）。
+- 必须覆盖上方「待决策句面」的全部 index，不得遗漏。
+
+请以 JSON 格式输出。"""
+
 
 def run_2b_decision(
     manifest_dict: dict,
@@ -118,57 +92,244 @@ def run_2b_decision(
     mode: TwoBMode = "single",
     review_fixes: list[dict] | None = None,
     on_chunk: Callable | None = None,
+    collector: "BlockStreamCollector | None" = None,
 ) -> dict:
-    """2b 决策子阶段：输出 keep_mask
+    """2b 决策：R1 → R2，输出 keep_mask。
 
-    Args:
-        manifest_dict: 包含 tokens、comprehension、goal 的工作数据
-        mode: ``single`` 单次全文调用；``block`` 按 2a 分块每块一次调用后合并。
-        review_fixes: 2c 审核返回的修正指令列表（修正重跑时由编排层传入）。
-            每项含 ``requirement``、``missing_indices``、``note``。
-            为 None 或空列表时表示首次调用，不注入审核反馈。
-        on_chunk: 可选；透传给 ``call_structured``，每个流式 StreamChunk 事件调用一次。
-
-    Returns:
-        追加了 keep_mask 字段的 manifest_dict
+    ``mode`` 保留兼容，内部始终走 R1+R2 流水线。
+    ``collector`` 为 None 时内部创建临时收集器；若提供 ``on_chunk``，会订阅收集器以兼容旧接口。
     """
+    from autosmartcut.nodes.l2.intelligence_2b_dispatch import BlockStreamCollector
+
+    _ = mode  # 保留参数
+
     is_fix_rerun = bool(review_fixes)
     logger.info(
-        "[2b] 决策子阶段开始%s | mode=%s | tokens=%d",
+        "[2b] 决策子阶段开始%s | tokens=%d",
         "（2c 审核修正重跑）" if is_fix_rerun else "",
-        mode,
         len(manifest_dict.get("tokens", [])),
     )
 
-    # 句面 JSON2：仅 index + text；决策语义以 comprehension 稠密文本为准
     tokens = manifest_dict["tokens"]
-    # 2a 产物：purpose / cleaned_annotations / outline_blocks 等
     comprehension = manifest_dict.get("comprehension", {})
-    # 用户剪辑意图，会写入 prompt 首行「用户目标」
     goal = manifest_dict.get("goal", "")
-    # F3 回流时编排器注入的用户选择意见（临时字段）
     selection_opinion = str(manifest_dict.get("_selection_opinion", ""))
 
-    if mode not in ("single", "block"):
-        raise ValueError(f"mode 须为 'single' 或 'block'，实际: {mode!r}")
-    if mode == "block":
-        keep_mask = _generate_keep_mask_block(
-            tokens, comprehension, goal, review_fixes=review_fixes,
-            selection_opinion=selection_opinion, on_chunk=on_chunk,
-        )
-    else:
-        keep_mask = _generate_keep_mask(
-            tokens, comprehension, goal, review_fixes=review_fixes,
-            selection_opinion=selection_opinion, on_chunk=on_chunk,
-        )
+    col = collector if collector is not None else BlockStreamCollector()
+    if on_chunk:
+        col.subscribe(lambda _ord, ch: on_chunk(ch))
 
-    # 验证 keep_mask 格式
+    cleaned_annotations = comprehension.get("cleaned_annotations", [])
+    _validate_dense_cleaned_vs_tokens(tokens, cleaned_annotations)
+
+    outline_blocks = comprehension.get("outline_blocks", []) or []
+
+    if outline_blocks:
+        partitions = _partition_token_indices_by_blocks(tokens, outline_blocks)
+        work = [(b, pos) for b, pos in partitions if pos]
+    else:
+        n = len(tokens)
+        work = [
+            (
+                {
+                    "start_index": int(tokens[0]["index"]),
+                    "end_index": int(tokens[-1]["index"]),
+                    "summary": "（全文单块）",
+                    "_synthetic_gap": True,
+                },
+                list(range(n)),
+            )
+        ]
+
+    if not work:
+        logger.warning("[2b] 无可决策块，全部保留")
+        km = [{"index": int(t["index"]), "keep": True} for t in tokens]
+        manifest_dict["keep_mask"] = km
+        return manifest_dict
+
+    cfg_intel = load_config(None).intelligence
+    throttle_initial = min(len(work), 8)
+
+    from autosmartcut.nodes.l2.intelligence_2b_dispatch import (
+        AdaptiveThrottle,
+        BlockResult,
+        BlockTask,
+        dispatch_blocks_parallel,
+    )
+
+    throttle_r1 = AdaptiveThrottle(throttle_initial)
+
+    schema_r1 = _get_r1_schema()
+    r1_tasks: list[BlockTask] = []
+    n_blocks_r1 = len(work)
+    for ord1, (block_meta, positions) in enumerate(work, start=1):
+        lo = int(tokens[positions[0]]["index"])
+        hi = int(tokens[positions[-1]]["index"])
+        summary = (
+            f"R1 口语清洗 | 第 {ord1}/{n_blocks_r1} 块 | index {lo}–{hi} | 共 {len(positions)} 句"
+        )
+        prompt = _build_prompt_r1_block(
+            block_ordinal=ord1,
+            n_blocks=n_blocks_r1,
+            tokens=tokens,
+            cleaned_annotations=cleaned_annotations,
+            block_positions=positions,
+        )
+        allowed = {int(tokens[i]["index"]) for i in positions}
+        r1_tasks.append(
+            BlockTask(
+                block_ordinal=ord1,
+                n_blocks=n_blocks_r1,
+                stage="decision_r1",
+                messages=build_messages(prompt, schema_r1),
+                schema=schema_r1,
+                allowed_indices=allowed,
+                input_summary=summary,
+            )
+        )
+        col.register_block(ord1)
+
+    def _call_r1(task: BlockTask, oc: Callable | None) -> BlockResult:
+        sr = call_structured(
+            task.messages, task.schema, task.stage, on_chunk=oc,
+        )
+        decisions_raw = sr.data.get("decisions", [])
+        sanitized: list[dict] = []
+        for d in decisions_raw:
+            idx = d.get("index")
+            if not isinstance(idx, int) or idx not in task.allowed_indices:
+                continue
+            reason = str(d.get("reason", "ok"))
+            if reason not in REASON_LABELS:
+                reason = "ok"
+            sanitized.append({
+                "index": idx,
+                "keep": bool(d.get("keep")),
+                "reason": reason,
+            })
+        for idx in task.allowed_indices:
+            if not any(x["index"] == idx for x in sanitized):
+                sanitized.append({"index": idx, "keep": True, "reason": "ok"})
+        return BlockResult(task.block_ordinal, sr, sanitized)
+
+    r1_results = dispatch_blocks_parallel(
+        r1_tasks, _call_r1, throttle_r1, col,
+    )
+    preliminary = _merge_r1_block_results(tokens, r1_results)
+
+    remaining_kept = sum(1 for d in preliminary if d.get("keep"))
+    threshold = cfg_intel.two_b_r2_single_threshold
+
+    arc_section = _narrative_arc_section(work, tokens)
+    purpose = comprehension.get("purpose", "")
+    block_limit = cfg_intel.two_b_block_size_limit
+
+    schema_r2 = _get_schema()
+
+    if remaining_kept < threshold:
+        prompt_r2 = _build_prompt_r2_single(
+            tokens=tokens,
+            comprehension=comprehension,
+            goal=goal,
+            preliminary=preliminary,
+            narrative_arc_section=arc_section,
+            review_fixes=review_fixes,
+            selection_opinion=selection_opinion,
+        )
+        logger.info(
+            "[2b] R2 single（保留句 %d < 阈值 %d）",
+            remaining_kept,
+            threshold,
+        )
+        r2_single_ord = n_blocks_r1 + 1
+        col.register_block(r2_single_ord)
+        sr2 = call_structured(
+            build_messages(prompt_r2, schema_r2),
+            schema_r2,
+            "decision_r2",
+            on_chunk=col.make_on_chunk(r2_single_ord) if col else None,
+        )
+        llm_r2 = sr2.data.get("decisions", [])
+        r2_map = _merge_chunk_decisions(llm_r2, {int(t["index"]) for t in tokens})
+    else:
+        throttle_r2 = AdaptiveThrottle(min(len(work), 8))
+        r2_tasks: list[BlockTask] = []
+        n_blocks_r2 = len(work)
+        base_ord = n_blocks_r1 + 1
+        for ord1, (block_meta, positions) in enumerate(work, start=1):
+            lo = int(tokens[positions[0]]["index"])
+            hi = int(tokens[positions[-1]]["index"])
+            n_pos = len(positions)
+            if block_limit > 0 and n_pos > block_limit:
+                logger.warning(
+                    "[2b] R2 outline 块 %d/%d 共 %d 句，超过 two_b_block_size_limit=%d",
+                    ord1,
+                    n_blocks_r2,
+                    n_pos,
+                    block_limit,
+                )
+            prompt_b = _build_prompt_r2_block(
+                purpose=purpose,
+                goal=goal,
+                block_ordinal=ord1,
+                n_blocks=n_blocks_r2,
+                narrative_arc_section=arc_section,
+                tokens=tokens,
+                cleaned_annotations=cleaned_annotations,
+                block_positions=positions,
+                block_meta=block_meta,
+                preliminary=preliminary,
+                review_fixes=review_fixes,
+                selection_opinion=selection_opinion,
+            )
+            allowed = {int(tokens[i]["index"]) for i in positions}
+            bo = base_ord + ord1 - 1
+            r2_tasks.append(
+                BlockTask(
+                    block_ordinal=bo,
+                    n_blocks=n_blocks_r2,
+                    stage="decision_r2",
+                    messages=build_messages(prompt_b, schema_r2),
+                    schema=schema_r2,
+                    allowed_indices=allowed,
+                    input_summary=(
+                        f"R2 内容取舍 | 第 {ord1}/{n_blocks_r2} 块 | index {lo}–{hi}"
+                    ),
+                )
+            )
+            col.register_block(bo)
+
+        def _call_r2(task: BlockTask, oc: Callable | None) -> BlockResult:
+            sr = call_structured(
+                task.messages, task.schema, task.stage, on_chunk=oc,
+            )
+            decisions_raw = sr.data.get("decisions", [])
+            sanitized = []
+            for d in decisions_raw:
+                idx = d.get("index")
+                if not isinstance(idx, int) or idx not in task.allowed_indices:
+                    continue
+                sanitized.append({"index": idx, "keep": bool(d.get("keep"))})
+            for idx in task.allowed_indices:
+                if not any(x["index"] == idx for x in sanitized):
+                    sanitized.append({"index": idx, "keep": True})
+            return BlockResult(task.block_ordinal, sr, sanitized)
+
+        r2_results = dispatch_blocks_parallel(
+            r2_tasks, _call_r2, throttle_r2, col,
+        )
+        merged_r2: dict[int, bool] = {}
+        for br in sorted(r2_results, key=lambda x: x.block_ordinal):
+            for d in br.decisions:
+                merged_r2[int(d["index"])] = bool(d["keep"])
+        r2_map = merged_r2
+
+    keep_mask = _merge_preliminary_with_r2(tokens, preliminary, r2_map)
+
     if len(keep_mask) != len(tokens):
         raise ValueError(
             f"keep_mask 长度不匹配: {len(keep_mask)} != {len(tokens)}"
         )
-
-    # 验证 index 对齐
     for i, entry in enumerate(keep_mask):
         if entry["index"] != tokens[i]["index"]:
             raise ValueError(
@@ -187,41 +348,180 @@ def run_2b_decision(
     return manifest_dict
 
 
-# ============================================================================
-# LLM 决策生成
-# ============================================================================
+def _merge_preliminary_with_r2(
+    tokens: list[dict],
+    preliminary: list[dict],
+    r2_map: dict[int, bool],
+) -> list[dict]:
+    """R2 输出优先；缺省时回退 R1。"""
+    out: list[dict] = []
+    for i, tok in enumerate(tokens):
+        idx = int(tok["index"])
+        if idx in r2_map:
+            out.append({"index": idx, "keep": r2_map[idx]})
+        else:
+            out.append({
+                "index": idx,
+                "keep": bool(preliminary[i].get("keep", True)),
+            })
+    return out
 
-def _generate_keep_mask(
+
+def _merge_r1_block_results(
+    tokens: list[dict],
+    results: list["BlockResult"],
+) -> list[dict]:
+    """合并各块 R1 决策为与 tokens 等长的稠密 preliminary（含 reason）。"""
+    by_idx: dict[int, dict] = {}
+    for br in sorted(results, key=lambda x: x.block_ordinal):
+        for d in br.decisions:
+            idx = d.get("index")
+            if not isinstance(idx, int):
+                continue
+            reason = str(d.get("reason", "ok"))
+            if reason not in REASON_LABELS:
+                reason = "ok"
+            by_idx[idx] = {
+                "index": idx,
+                "keep": bool(d.get("keep")),
+                "reason": reason,
+            }
+    out: list[dict] = []
+    for tok in tokens:
+        idx = int(tok["index"])
+        out.append(by_idx.get(idx, {"index": idx, "keep": True, "reason": "ok"}))
+    return out
+
+
+def _build_prompt_r1_block(
+    *,
+    block_ordinal: int,
+    n_blocks: int,
+    tokens: list[dict],
+    cleaned_annotations: list[dict],
+    block_positions: list[int],
+) -> str:
+    lo = int(tokens[block_positions[0]]["index"])
+    hi = int(tokens[block_positions[-1]]["index"])
+    speech_lines = []
+    for i in block_positions:
+        idx = int(tokens[i]["index"])
+        text = cleaned_annotations[i]["cleaned_content"]
+        speech_lines.append(f"[{idx}] {text}")
+    rules = _r1_task_text()
+    loc = (
+        f"【阶段定位】2b · R1 口语清洗 | 第 {block_ordinal}/{n_blocks} 块 | "
+        f"全文 index {lo}–{hi}（共 {len(block_positions)} 句）"
+    )
+    return f"""{rules}
+
+【待决策句面】
+{chr(10).join(speech_lines)}
+
+{loc}"""
+
+
+def _build_prompt_r2_single(
+    *,
     tokens: list[dict],
     comprehension: dict,
     goal: str,
+    preliminary: list[dict],
+    narrative_arc_section: str,
+    review_fixes: list[dict] | None,
+    selection_opinion: str,
+) -> str:
+    purpose = comprehension.get("purpose", "")
+    cleaned_annotations = comprehension.get("cleaned_annotations", [])
+    goal_line = f"用户目标：{goal}" if goal else "用户目标：无特定目标，提取核心内容"
+    fixes = _build_review_fixes_section(review_fixes)
+    opinion_section = ""
+    if selection_opinion:
+        opinion_section = (
+            "【用户内容选择意见（F3 反馈，本轮须优先遵从）】\n"
+            f"用户要求：{selection_opinion}\n\n"
+        )
+    rules = _r2_task_text()
+    lines = []
+    for i, tok in enumerate(tokens):
+        idx = int(tok["index"])
+        text = cleaned_annotations[i]["cleaned_content"]
+        pre = preliminary[i]
+        tag = REASON_LABELS.get(pre.get("reason", "ok"), "✓")
+        lines.append(f"[{tag}] [{idx}] {text}")
+    speech = "\n".join(lines)
+    stage = "【阶段定位】2b · R2 内容取舍（全文单次调用）\n"
+    return f"""{rules}
+
+{goal_line}
+
+{stage}{fixes}{opinion_section}内容主旨：{purpose}
+
+{narrative_arc_section}
+
+【待决策句面】（R1 标注 + 原文）
+{speech}"""
+
+
+def _build_prompt_r2_block(
     *,
-    review_fixes: list[dict] | None = None,
-    selection_opinion: str = "",
-    on_chunk: Callable | None = None,
-) -> list[dict]:
-    """调用 LLM 生成 keep_mask（single 模式：全文一次调用）"""
-    n_tokens = len(tokens)
-    logger.info("[2b] 调用 LLM 生成决策（single 模式，共 %d 句）", n_tokens)
+    purpose: str,
+    goal: str,
+    block_ordinal: int,
+    n_blocks: int,
+    narrative_arc_section: str,
+    tokens: list[dict],
+    cleaned_annotations: list[dict],
+    block_positions: list[int],
+    block_meta: dict,
+    preliminary: list[dict],
+    review_fixes: list[dict] | None,
+    selection_opinion: str,
+) -> str:
+    goal_line = f"用户目标：{goal}" if goal else "用户目标：无特定目标，提取核心内容"
+    lo = int(tokens[block_positions[0]]["index"])
+    hi = int(tokens[block_positions[-1]]["index"])
+    fixes = _build_review_fixes_section(review_fixes)
+    opinion_section = ""
+    if selection_opinion:
+        opinion_section = (
+            "【用户内容选择意见（F3 反馈，本轮须优先遵从）】\n"
+            f"用户要求：{selection_opinion}\n\n"
+        )
+    rules = _r2_task_text()
+    summ = _block_summary(block_meta)
+    extra = ""
+    if block_meta.get("_synthetic_gap"):
+        extra = "\n说明：本块为程序补齐分区。"
+    lines = []
+    for i in block_positions:
+        idx = int(tokens[i]["index"])
+        text = cleaned_annotations[i]["cleaned_content"]
+        pre = preliminary[i]
+        tag = REASON_LABELS.get(pre.get("reason", "ok"), "✓")
+        lines.append(f"[{tag}] [{idx}] {text}")
+    speech = "\n".join(lines)
+    loc = (
+        f"【阶段定位】2b · R2 内容取舍 | 第 {block_ordinal}/{n_blocks} 块 | "
+        f"index {lo}–{hi}{extra}"
+    )
+    return f"""{rules}
 
-    prompt = _build_prompt_single(tokens, comprehension, goal, review_fixes=review_fixes, selection_opinion=selection_opinion)
-    schema = _get_schema()
+{goal_line}
 
-    logger.info("[2b] single prompt 长度: %d 字符", len(prompt))
+{loc}
 
-    response = call_structured(
-        build_messages(prompt, schema), schema, "decision", on_chunk=on_chunk,
-    ).data
+{fixes}{opinion_section}内容主旨：{purpose}
 
-    llm_decisions = response.get("decisions", [])
-    logger.info("[2b] LLM 返回 %d 条决策", len(llm_decisions))
-    keep_mask = _build_keep_mask_from_llm_decisions(tokens, llm_decisions)
+{narrative_arc_section}
 
-    return keep_mask
+本块摘要：{summ if summ else "（无）"}
+
+【待决策句面】（仅下列 index；须输出全部）
+{speech}"""
 
 
 def _block_summary(block: dict) -> str:
-    """兼容 2a 的 summary / topic 字段。"""
     s = block.get("summary")
     if isinstance(s, str) and s.strip():
         return s.strip()
@@ -235,15 +535,6 @@ def _partition_token_indices_by_blocks(
     tokens: list[dict],
     outline_blocks: list[dict],
 ) -> list[tuple[dict, list[int]]]:
-    """按 2a 分块区间划分「列表下标」（顺序与 tokens 一致）。
-
-    规则：按 ``outline_blocks`` 顺序扫描；每块认领满足
-    ``start_index <= token.index <= end_index`` 且尚未被认领的句子。
-    仍未认领的下标归入合成补块（全文级 index 不变）。
-
-    Returns:
-        (block_meta, positions) 列表；positions 为 ``tokens`` 的下标列表。
-    """
     n = len(tokens)
     assigned = [False] * n
     out: list[tuple[dict, list[int]]] = []
@@ -287,7 +578,6 @@ def _narrative_arc_section(
     work: list[tuple[dict, list[int]]],
     tokens: list[dict],
 ) -> str:
-    """由各块总结拼成叙事弧说明（1..N 编号）。"""
     lines: list[str] = []
     for i, (block_meta, positions) in enumerate(work, start=1):
         if not positions:
@@ -300,99 +590,7 @@ def _narrative_arc_section(
     return "叙事弧（各块主旨，理解整体结构）：\n" + "\n".join(lines)
 
 
-def _generate_keep_mask_block(
-    tokens: list[dict],
-    comprehension: dict,
-    goal: str,
-    *,
-    review_fixes: list[dict] | None = None,
-    selection_opinion: str = "",
-    on_chunk: Callable | None = None,
-) -> list[dict]:
-    """按 outline_blocks 整块调用 LLM，每块一次，不做子块拆分，合并为完整 keep_mask。"""
-    outline_blocks = comprehension.get("outline_blocks", [])
-    cleaned_annotations = comprehension.get("cleaned_annotations", [])
-    _validate_dense_cleaned_vs_tokens(tokens, cleaned_annotations)
-
-    if not outline_blocks:
-        logger.info("[2b] block：outline_blocks 为空，回退为 single 单次调用")
-        return _generate_keep_mask(
-            tokens, comprehension, goal, review_fixes=review_fixes,
-            selection_opinion=selection_opinion, on_chunk=on_chunk,
-        )
-
-    partitions = _partition_token_indices_by_blocks(tokens, outline_blocks)
-    work = [(b, pos) for b, pos in partitions if pos]
-
-    if not work:
-        logger.warning("[2b] 分块后无任何句子，全部默认保留")
-        return [{"index": int(tok["index"]), "keep": True} for tok in tokens]
-
-    n_blocks = len(work)
-    arc = _narrative_arc_section(work, tokens)
-    purpose = comprehension.get("purpose", "")
-    schema = _get_schema()
-    merged: dict[int, bool] = {}
-
-    block_limit = load_config(None).intelligence.two_b_block_size_limit
-
-    for ord1, (block_meta, positions) in enumerate(work, start=1):
-        n_pos = len(positions)
-        if block_limit > 0 and n_pos > block_limit:
-            logger.warning(
-                "[2b] outline 块 %d/%d 共 %d 句，超过 two_b_block_size_limit=%d，"
-                "仍整块发送（block 模式不拆分）",
-                ord1,
-                n_blocks,
-                n_pos,
-                block_limit,
-            )
-
-        prompt = _build_prompt_block(
-            purpose=purpose,
-            goal=goal,
-            block_ordinal=ord1,
-            n_blocks=n_blocks,
-            sub_ordinal=1,
-            n_subs=1,
-            narrative_arc_section=arc,
-            tokens=tokens,
-            cleaned_annotations=cleaned_annotations,
-            block_positions=positions,
-            block_meta=block_meta,
-            review_fixes=review_fixes,
-            selection_opinion=selection_opinion,
-        )
-        logger.info(
-            "[2b] block LLM outline 块 %d/%d，本块 %d 句，prompt 长度: %d 字符",
-            ord1,
-            n_blocks,
-            n_pos,
-            len(prompt),
-        )
-        response = call_structured(
-            build_messages(prompt, schema), schema, "decision", on_chunk=on_chunk,
-        ).data
-        llm_decisions = response.get("decisions", [])
-        logger.info("[2b] block 块 %d/%d LLM 返回 %d 条决策", ord1, n_blocks, len(llm_decisions))
-        allowed = {int(tokens[i]["index"]) for i in positions}
-        chunk_map = _merge_chunk_decisions(llm_decisions, allowed)
-        for idx, keep in chunk_map.items():
-            if idx in merged:
-                logger.warning(
-                    "[2b] index %s 在多块中重复决策，以后块为准", idx
-                )
-            merged[idx] = keep
-
-    synthetic = [
-        {"index": int(tok["index"]), "keep": merged.get(int(tok["index"]), True)}
-        for tok in tokens
-    ]
-    return _build_keep_mask_from_llm_decisions(tokens, synthetic)
-
-
 def _build_review_fixes_section(review_fixes: list[dict] | None) -> str:
-    """构造审核修正指令区段。无修正时返回空字符串。"""
     if not review_fixes:
         return ""
     lines = [
@@ -415,7 +613,6 @@ def _merge_chunk_decisions(
     llm_decisions: list[dict],
     allowed_global_indices: set[int],
 ) -> dict[int, bool]:
-    """只接受属于本批次的全文 index；缺省默认保留。"""
     out: dict[int, bool] = {}
     for d in llm_decisions:
         idx = d.get("index")
@@ -432,147 +629,10 @@ def _merge_chunk_decisions(
     return out
 
 
-def _build_prompt_block(
-    *,
-    purpose: str,
-    goal: str,
-    block_ordinal: int,
-    n_blocks: int,
-    sub_ordinal: int,
-    n_subs: int,
-    narrative_arc_section: str,
-    tokens: list[dict],
-    cleaned_annotations: list[dict],
-    block_positions: list[int],
-    block_meta: dict,
-    review_fixes: list[dict] | None = None,
-    selection_opinion: str = "",
-) -> str:
-    """block 模式下单次 LLM 的 prompt（每个 outline 块整体一次调用）。"""
-    goal_line = f"用户目标：{goal}" if goal else "用户目标：无特定目标，提取核心内容"
-    lo = int(tokens[block_positions[0]]["index"])
-    hi = int(tokens[block_positions[-1]]["index"])
-    range_line = f"本块在全文中的 index 范围：{lo}–{hi}（共 {len(block_positions)} 句）"
-
-    speech_lines = []
-    for i in block_positions:
-        idx = int(tokens[i]["index"])
-        text = cleaned_annotations[i]["cleaned_content"]
-        speech_lines.append(f"[{idx}] {text}")
-
-    block_summ = _block_summary(block_meta)
-    extra = ""
-    if block_meta.get("_synthetic_gap"):
-        extra = "\n说明：本块为程序根据全文 index 补齐的分区，不在 2a 原始 outline_blocks 中。"
-
-    # n_subs == 1 时（block 模式始终如此）省略子块行
-    if n_subs > 1:
-        sub_line = (
-            f"当前 outline 块：第 {block_ordinal}/{n_blocks} 块；"
-            f"本子块：第 {sub_ordinal}/{n_subs} 批（同一 outline 块内按句数上限切分）。\n"
-        )
-    else:
-        sub_line = f"当前 outline 块：第 {block_ordinal}/{n_blocks} 块。\n"
-
-    stage = (
-        "【阶段定位】当前阶段：2b 决策层（口语转录清洗 + 成片取舍）。"
-        "上游 2a 已产出主旨、分块摘要与稠密消歧句面（cleaned）；"
-        "下游执行层将仅依据 keep_mask 与清单时间轴裁切视频。\n"
-    )
-
-    fixes_section = _build_review_fixes_section(review_fixes)
-
-    opinion_section = ""
-    if selection_opinion:
-        opinion_section = (
-            "【用户内容选择意见（F3 反馈，本轮须优先遵从）】\n"
-            f"用户要求：{selection_opinion}\n\n"
-        )
-
-    shared = _two_b_shared_task_and_output_instructions()
-
-    return f"""{goal_line}
-
-{stage}{sub_line}{fixes_section}{opinion_section}内容主旨：{purpose}
-
-{range_line}
-本 outline 块摘要：{block_summ if block_summ else "（无）"}{extra}
-
-{narrative_arc_section}
-
-【待决策句面】（仅下列 index 须输出 decisions；须与原文逐字一致）
-{chr(10).join(speech_lines)}
-
-{shared}"""
-
-
-def _build_prompt_single(
-    tokens: list[dict],
-    comprehension: dict,
-    goal: str,
-    *,
-    review_fixes: list[dict] | None = None,
-    selection_opinion: str = "",
-) -> str:
-    """构造 2b 决策的 Prompt（single 模式：全文一次）。"""
-    purpose = comprehension.get("purpose", "")
-    cleaned_annotations = comprehension.get("cleaned_annotations", [])
-    outline_blocks = comprehension.get("outline_blocks", [])
-    _validate_dense_cleaned_vs_tokens(tokens, cleaned_annotations)
-
-    if outline_blocks:
-        block_lines = [
-            f"  块 {i+1} [index {b['start_index']}-{b['end_index']}]: {_block_summary(b)}"
-            for i, b in enumerate(outline_blocks)
-        ]
-        blocks_section = "内容分块：\n" + "\n".join(block_lines)
-    else:
-        blocks_section = "内容分块：无"
-
-    speech_lines = []
-    for i, tok in enumerate(tokens):
-        idx = int(tok["index"])
-        text = cleaned_annotations[i]["cleaned_content"]
-        speech_lines.append(f"[{idx}] {text}")
-
-    speech_text = "\n".join(speech_lines)
-
-    goal_line = f"用户目标：{goal}" if goal else "用户目标：无特定目标，提取核心内容"
-
-    stage = (
-        "【阶段定位】当前阶段：2b 决策层 · single 模式（全文一次调用）。"
-        "上游 2a 已产出主旨、分块摘要与稠密消歧句面；"
-        "下游执行层将仅依据 keep_mask 裁切视频。\n"
-    )
-
-    fixes_section = _build_review_fixes_section(review_fixes)
-
-    opinion_section = ""
-    if selection_opinion:
-        opinion_section = (
-            "【用户内容选择意见（F3 反馈，本轮须优先遵从）】\n"
-            f"用户要求：{selection_opinion}\n\n"
-        )
-
-    shared = _two_b_shared_task_and_output_instructions()
-
-    return f"""{goal_line}
-
-{stage}{fixes_section}{opinion_section}内容主旨：{purpose}
-
-{blocks_section}
-
-【待决策句面】（全文所有句；须与原文逐字一致）
-{speech_text}
-
-{shared}"""
-
-
 def _validate_dense_cleaned_vs_tokens(
     tokens: list[dict],
     cleaned_annotations: list[dict],
 ) -> None:
-    """校验 cleaned_annotations 为与 tokens 严格对齐的稠密序列。"""
     if len(cleaned_annotations) != len(tokens):
         raise ValueError(
             "comprehension.cleaned_annotations 必须为稠密全量序列："
@@ -605,8 +665,33 @@ def _validate_dense_cleaned_vs_tokens(
             )
 
 
+def _get_r1_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "keep": {"type": "boolean"},
+                        "reason": {
+                            "type": "string",
+                            "enum": _R1_REASON_ENUM,
+                        },
+                    },
+                    "required": ["index", "keep", "reason"],
+                },
+            },
+        },
+        "required": ["decisions"],
+    }
+
+
 def _get_schema() -> dict:
-    """2b 决策的输出 JSON Schema：供 intelligence_llm 生成示例尾缀 + 解析后校验。"""
     return {
         "type": "object",
         "additionalProperties": False,
@@ -637,9 +722,8 @@ def _get_schema() -> dict:
 
 def _build_keep_mask_from_llm_decisions(
     tokens: list[dict],
-    llm_decisions: list[dict]
+    llm_decisions: list[dict],
 ) -> list[dict]:
-    """将 LLM 决策扩展为完整 keep_mask"""
     decision_map = {d["index"]: d["keep"] for d in llm_decisions}
 
     keep_mask = []
