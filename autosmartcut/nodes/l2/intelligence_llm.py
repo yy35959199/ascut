@@ -20,11 +20,14 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import httpcore
+import httpx
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from openai import OpenAI
@@ -102,6 +105,52 @@ class LLMAPIError(LLMCallError):
     def __init__(self, status_code: int, message: str):
         self.status_code = status_code
         super().__init__(f"API 错误 [{status_code}]: {message}")
+
+
+def _retryable_transport_types() -> tuple[type[BaseException], ...]:
+    """httpx/httpcore 及 OpenAI 连接类异常，供 ``_is_retryable_transport_error`` 使用。"""
+    types_list: list[type[BaseException]] = [
+        httpx.RemoteProtocolError,
+        httpx.ReadTimeout,
+        httpx.ConnectTimeout,
+        httpx.ConnectError,
+        httpcore.RemoteProtocolError,
+    ]
+    for _name in ("ReadError", "WriteError", "ConnectError"):
+        _t = getattr(httpcore, _name, None)
+        if isinstance(_t, type) and issubclass(_t, BaseException):
+            types_list.append(_t)
+    try:
+        from openai import APIConnectionError as _APIConnectionError
+    except ImportError:
+        pass
+    else:
+        types_list.append(_APIConnectionError)
+    return tuple(types_list)
+
+
+_RETRYABLE_TRANSPORT_TYPES: tuple[type[BaseException], ...] = (
+    _retryable_transport_types()
+)
+
+
+def _is_retryable_transport_error(exc: BaseException | None) -> bool:
+    """判定是否为可重试的传输层异常（含 ``__cause__`` / ``__context__`` 短链）。"""
+    if exc is None:
+        return False
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    depth = 0
+    while cur is not None and depth < 8:
+        oid = id(cur)
+        if oid in seen:
+            break
+        seen.add(oid)
+        if isinstance(cur, _RETRYABLE_TRANSPORT_TYPES):
+            return True
+        cur = cur.__cause__ or cur.__context__
+        depth += 1
+    return False
 
 
 @dataclass(frozen=True)
@@ -586,9 +635,10 @@ def call_structured(
 
     重试语义：
     - 空 content 或 JSON 解析/schema 校验失败时重试（最多 max_retries 次）
+    - HTTP 429 / 503 时指数退避重试（带 jitter），同上次数上限
     - 重试前推送 retry chunk（attempt=当前失败次数，1-based），通知消费方清空显示
     - schema 本身有问题（SCHEMA_ERROR）时不重试，直接抛出
-    - API 级错误（LLMAPIError）不重试，直接抛出
+    - 其它不可恢复的 ``LLMAPIError`` 不重试，直接抛出
     """
     app_cfg = load_config()
     if app_cfg.llm is None:
@@ -669,7 +719,10 @@ def call_structured(
                     "[LLM] stage=%s 空 content，重试 %d/%d",
                     stage, attempt + 1, max_retries,
                 )
-                time.sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
+                time.sleep(
+                    RETRY_DELAY_SECONDS * (2 ** attempt)
+                    + random.uniform(0.0, 0.5),
+                )
                 continue
             raise
 
@@ -689,12 +742,66 @@ def call_structured(
                     "[LLM] stage=%s JSON 解析失败，重试 %d/%d: %s",
                     stage, attempt + 1, max_retries, e,
                 )
-                time.sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
+                time.sleep(
+                    RETRY_DELAY_SECONDS * (2 ** attempt)
+                    + random.uniform(0.0, 0.5),
+                )
                 continue
             raise
 
         except LLMAPIError as e:
+            sc = int(getattr(e, "status_code", 0) or 0)
+            if sc in (429, 503) and attempt < max_retries - 1:
+                delay = min(
+                    1.0 * (2**attempt) + random.uniform(0.0, 0.5),
+                    30.0,
+                )
+                if sc == 503:
+                    delay = max(delay, 5.0)
+                if on_chunk:
+                    _safe_on_chunk(
+                        on_chunk,
+                        StreamChunk(
+                            stage=stage,
+                            event="retry",
+                            attempt=attempt + 1,
+                            retry_reason=f"HTTP {sc} 限速",
+                        ),
+                    )
+                logger.warning(
+                    "[LLM] stage=%s HTTP %d，%.1fs 后重试 %d/%d",
+                    stage,
+                    sc,
+                    delay,
+                    attempt + 1,
+                    max_retries,
+                )
+                time.sleep(delay)
+                continue
             logger.error("[LLM] stage=%s API 错误: %s", stage, e)
+            raise
+
+        except Exception as e:
+            if not _is_retryable_transport_error(e):
+                raise
+            if attempt < max_retries - 1:
+                reason = str(e)[:120]
+                if on_chunk:
+                    _safe_on_chunk(on_chunk, StreamChunk(
+                        stage=stage,
+                        event="retry",
+                        attempt=attempt + 1,
+                        retry_reason=f"传输错误: {reason}",
+                    ))
+                logger.warning(
+                    "[LLM] stage=%s 传输异常，重试 %d/%d: %s",
+                    stage, attempt + 1, max_retries, e,
+                )
+                time.sleep(
+                    RETRY_DELAY_SECONDS * (2 ** attempt)
+                    + random.uniform(0.0, 0.5),
+                )
+                continue
             raise
 
     raise LLMCallError("不应到达此处")

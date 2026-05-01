@@ -12,7 +12,12 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
 from autosmartcut.config import load_config
-from autosmartcut.nodes.l2.intelligence_llm import build_messages, call_structured
+from autosmartcut.nodes.l2.intelligence_llm import (
+    StructuredResult,
+    build_messages,
+    call_structured,
+)
+from autosmartcut.nodes.l2.llm_concurrent import AdaptiveThrottle
 
 if TYPE_CHECKING:
     from autosmartcut.nodes.l2.intelligence_2b_dispatch import (
@@ -151,7 +156,6 @@ def run_2b_decision(
     throttle_initial = min(len(work), 8)
 
     from autosmartcut.nodes.l2.intelligence_2b_dispatch import (
-        AdaptiveThrottle,
         BlockResult,
         BlockTask,
         dispatch_blocks_parallel,
@@ -189,10 +193,7 @@ def run_2b_decision(
         )
         col.register_block(ord1)
 
-    def _call_r1(task: BlockTask, oc: Callable | None) -> BlockResult:
-        sr = call_structured(
-            task.messages, task.schema, task.stage, on_chunk=oc,
-        )
+    def _sanitize_r1(task: BlockTask, sr: StructuredResult) -> BlockResult:
         decisions_raw = sr.data.get("decisions", [])
         sanitized: list[dict] = []
         for d in decisions_raw:
@@ -213,7 +214,7 @@ def run_2b_decision(
         return BlockResult(task.block_ordinal, sr, sanitized)
 
     r1_results = dispatch_blocks_parallel(
-        r1_tasks, _call_r1, throttle_r1, col,
+        r1_tasks, _sanitize_r1, throttle_r1, col,
     )
     preliminary = _merge_r1_block_results(tokens, r1_results)
 
@@ -299,10 +300,7 @@ def run_2b_decision(
             )
             col.register_block(bo)
 
-        def _call_r2(task: BlockTask, oc: Callable | None) -> BlockResult:
-            sr = call_structured(
-                task.messages, task.schema, task.stage, on_chunk=oc,
-            )
+        def _sanitize_r2(task: BlockTask, sr: StructuredResult) -> BlockResult:
             decisions_raw = sr.data.get("decisions", [])
             sanitized = []
             for d in decisions_raw:
@@ -316,7 +314,7 @@ def run_2b_decision(
             return BlockResult(task.block_ordinal, sr, sanitized)
 
         r2_results = dispatch_blocks_parallel(
-            r2_tasks, _call_r2, throttle_r2, col,
+            r2_tasks, _sanitize_r2, throttle_r2, col,
         )
         merged_r2: dict[int, bool] = {}
         for br in sorted(r2_results, key=lambda x: x.block_ordinal):

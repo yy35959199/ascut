@@ -1,18 +1,23 @@
-"""2b 分块并发调度：线程池 + TTFT 首块建缓存 + jitter + 429/503 退避。
+"""2b 分块并发调度：分块流式收集与结果聚合。
 
-配合同步阻塞的 ``call_structured``（SSE 流式），不在 LLM 层引入 asyncio。
+线程池、首块 TTFT（首 token 延迟）与自适应并发委托
+``llm_concurrent.dispatch_concurrent``；单次 LLM 调用与重试由
+``intelligence_llm.call_structured`` 负责。
 """
+
 from __future__ import annotations
 
 import logging
-import random
 import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
-from autosmartcut.nodes.l2.intelligence_llm import StreamChunk
+from autosmartcut.nodes.l2.intelligence_llm import StreamChunk, call_structured
+from autosmartcut.nodes.l2.llm_concurrent import (
+    AdaptiveThrottle,
+    ConcurrentTask,
+    dispatch_concurrent,
+)
 
 if TYPE_CHECKING:
     from autosmartcut.nodes.l2.intelligence_llm import StructuredResult
@@ -49,38 +54,6 @@ class PreliminaryDecision:
     index: int
     keep: bool
     reason: str
-
-
-class AdaptiveThrottle:
-    """自适应并发上限（遇到 429/503 时收缩，成功后逐步恢复）。"""
-
-    def __init__(self, initial: int) -> None:
-        self._lock = threading.Lock()
-        self._initial = max(1, initial)
-        self._max_conc = self._initial
-        self._last_throttle_time = 0.0
-
-    @property
-    def max_concurrency(self) -> int:
-        with self._lock:
-            return self._max_conc
-
-    def on_throttle(self) -> None:
-        with self._lock:
-            self._max_conc = max(1, self._max_conc // 2)
-            self._last_throttle_time = time.monotonic()
-            logger.warning(
-                "[2b-dispatch] 触发限速，并发上限降至 %d",
-                self._max_conc,
-            )
-
-    def on_success_window(self) -> None:
-        """若距上次限速超过 30s，尝试 +1 并发直至 initial。"""
-        with self._lock:
-            if time.monotonic() - self._last_throttle_time < 30.0:
-                return
-            if self._max_conc < self._initial:
-                self._max_conc = min(self._initial, self._max_conc + 1)
 
 
 class BlockStreamCollector:
@@ -132,126 +105,80 @@ class BlockStreamCollector:
             self._status.setdefault(block_ordinal, "pending")
 
 
-def _is_delta_chunk(chunk: StreamChunk) -> bool:
-    return chunk.event in ("reasoning_delta", "content_delta") and (
-        bool(chunk.reasoning_delta) or bool(chunk.content_delta)
-    )
+def _wrap_ttft_on_chunk(
+    orig: Callable[[StreamChunk], None] | None,
+    evt: threading.Event,
+) -> Callable[[StreamChunk], None]:
+    """首块 on_chunk：在首个 delta 到达时 set ``evt``，再转发原回调。"""
 
+    def _wrapped(chunk: StreamChunk) -> None:
+        if not evt.is_set():
+            if chunk.event in ("reasoning_delta", "content_delta") and (
+                chunk.reasoning_delta or chunk.content_delta
+            ):
+                evt.set()
+        if orig is not None:
+            orig(chunk)
 
-def _call_one_block_with_retry(
-    task: BlockTask,
-    call_fn: Callable[
-        [BlockTask, Callable[[StreamChunk], None] | None],
-        BlockResult,
-    ],
-    throttle: AdaptiveThrottle | None,
-    on_chunk: Callable[[StreamChunk], None] | None,
-    *,
-    max_retries: int = 5,
-) -> BlockResult:
-    from autosmartcut.nodes.l2.intelligence_llm import LLMAPIError
-
-    attempt = 0
-    while attempt < max_retries:
-        try:
-            if throttle:
-                throttle.on_success_window()
-            return call_fn(task, on_chunk)
-        except LLMAPIError as e:
-            sc = int(getattr(e, "status_code", 0) or 0)
-            if sc in (429, 503) and throttle:
-                throttle.on_throttle()
-            attempt += 1
-            if sc in (429, 503) and attempt < max_retries:
-                base = 1.0 * (2 ** (attempt - 1)) + random.uniform(0.0, 0.5)
-                if sc == 503:
-                    base = max(base, 5.0)
-                delay = min(base, 30.0)
-                logger.warning(
-                    "[2b-dispatch] API %s，%.1fs 后重试 (%d/%d)",
-                    sc,
-                    delay,
-                    attempt,
-                    max_retries,
-                )
-                time.sleep(delay)
-                continue
-            raise
-    raise RuntimeError("不应到达此处")
+    return _wrapped
 
 
 def dispatch_blocks_parallel(
     tasks: list[BlockTask],
-    call_fn: Callable[
-        [BlockTask, Callable[[StreamChunk], None] | None],
-        BlockResult,
-    ],
+    sanitize_fn: Callable[["BlockTask", "StructuredResult"], BlockResult],
     throttle: AdaptiveThrottle | None = None,
     collector: BlockStreamCollector | None = None,
     *,
     ttft_timeout: float = 10.0,
     max_jitter_ms: int = 300,
 ) -> list[BlockResult]:
-    """首块同步等待 TTFT，其余块线程池 + jitter 并发。"""
+    """2b 分块并发：委托通用调度器，再用 ``sanitize_fn`` 转为 ``BlockResult``。"""
     if not tasks:
         return []
 
     ordered = sorted(tasks, key=lambda x: x.block_ordinal)
-    if len(ordered) == 1:
-        t0 = ordered[0]
-        oc = collector.make_on_chunk(t0.block_ordinal) if collector else None
-        return [_call_one_block_with_retry(t0, call_fn, throttle, oc)]
-
-    first = ordered[0]
-    rest = ordered[1:]
-
     ttft_event = threading.Event()
-    col_first = (
-        collector.make_on_chunk(first.block_ordinal) if collector else None
-    )
 
-    def _on_first(chunk: StreamChunk) -> None:
-        if not ttft_event.is_set() and _is_delta_chunk(chunk):
-            ttft_event.set()
-        if col_first is not None:
-            col_first(chunk)
-
-    r_first = _call_one_block_with_retry(
-        first,
-        call_fn,
-        throttle,
-        _on_first,
-    )
-
-    if not ttft_event.wait(timeout=ttft_timeout):
-        logger.warning(
-            "[2b-dispatch] 首块 TTFT 超时 %.1fs，继续并发剩余块",
-            ttft_timeout,
+    concurrent_tasks: list[
+        ConcurrentTask[tuple[BlockTask, Callable[[StreamChunk], None] | None]]
+    ] = []
+    for i, task in enumerate(ordered):
+        oc = collector.make_on_chunk(task.block_ordinal) if collector else None
+        if i == 0 and len(ordered) > 1:
+            oc = _wrap_ttft_on_chunk(oc, ttft_event)
+        concurrent_tasks.append(
+            ConcurrentTask(key=str(task.block_ordinal), payload=(task, oc))
         )
 
-    max_workers = min(
-        len(rest),
-        throttle.max_concurrency if throttle else 8,
+    def _call_llm(
+        payload: tuple[BlockTask, Callable[[StreamChunk], None] | None],
+    ) -> StructuredResult:
+        bt, on_chunk = payload
+        return call_structured(
+            bt.messages,
+            bt.schema,
+            bt.stage,
+            on_chunk=on_chunk,
+        )
+
+    results = dispatch_concurrent(
+        concurrent_tasks,
+        _call_llm,
+        throttle=throttle,
+        first_sync=True,
+        first_done_event=ttft_event if len(ordered) > 1 else None,
+        ttft_timeout=ttft_timeout,
+        max_jitter_ms=max_jitter_ms,
     )
-    max_workers = max(1, max_workers)
 
-    def _run_one(i: int, task: BlockTask) -> tuple[int, BlockResult]:
-        jitter = random.randint(0, max_jitter_ms) / 1000.0
-        if jitter > 0:
-            time.sleep(jitter)
-        oc = collector.make_on_chunk(task.block_ordinal) if collector else None
-        br = _call_one_block_with_retry(task, call_fn, throttle, oc)
-        return i, br
-
-    results_map: dict[int, BlockResult] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        future_to_i = {
-            ex.submit(_run_one, i, task): i
-            for i, task in enumerate(rest)
-        }
-        for fut in as_completed(future_to_i):
-            i, br = fut.result()
-            results_map[i] = br
-
-    ordered_rest = [results_map[i] for i in range(len(rest))]
-    return [r_first] + ordered_rest
+    block_results: list[BlockResult] = []
+    for cr, task in zip(results, ordered, strict=True):
+        if cr.ok and cr.value is not None:
+            block_results.append(sanitize_fn(task, cr.value))
+        elif cr.error is not None:
+            raise cr.error
+        else:
+            raise RuntimeError(
+                f"[2b-dispatch] 无结果且无异常 block={task.block_ordinal}"
+            )
+    return block_results
