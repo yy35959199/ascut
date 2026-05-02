@@ -38,6 +38,7 @@ def render_segments(
     output_video: Path,
     positive_segments: list[tuple[Fraction, Fraction]],
     options: SmartcutRenderOptions | None = None,
+    progress: "ProgressCallback | None" = None,
 ) -> None:
     from autosmartcut.backends.smartcut_core.media_container import MediaContainer
     from autosmartcut.backends.smartcut_core.misc_data import AudioExportInfo, AudioExportSettings
@@ -60,6 +61,7 @@ def render_segments(
             out_path=str(output_video),
             audio_export_info=audio_info,
             video_settings=VideoSettings(opts.video_mode, opts.video_quality),
+            progress=progress,
         )
         if err is not None:
             raise SmartcutBackendError(f"smart_cut 失败: {err}")

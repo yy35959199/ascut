@@ -251,6 +251,26 @@ def format_progress(node_id: str, phase: str, payload: dict) -> str:
         # ── L3 Execute ────────────────────────────────────────────────────
         case ("l3_execute", "resolve_start"):
             return f"  L3 编排中（{p.get('segment_count', 0)} 个保留段）..."
+        case ("l3_execute", "vad_snap_start"):
+            return f"  静音吸附中（snap_radius={p.get('snap_radius', 0):.3f}s）..."
+        case ("l3_execute", "vad_snap_done"):
+            return (
+                f"  静音吸附完成：{p.get('silence_count', 0)} 条静音区间，"
+                f"snap_radius={p.get('snap_radius', 0):.3f}s"
+                f"（{p.get('elapsed_sec', 0):.1f}s）"
+            )
+        case ("l3_execute", "render_start"):
+            return f"  开始渲染（{p.get('segment_count', 0)} 个 cut 单元）..."
+        case ("l3_execute", "render_progress"):
+            done = p.get("done", 0)
+            total = p.get("total", 1)
+            pct = done / total * 100 if total else 0
+            bar_width = 20
+            filled = int(pct / 100 * bar_width)
+            bar = "█" * filled + "░" * (bar_width - filled)
+            return f"  渲染 {bar} {done}/{total}  ({pct:.0f}%)"
+        case ("l3_execute", "render_done"):
+            return f"  渲染完成 ({p.get('elapsed_sec', 0):.1f}s)"
         case ("l3_execute", "encode_start"):
             return f"  编码中（{p.get('segment_count', 0)} 段）..."
         case ("l3_execute", "encode_progress"):

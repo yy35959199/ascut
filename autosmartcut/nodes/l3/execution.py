@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time as _time
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from autosmartcut.nodes.l2.annotation_tokens import video_path_from_manifest
 from autosmartcut.backends.smartcut_backend import (
@@ -27,6 +28,26 @@ from autosmartcut.nodes.l3.timeline_segments import (  # noqa: F401
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _L3RenderProgress:
+    """将 smart_cut 的 emit(value) 协议转换为 (phase, payload) 回调。
+
+    smart_cut 的调用约定：
+    - 第一次 emit(total)：告知 cut_segments 总数
+    - 后续每次 emit(done)：已完成的 cut_segments 数量（从 0 递增）
+    """
+
+    def __init__(self, on_event: "Callable[[str, dict], None]") -> None:
+        self._on_event = on_event
+        self._total: int | None = None
+
+    def emit(self, value: int) -> None:
+        if self._total is None:
+            self._total = value
+            self._on_event("render_start", {"segment_count": value})
+        else:
+            self._on_event("render_progress", {"done": value, "total": self._total})
 
 
 def probe_video_duration_seconds(video_path: Path) -> float:
@@ -95,6 +116,7 @@ def positive_segments_from_annotations(
     config: AppConfig | None = None,
     vad_snap_disabled_by_cli: bool = False,
     audio_16k_path: Path | None = None,
+    on_event: "Callable[[str, dict], None] | None" = None,
 ):
     """
     从句级 annotations 与 keep_mask 生成 positive_segments。
@@ -116,18 +138,29 @@ def positive_segments_from_annotations(
         try:
             from autosmartcut.nodes.l1.vad_silence import silence_intervals_for_video
 
+            if on_event is not None:
+                on_event("vad_snap_start", {"snap_radius": cfg.execution.vad_snap_radius})
+
+            _t_vad = _time.monotonic()
             silence_intervals = silence_intervals_for_video(
                 video,
                 duration,
                 cfg.execution,
                 audio_16k_path=audio_16k_path,
             )
+            _vad_elapsed = _time.monotonic() - _t_vad
             snap_radius = cfg.execution.vad_snap_radius
             logger.info(
                 "[L3] VAD 静音区间 %d 条，snap_radius=%.3fs",
                 len(silence_intervals),
                 snap_radius,
             )
+            if on_event is not None:
+                on_event("vad_snap_done", {
+                    "silence_count": len(silence_intervals),
+                    "snap_radius": snap_radius,
+                    "elapsed_sec": _vad_elapsed,
+                })
         except Exception as exc:
             logger.warning("[L3] VAD 静音构建失败，跳过切点吸附: %s", exc)
             silence_intervals = None
@@ -177,6 +210,7 @@ def run_execution_layer(
     min_duration: float = 1.0,
     gap_after_cap: float | None = None,
     vad_snap_disabled_by_cli: bool = False,
+    on_event: "Callable[[str, dict], None] | None" = None,
 ) -> tuple[Path, int]:
     """L3 端到端：清单 ``annotations`` + ``current.keep_mask`` → 输出视频。返回 (输出路径, 保留段数量)。"""
     setup_logging_for_manifest(run.manifest_path, verbose=False)
@@ -206,6 +240,7 @@ def run_execution_layer(
             config=config,
             vad_snap_disabled_by_cli=vad_snap_disabled_by_cli,
             audio_16k_path=audio_16k_path,
+            on_event=on_event,
         )
         if not positive:
             raise L3InputError("keep_mask 解析后无保留区间")
@@ -218,11 +253,22 @@ def run_execution_layer(
         except OSError:
             pass
 
+        # 构造渲染进度回调（on_event 为 None 时不传 progress）
+        render_progress = _L3RenderProgress(on_event) if on_event is not None else None
+
+        _t_render = _time.monotonic()
         render_segments(
             source_video=video_resolved,
             output_video=out,
             positive_segments=positive,
+            progress=render_progress,
         )
+        _render_elapsed = _time.monotonic() - _t_render
+        if on_event is not None:
+            on_event("render_done", {
+                "elapsed_sec": _render_elapsed,
+                "output_path": str(out),
+            })
 
     with log_stage("l3.persist_manifest", manifest=str(mp)):
         touch_layer_status(data, "l3")

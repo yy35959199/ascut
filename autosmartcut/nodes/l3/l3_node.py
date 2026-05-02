@@ -98,11 +98,18 @@ class L3Node:
         if "keep_mask" in manifest:
             manifest.setdefault("current", {})["keep_mask"] = manifest["keep_mask"]
 
+        def _on_event(phase: str, payload: dict) -> None:
+            """将 (phase, payload) 包装为 ProgressEvent 并通过 ctx.emit 发布。
+            在工作线程中调用，ctx.emit 内部通过 call_soon_threadsafe 保证线程安全。
+            """
+            ctx.emit(ProgressEvent(node_id=self.id, phase=phase, payload=payload))
+
         try:
             out_path, segment_count = await asyncio.to_thread(
                 run_execution_layer,
                 run,
                 config=self._config,
+                on_event=_on_event,
             )
         except Exception as e:
             logger.exception("[L3Node] run_execution_layer 失败: %s", e)

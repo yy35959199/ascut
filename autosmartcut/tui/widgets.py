@@ -571,6 +571,95 @@ if _TEXTUAL_AVAILABLE:
                     pass
 
     # -----------------------------------------------------------------------
+    # L3ProgressView
+    # -----------------------------------------------------------------------
+
+    class L3ProgressView(Widget):
+        """L3 专用进度视图：状态文本 + 渲染进度条 + 历史行。"""
+
+        def compose(self):
+            yield Static("", id="l3-status")
+            yield Static("", id="l3-progress-bar")
+            yield RichLog(id="l3-log", max_lines=200, wrap=True, auto_scroll=True)
+
+        def on_mount(self) -> None:
+            self._render_total: int = 0
+
+        def handle_progress(self, event: "PipelineEvent") -> None:
+            phase = event.phase
+            payload = event.payload or {}
+
+            if phase == "vad_snap_start":
+                snap_r = payload.get("snap_radius", 0)
+                self._set_status(f"  静音吸附中（snap_radius={snap_r:.3f}s）...")
+                self._set_bar("")
+
+            elif phase == "vad_snap_done":
+                count = payload.get("silence_count", 0)
+                snap_r = payload.get("snap_radius", 0)
+                elapsed = payload.get("elapsed_sec", 0)
+                line = (
+                    f"  ✓ 静音吸附完成：{count} 条静音区间，"
+                    f"snap_radius={snap_r:.3f}s（{elapsed:.1f}s）"
+                )
+                self._freeze_to_log(line)
+                self._set_status("")
+
+            elif phase == "render_start":
+                self._render_total = int(payload.get("segment_count", 0))
+                self._set_status(f"  渲染中（共 {self._render_total} 个 cut 单元）...")
+                self._set_bar(self._make_bar(0, self._render_total))
+
+            elif phase == "render_progress":
+                done = int(payload.get("done", 0))
+                total = int(payload.get("total", self._render_total or 1))
+                self._render_total = total
+                self._set_bar(self._make_bar(done, total))
+
+            elif phase == "render_done":
+                elapsed = payload.get("elapsed_sec", 0)
+                # 满格进度条
+                self._set_bar(self._make_bar(self._render_total, self._render_total))
+                line = f"  ✓ 渲染完成（{elapsed:.1f}s）"
+                self._freeze_to_log(line)
+                self._set_status("")
+                self._set_bar("")
+
+            else:
+                # resolve_start 等其他 phase → 状态栏
+                text = format_progress(event.node_id, event.phase, payload)
+                if text:
+                    self._set_status(text)
+
+        def _make_bar(self, done: int, total: int) -> str:
+            if total <= 0:
+                return ""
+            pct = done / total * 100
+            bar_width = 24
+            filled = int(pct / 100 * bar_width)
+            bar = "█" * filled + "░" * (bar_width - filled)
+            return f"  {bar} {done}/{total}  ({pct:.0f}%)"
+
+        def _set_status(self, text: str) -> None:
+            try:
+                self.query_one("#l3-status", Static).update(text)
+            except Exception:
+                pass
+
+        def _set_bar(self, text: str) -> None:
+            try:
+                self.query_one("#l3-progress-bar", Static).update(text)
+            except Exception:
+                pass
+
+        def _freeze_to_log(self, line: str) -> None:
+            if line:
+                try:
+                    self.query_one("#l3-log", RichLog).write(line)
+                except Exception:
+                    pass
+
+    # -----------------------------------------------------------------------
     # MainArea
     # -----------------------------------------------------------------------
 
@@ -593,6 +682,8 @@ if _TEXTUAL_AVAILABLE:
                 self._switch_to_l1a_view()
             elif node_id.startswith("l2") and node_id != "l2d_human":
                 self._switch_to_stream_view(node_id)
+            elif node_id == "l3_execute":
+                self._switch_to_l3_view()
             else:
                 self._ensure_generic_view()
                 try:
@@ -622,6 +713,8 @@ if _TEXTUAL_AVAILABLE:
                     gv.set_current("")
                 except Exception:
                     pass
+            elif node_id == "l3_execute":
+                self._teardown_l3_view(summary_line)
             else:
                 try:
                     gv = self.query_one("#generic-view", GenericStageView)
@@ -643,8 +736,13 @@ if _TEXTUAL_AVAILABLE:
                     self.query_one("#stream-view", LLMStreamView).handle_progress(event)
                 except Exception:
                     pass
+            elif event.node_id == "l3_execute":
+                try:
+                    self.query_one("#l3-view", L3ProgressView).handle_progress(event)
+                except Exception:
+                    pass
             else:
-                # L3 / 其他 → GenericStageView 状态栏
+                # 其他 → GenericStageView 状态栏
                 try:
                     gv = self.query_one("#generic-view", GenericStageView)
                     gv.set_current(format_progress(event.node_id, event.phase, event.payload))
@@ -692,6 +790,33 @@ if _TEXTUAL_AVAILABLE:
         def _teardown_l1a_view(self, summary_line: str) -> None:
             try:
                 self.query_one("#l1a-view", L1aProgressView).remove()
+            except Exception:
+                pass
+            self._ensure_generic_view()
+            try:
+                self.query_one("#generic-view", GenericStageView).append_frozen(summary_line)
+            except Exception:
+                pass
+
+        def _switch_to_l3_view(self) -> None:
+            try:
+                self.query_one("#generic-view", GenericStageView).display = False
+            except Exception:
+                pass
+            try:
+                self.query_one("#stream-view", LLMStreamView).display = False
+            except Exception:
+                pass
+            existing = self.query("#l3-view")
+            if not existing:
+                try:
+                    self.mount(L3ProgressView(id="l3-view"))
+                except Exception:
+                    pass
+
+        def _teardown_l3_view(self, summary_line: str) -> None:
+            try:
+                self.query_one("#l3-view", L3ProgressView).remove()
             except Exception:
                 pass
             self._ensure_generic_view()
@@ -1067,6 +1192,9 @@ else:
         pass
 
     class L1aProgressView:  # type: ignore[no-redef]
+        pass
+
+    class L3ProgressView:  # type: ignore[no-redef]
         pass
 
     class MainArea:  # type: ignore[no-redef]

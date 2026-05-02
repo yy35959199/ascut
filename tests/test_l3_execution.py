@@ -16,7 +16,7 @@ def test_run_execution_layer_rejects_same_input_output_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """输出路径与源视频相同则抛 L3InputError（原 l3_planner 同路径保护）。"""
-    from autosmartcut import execution as execution_mod
+    from autosmartcut.nodes.l3 import execution as execution_mod
 
     src = tmp_path / "in.mp4"
     src.write_text("x", encoding="utf-8")
@@ -57,7 +57,7 @@ def test_run_execution_layer_propagates_smartcut_backend_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """render_segments 抛 SmartcutBackendError 时应原样向上抛出（不与 L3 异常混绑）。"""
-    from autosmartcut import execution as execution_mod
+    from autosmartcut.nodes.l3 import execution as execution_mod
 
     src = tmp_path / "in.mp4"
     out = tmp_path / "out.mp4"
