@@ -430,7 +430,7 @@ def _run_pipeline(args: argparse.Namespace, *, use_tui: bool = False) -> int:
         app_ctrl._subscribe_to_session()  # 必须订阅，否则 TUI 收不到任何事件
         from autosmartcut.tui import PipelineApp
         try:
-            asyncio.run(PipelineApp(app_ctrl).run_async())
+            PipelineApp(app_ctrl).run()
         except Exception as e:
             logger.exception("TUI 流水线失败: %s", e)
             return 1
@@ -469,7 +469,7 @@ def _run_tui_with_path(args: argparse.Namespace) -> int:
 
     from autosmartcut.tui import PipelineApp
     try:
-        asyncio.run(PipelineApp(ctrl).run_async())
+        PipelineApp(ctrl).run()
     except Exception as e:
         logger.exception("TUI 流水线失败: %s", e)
         return 1

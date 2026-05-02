@@ -156,6 +156,8 @@ if _TEXTUAL_AVAILABLE:
             try:
                 self._ctrl.confirm_resume(stage=stage, goal=goal, force_rerun_phases=force_rerun_phases)
                 self.app.pop_screen()
+                # UI 层自己启动 pipeline，不经过 poster 绕一圈
+                self._ctrl.start_pipeline()
             except Exception as e:
                 logger.warning("ResumeScreen confirm_resume 失败: %s", e)
                 try:
@@ -209,9 +211,10 @@ if _TEXTUAL_AVAILABLE:
                 case "btn-reconfigure":
                     try:
                         self._ctrl.reconfigure()
-                        # AppController 状态变为 DIAGNOSING
-                        # PipelineApp._on_ctrl_state_change 会自动 push ResumeScreen
+                        # reconfigure 后状态变为 DIAGNOSING，UI 层自己推 ResumeScreen
                         self.app.pop_screen()
+                        from autosmartcut.tui.screens import ResumeScreen
+                        self.app.push_screen(ResumeScreen(self._ctrl))
                     except Exception as e:
                         logger.warning("reconfigure 失败: %s", e)
                         self.app.pop_screen()

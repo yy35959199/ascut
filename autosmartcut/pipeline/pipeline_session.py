@@ -94,6 +94,7 @@ class PipelineSession:
 
         self._event_handlers: list[Callable[[PipelineEvent], None]] = []
         self._action_queue: asyncio.Queue = asyncio.Queue()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         self._pause_flag: bool = False
         self._abort_flag: bool = False
@@ -149,7 +150,29 @@ class PipelineSession:
         self._event_handlers.append(handler)
 
     def _emit(self, event: PipelineEvent) -> None:
-        """向所有已注册的 handler 发布事件。"""
+        """线程安全的事件发布。
+
+        在 pipeline loop 线程中直接分发；
+        在工作线程（asyncio.to_thread / ThreadPoolExecutor）中通过
+        call_soon_threadsafe 投递到 pipeline loop 再分发。
+
+        节点层只需直接调用 ctx.emit()，无需关心线程安全细节。
+        """
+        loop = self._loop
+        if loop is None:
+            self._dispatch(event)
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            self._dispatch(event)
+        else:
+            loop.call_soon_threadsafe(self._dispatch, event)
+
+    def _dispatch(self, event: PipelineEvent) -> None:
+        """向所有已注册的 handler 分发事件（始终在 pipeline loop 线程执行）。"""
         for handler in self._event_handlers:
             try:
                 handler(event)
@@ -316,6 +339,7 @@ class PipelineSession:
         使用 asyncio.wait(FIRST_COMPLETED) 替代 gather，任意节点完成就重新扫描
         schedulable 节点并立刻启动，彻底消除"慢节点阻塞快节点下游"的问题。
         """
+        self._loop = asyncio.get_running_loop()
         self._build_dag()
         manifest = load_manifest(self._manifest_path)
         self._current_manifest = manifest  # 供 abort() 使用
@@ -643,17 +667,13 @@ class PipelineSession:
         ))
         return result
 
-    def send_action(self, action: object) -> None:
-        """供消费层将用户操作传递给等待中的 l2d_human 节点。
+    def put_action_nowait(self, action: object) -> None:
+        """在 pipeline loop 内部投递 action（同线程调用）。
 
-        线程安全：可从非 asyncio 线程调用（如 Textual 的 UI 线程）。
-        内部通过 asyncio.Queue 传递给节点的 pending_action 队列。
+        CLI 适配器在同一个 asyncio loop 里直接调用此方法。
+        跨线程场景由 PipelineThread.send_action 处理。
         """
-        try:
-            loop = asyncio.get_running_loop()
-            loop.call_soon_threadsafe(self._action_queue.put_nowait, action)
-        except RuntimeError:
-            self._action_queue.put_nowait(action)
+        self._action_queue.put_nowait(action)
 
     # -----------------------------------------------------------------------
     # 统一结果处理（任务 2.10）

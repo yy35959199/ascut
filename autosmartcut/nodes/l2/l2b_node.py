@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 from autosmartcut.nodes.l2.annotation_tokens import tokens_from_annotations
 from autosmartcut.pipeline.pipeline_events import ProgressEvent
 from autosmartcut.pipeline.pipeline_models import L2bOutput, StageResult, StageStatus
-from autosmartcut.nodes.l2.llm_progress import make_on_chunk
 
 if TYPE_CHECKING:
     from autosmartcut.config import AppConfig
@@ -111,19 +110,22 @@ class L2bNode:
         try:
             from autosmartcut.nodes.l2.intelligence_2b_dispatch import BlockStreamCollector
 
-            loop = asyncio.get_running_loop()
             collector = BlockStreamCollector()
 
             outline_blocks = comprehension.get("outline_blocks") or []
             n_blocks_r1_est = max(1, len(outline_blocks)) if outline_blocks else 1
 
-            def _bridge(block_ordinal: int, chunk: object) -> None:
+            def _on_block_chunk(block_ordinal: int, chunk: object) -> None:
+                """将 collector 的 StreamChunk 转为 ProgressEvent(phase="2b_chunk") 发出。
+
+                直接调用 ctx.emit——PipelineSession._emit 已处理线程安全，
+                无需在节点层手动 call_soon_threadsafe。
+                """
                 from autosmartcut.nodes.l2.intelligence_llm import StreamChunk
 
                 if not isinstance(chunk, StreamChunk):
                     return
-                loop.call_soon_threadsafe(
-                    ctx.emit,
+                ctx.emit(
                     ProgressEvent(
                         node_id=self.id,
                         phase="2b_chunk",
@@ -139,14 +141,13 @@ class L2bNode:
                     ),
                 )
 
-            collector.subscribe(_bridge)
+            collector.subscribe(_on_block_chunk)
 
             ctx.emit(
                 ProgressEvent(
                     node_id=self.id,
                     phase="2b_start",
                     payload={
-                        "collector": collector,
                         "n_blocks_r1_estimate": n_blocks_r1_est,
                         "token_count": len(tokens),
                         "show_thinking_default": self._config.tui.show_thinking_default,
@@ -159,7 +160,7 @@ class L2bNode:
                 manifest,
                 mode=two_b_mode,
                 review_fixes=review_fixes if review_fixes else None,
-                on_chunk=make_on_chunk(ctx.emit, self.id),
+                on_chunk=None,      # collector 已订阅 _on_block_chunk，不再双重路径
                 collector=collector,
             )
 

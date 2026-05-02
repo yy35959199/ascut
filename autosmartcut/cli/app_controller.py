@@ -4,12 +4,14 @@
 
 - ``SessionController``：session 生命周期管理，``ascut run`` 使用的最小单元。
 - ``AppController``：在 ``SessionController`` 基础上增加状态机和回调机制，
-  TUI / GUI 使用。
+  TUI / GUI / WebUI 使用。
 
 设计约定：
 - 两个类均不含任何 UI 框架代码（无 Textual、无 Qt）。
-- ``AppController`` 的回调在 asyncio event loop 线程中触发，
-  UI 层负责自己的线程安全（Textual 用 call_later，Qt 用信号槽）。
+- Pipeline 线程管理委托给 ``PipelineThread``（pipeline/pipeline_thread.py）。
+- ``_set_state`` 只更新内部状态，不通知 UI。
+- ``_on_session_event`` 在 pipeline 线程里被调用，通过 poster 跨线程通知 UI。
+- UI 层发起的操作（open/confirm_resume）由 UI 层自己处理后续逻辑。
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ if TYPE_CHECKING:
     from autosmartcut.pipeline.pipeline_events import PipelineEvent
     from autosmartcut.pipeline.pipeline_run import PipelineRun
     from autosmartcut.pipeline.pipeline_session import PipelineSession
+    from autosmartcut.pipeline.pipeline_thread import PipelineThread
     from autosmartcut.pipeline.session_factory import PipelineParams
 
 logger = logging.getLogger(__name__)
@@ -115,19 +118,14 @@ class SessionController:
         return self._session is not None
 
     def pause(self) -> None:
-        """暂停流水线（当前节点完成后停止）。"""
+        """暂停流水线（当前节点完成后停止）。线程安全（只设标志）。"""
         if self._session is not None:
             self._session.pause()
 
     def abort(self, save: bool = True) -> None:
-        """中止流水线。save=True 时保存已完成阶段的检查点。"""
+        """中止流水线。save=True 时保存已完成阶段的检查点。线程安全。"""
         if self._session is not None:
             self._session.abort(save=save)
-
-    def send_action(self, action: object) -> None:
-        """向 l2d_human 节点发送用户操作。"""
-        if self._session is not None:
-            self._session.send_action(action)
 
 
 # ---------------------------------------------------------------------------
@@ -135,18 +133,22 @@ class SessionController:
 # ---------------------------------------------------------------------------
 
 class AppController(SessionController):
-    """交互式应用控制器，TUI / GUI 使用。
+    """交互式应用控制器，TUI / GUI / WebUI 使用。
 
     在 ``SessionController`` 基础上增加：
     - 应用状态机（AppState）
     - 输入类型判断（open()）
     - 用户确认参数（confirm_resume()）
     - 执行中途重配（reconfigure()）
-    - 状态变化回调（on_state_change）
-    - pipeline 事件转发回调（on_pipeline_event）
+    - Pipeline 线程启动（start_pipeline()，委托给 PipelineThread）
+    - UI 层事件投递接口（set_ui_poster / set_state_poster）
 
-    回调约定：所有回调在 asyncio event loop 线程中触发，
-    UI 层负责自己的线程安全。
+    线程模型：
+    - Pipeline 在独立 daemon 线程里运行（PipelineThread 管理）。
+    - UI 层通过 set_ui_poster / set_state_poster 注册投递方法。
+    - poster 在 pipeline 线程里被调用，UI 层负责线程安全。
+    - _set_state 只更新内部状态，不通知 UI（避免 UI 线程自己绕一圈）。
+    - UI 层发起的操作（open/confirm_resume）由 UI 层自己处理后续逻辑。
     """
 
     def __init__(self) -> None:
@@ -154,24 +156,61 @@ class AppController(SessionController):
         self._state: AppState = AppState.IDLE
         self._resolved_input: "ResolvedInput | None" = None
         self._progress_report: "ProgressReport | None" = None
-        self._state_callbacks: list[Callable[[AppState], None]] = []
-        self._event_callbacks: list[Callable[["PipelineEvent"], None]] = []
 
-    # ── 回调注册 ────────────────────────────────────────────────────────────
+        # Pipeline 线程（由 start_pipeline 创建）
+        self._pipeline_thread: "PipelineThread | None" = None
 
-    def on_state_change(self, callback: Callable[[AppState], None]) -> None:
-        """注册状态变化监听。
+        # UI 层投递接口（poster 在 pipeline 线程里被调用）
+        self._ui_poster: Callable[["PipelineEvent"], None] | None = None
+        self._state_poster: Callable[[AppState], None] | None = None
 
-        回调在 asyncio event loop 线程中触发，UI 层负责线程安全。
+    # ── UI 层接口 ────────────────────────────────────────────────────────────
+
+    def set_ui_poster(self, poster: Callable[["PipelineEvent"], None]) -> None:
+        """注册 pipeline 事件投递方法。
+
+        poster 在 pipeline 线程里被调用，实现方必须保证线程安全：
+        - Textual: ``lambda ev: app.call_later(app.handle_pipeline_event, ev)``
+        - Qt:      ``lambda ev: window.pipeline_event_signal.emit(ev)``
+        - WebUI:   ``lambda ev: asyncio.run_coroutine_threadsafe(ws.send_json(...), ui_loop)``
         """
-        self._state_callbacks.append(callback)
+        self._ui_poster = poster
 
-    def on_pipeline_event(self, callback: Callable[["PipelineEvent"], None]) -> None:
-        """注册 pipeline 事件监听（转发 session EventBus）。
+    def set_state_poster(self, poster: Callable[[AppState], None]) -> None:
+        """注册状态变化投递方法。
 
-        回调在 asyncio event loop 线程中触发，UI 层负责线程安全。
+        poster 在 pipeline 线程里被调用（仅 pipeline 线程触发的状态变化）。
+        UI 线程发起的状态变化（open/confirm_resume）不经过 poster。
         """
-        self._event_callbacks.append(callback)
+        self._state_poster = poster
+
+    # ── Pipeline 线程管理 ─────────────────────────────────────────────────────
+
+    def start_pipeline(self) -> None:
+        """在独立 daemon 线程里启动 pipeline。非阻塞，立即返回。
+
+        pipeline 完成/失败通过 PipelineEvent 通知 UI。
+
+        Raises:
+            RuntimeError: session 未构造或 pipeline 线程已在运行。
+        """
+        from autosmartcut.pipeline.pipeline_thread import PipelineThread
+
+        if self._session is None:
+            raise RuntimeError("session 尚未构造，请先调用 setup()")
+        if self._pipeline_thread is not None and self._pipeline_thread.is_alive:
+            raise RuntimeError("pipeline 线程已在运行")
+
+        self._pipeline_thread = PipelineThread(self._session)
+        self._pipeline_thread.start()
+
+    def send_action(self, action: object) -> None:
+        """UI 线程调用，将用户操作投递到 pipeline 线程的 action_queue。
+
+        委托给 PipelineThread.send_action，通过 call_soon_threadsafe 保证线程安全。
+        """
+        if self._pipeline_thread is not None:
+            self._pipeline_thread.send_action(action)
 
     # ── 属性 ────────────────────────────────────────────────────────────────
 
@@ -198,6 +237,8 @@ class AppController(SessionController):
         - MEDIA_FILE  → setup(params) → state = READY
         - MANIFEST_*  → state = DIAGNOSING，附带 progress_report
 
+        UI 层调用此方法后，自行根据 ctrl.state 决定下一步（不经过 poster）。
+
         Args:
             path: 输入路径（媒体文件、清单文件或清单目录）。
 
@@ -216,7 +257,6 @@ class AppController(SessionController):
         if resolved.input_type == InputType.MEDIA_FILE:
             self._setup_from_media(resolved)
         else:
-            # 清单文件/目录：进入诊断状态
             self._progress_report = resolved.progress_report
             self._set_state(AppState.DIAGNOSING)
 
@@ -231,9 +271,7 @@ class AppController(SessionController):
     ) -> None:
         """用户确认参数，构造 session，进入 READY 状态。
 
-        适用场景：
-        - 首次打开清单文件后用户确认参数
-        - 执行中途重配后用户确认新参数
+        UI 层调用此方法后，自行调用 start_pipeline()（不经过 poster）。
 
         Args:
             stage: stage 规格字符串（如 "3"、"23"、"123"）。
@@ -248,11 +286,15 @@ class AppController(SessionController):
         if manifest_path is None:
             raise RuntimeError("当前输入不是清单文件，无法续跑")
 
-        self._setup_from_manifest(manifest_path, stage, goal, force_rerun_phases=force_rerun_phases, **overrides)
+        self._setup_from_manifest(
+            manifest_path, stage, goal,
+            force_rerun_phases=force_rerun_phases,
+            **overrides,
+        )
         self._set_state(AppState.READY)
 
     def reconfigure(self) -> "ProgressReport":
-        """执行中途重配：abort 当前 session，回到 DIAGNOSING 状态。
+        """执行中途重配：abort 当前 pipeline，等待线程结束，回到 DIAGNOSING。
 
         适用场景：用户在执行中途想修改参数重跑。
 
@@ -270,8 +312,10 @@ class AppController(SessionController):
                 f"只能在 RUNNING 或 PAUSED 状态下重配，当前状态: {self._state}"
             )
 
-        # abort 当前 session，保存已完成阶段的检查点
-        self.abort(save=True)
+        # 停止 pipeline 线程
+        if self._pipeline_thread is not None:
+            self._pipeline_thread.stop(timeout=10.0)
+        self._pipeline_thread = None
 
         # 重新推断进度
         manifest_path = self._run.manifest_path if self._run else None
@@ -291,47 +335,54 @@ class AppController(SessionController):
     # ── session 事件处理 ─────────────────────────────────────────────────────
 
     def _subscribe_to_session(self) -> None:
-        """订阅当前 session 的 EventBus，驱动状态转换并转发事件给 UI。
-
-        在 setup() 之后、session 开始执行之前调用。
-        """
+        """订阅当前 session 的 EventBus。在 setup() 之后调用。"""
         if self._session is None:
             return
         self._session.subscribe(self._on_session_event)
 
     def _on_session_event(self, event: "PipelineEvent") -> None:
-        """处理 session 事件：驱动状态转换 + 转发给 UI 层。
+        """处理 session 事件：驱动状态转换 + 通过 poster 投递到 UI 线程。
 
-        在 asyncio event loop 线程中被调用。
+        在 pipeline 线程（asyncio loop 或 call_soon_threadsafe 回调）中被调用。
+        这是唯一调用 poster 的地方（跨线程通知）。
         """
-        # 驱动状态转换
+        # 驱动状态转换（不触发任何 UI 操作，只更新内部状态）
+        new_state: AppState | None = None
         match event.type:
             case "stage_enter":
                 if self._state == AppState.READY:
-                    self._set_state(AppState.RUNNING)
+                    new_state = AppState.RUNNING
             case "pipeline_complete":
-                self._set_state(AppState.COMPLETED)
+                new_state = AppState.COMPLETED
             case "paused":
-                self._set_state(AppState.PAUSED)
+                new_state = AppState.PAUSED
             case "error":
-                self._set_state(AppState.FAILED)
+                new_state = AppState.FAILED
 
-        # 转发给 UI 层
-        for cb in self._event_callbacks:
+        if new_state is not None and new_state != self._state:
+            self._state = new_state
+            logger.debug("AppController 状态: → %s", new_state.value)
+            # 跨线程通知 UI
+            if self._state_poster is not None:
+                try:
+                    self._state_poster(new_state)
+                except Exception as e:
+                    logger.warning("state_poster 异常: %s", e)
+
+        # 投递事件到 UI 线程
+        if self._ui_poster is not None:
             try:
-                cb(event)
+                self._ui_poster(event)
             except Exception as e:
-                logger.warning("AppController event callback 异常: %s", e)
+                logger.warning("ui_poster 异常: %s", e)
 
     # ── 内部辅助 ─────────────────────────────────────────────────────────────
 
     def _resolve_input(self, path: Path) -> "ResolvedInput":
-        """仅输入解析（resolve_input）。"""
         from autosmartcut.cli.input_resolver import resolve_input
         return resolve_input(path)
 
     def _setup_from_media(self, resolved: "ResolvedInput") -> None:
-        """媒体文件场景：构造 PipelineParams 并 setup，进入 READY。"""
         from autosmartcut.pipeline.session_factory import PipelineParams
 
         if resolved.media_path is None:
@@ -351,7 +402,6 @@ class AppController(SessionController):
         force_rerun_phases: "frozenset[int] | None" = None,
         **overrides: object,
     ) -> None:
-        """清单续跑：组装 PipelineParams 并 setup（不改变 AppState）。"""
         from autosmartcut.pipeline.session_factory import PipelineParams
 
         params = PipelineParams(
@@ -364,17 +414,16 @@ class AppController(SessionController):
         self.setup(params)
 
     def _set_state(self, new_state: AppState) -> None:
-        """设置新状态并触发回调。"""
+        """仅更新内部状态，不通知 UI。
+
+        UI 线程发起的状态变化（open/confirm_resume）不需要通知 UI——
+        UI 层自己知道它发起了什么操作，自己处理后续逻辑。
+        跨线程通知只在 _on_session_event 里通过 poster 完成。
+        """
         if self._state == new_state:
             return
-        old_state = self._state
         self._state = new_state
-        logger.debug("AppController 状态: %s → %s", old_state.value, new_state.value)
-        for cb in self._state_callbacks:
-            try:
-                cb(new_state)
-            except Exception as e:
-                logger.warning("AppController state callback 异常: %s", e)
+        logger.debug("AppController 状态: → %s", new_state.value)
 
     def setup(self, params: "PipelineParams") -> None:
         """构造 session 并订阅事件。覆盖父类方法以增加事件订阅。"""

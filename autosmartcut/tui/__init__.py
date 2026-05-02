@@ -1,6 +1,8 @@
 """autosmartcut.tui — TUI 子包（基于 Textual 框架）。
 
 子模块：
+- stream_vm.py   LLM 流式输出 ViewModel（纯 Python，无 Textual 依赖）
+- addons.py      LLMStreamView 插件 Widget（DecisionsAddon、ResultAddon）
 - formatters.py  兼容重导出（实现见 ``autosmartcut.formatters``）
 - widgets.py     Textual Widget 组件（PipelineSidebar、MainArea、LogArea 等）
 - screens.py     Textual Screen（ResumeScreen、QuitDialog、PauseDialog、LogScreen）

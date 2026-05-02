@@ -2,6 +2,7 @@
 
 包含：
 - PipelineSidebar  侧边栏（节点状态）
+- LLMStreamView    统一 LLM 流式视图（L2A/L2B/L2C 共用，支持多 slot + 插件）
 - GenericStageView 通用阶段视图
 - L1aProgressView  L1A 专用进度视图
 - MainArea         主区域（切换视图）
@@ -16,6 +17,12 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from autosmartcut.nodes.l2.intelligence_2d_core import DisplayData
     from autosmartcut.pipeline.pipeline_events import PipelineEvent
+    from autosmartcut.tui.logging.stream_hub import LogStreamHub
+    from autosmartcut.tui.logging.repository import LogRepository
+    from autosmartcut.tui.logging.context import RunLogContext
+    from autosmartcut.tui.logging.screen_controller import LogScreenController
+    from autosmartcut.tui.addons import DecisionsAddon, ResultAddon
+    from autosmartcut.tui.stream_vm import SlotState
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +42,7 @@ if _TEXTUAL_AVAILABLE:
 
     from textual.binding import Binding
     from textual.containers import Vertical, VerticalScroll
+    from textual import events
 
     from autosmartcut.cli.formatters import (
         format_decision_list,
@@ -92,85 +100,374 @@ if _TEXTUAL_AVAILABLE:
                 pass
 
     # -----------------------------------------------------------------------
-    # LLMStreamView
+    # LLMStreamView — 统一 LLM 流式视图（L2A/L2B/L2C 共用）
     # -----------------------------------------------------------------------
 
     class LLMStreamView(Widget):
-        """LLM 流式输出视图：双面板显示 reasoning 和 content。
+        """统一 LLM 流式视图：支持多 slot（并发/串行 LLM 调用）+ 插件面板。
 
-        状态栏：当前 stage + 状态（思考中 / 生成中 / 重试中 / 完成）
-        reasoning 面板：thinking 过程（暗色，可滚动）
-        content 面板：最终 JSON 输出（主色调，高度自适应）
+        架构：
+        - LLMStreamViewModel（tui/stream_vm.py）管理所有 slot 状态，纯 Python
+        - 本 Widget 只做"读 ViewModel → 写 Textual 控件"的映射
+        - 插件（DecisionsAddon / ResultAddon）挂载到 #stream-addon 容器
 
         生命周期：
-        - ``reset()``：新 stage 开始时清空所有面板
-        - ``handle_llm_chunk(payload)``：处理 ProgressEvent(phase="llm_stream") 的 payload
+        - begin_node(node_id, slots)：节点开始，重置 ViewModel，注册初始 slots
+        - handle_progress(event)：L2 节点所有 progress 事件的统一入口
+        - 50ms 节流 flush：只更新 active slot 的增量行
+        - slot 切换（←/→）：全量重绘 active slot
         """
 
+        can_focus = True
+
+        BINDINGS = [
+            Binding("left",  "prev_slot",        "上一个", show=False),
+            Binding("right", "next_slot",        "下一个", show=False),
+            Binding("t",     "toggle_reasoning", "思考",   show=False),
+        ]
+
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            from autosmartcut.tui.stream_vm import LLMStreamViewModel
+            self._vm = LLMStreamViewModel()
+            self._reasoning_expanded: bool = True
+            self._flush_scheduled: bool = False
+            self._addon: object = None  # StreamAddon | None
+
         def compose(self):
-            yield Static("", id="llm-status-bar")
-            yield RichLog(id="llm-reasoning", max_lines=500, wrap=True, auto_scroll=True)
-            yield Static("─" * 40, id="llm-divider")
-            yield RichLog(id="llm-content", max_lines=200, wrap=True, auto_scroll=True)
+            yield Static("", id="stream-status")
+            yield Static("", id="stream-progress")
+            yield RichLog(id="stream-reasoning", max_lines=500, wrap=True, auto_scroll=True)
+            yield Static("", id="stream-reasoning-cur")
+            yield Static("─" * 40, id="stream-divider")
+            yield RichLog(id="stream-content", max_lines=200, wrap=True, auto_scroll=True)
+            yield Static("", id="stream-content-cur")
+            from textual.containers import Vertical as _V
+            yield _V(id="stream-addon")
 
-        def handle_llm_chunk(self, payload: dict) -> None:
-            """处理单个 llm_stream payload，更新对应面板。"""
-            evt = payload.get("event", "")
-            stage = payload.get("stage", "")
-
-            match evt:
-                case "reasoning_delta":
-                    delta = payload.get("reasoning_delta", "")
-                    if delta:
-                        try:
-                            self.query_one("#llm-status-bar", Static).update(
-                                f"🧠 [{stage}] 思考中..."
-                            )
-                            self.query_one("#llm-reasoning", RichLog).write(delta)
-                        except Exception:
-                            pass
-
-                case "content_delta":
-                    delta = payload.get("content_delta", "")
-                    if delta:
-                        try:
-                            self.query_one("#llm-status-bar", Static).update(
-                                f"✍ [{stage}] 生成中..."
-                            )
-                            self.query_one("#llm-content", RichLog).write(delta)
-                        except Exception:
-                            pass
-
-                case "retry":
-                    attempt = payload.get("attempt", 0)
-                    reason = payload.get("retry_reason", "")
-                    reason_short = reason[:50] + "…" if len(reason) > 50 else reason
-                    try:
-                        self.query_one("#llm-status-bar", Static).update(
-                            f"⟳ [{stage}] 重试（第 {attempt} 次）: {reason_short}"
-                        )
-                        # 清空面板，准备接收新一轮输出
-                        self.query_one("#llm-reasoning", RichLog).clear()
-                        self.query_one("#llm-content", RichLog).clear()
-                    except Exception:
-                        pass
-
-                case "result":
-                    try:
-                        self.query_one("#llm-status-bar", Static).update(
-                            f"✓ [{stage}] 完成"
-                        )
-                    except Exception:
-                        pass
-
-        def reset(self) -> None:
-            """新 stage 开始时清空所有面板。"""
+        def on_mount(self) -> None:
             try:
-                self.query_one("#llm-status-bar", Static).update("")
-                self.query_one("#llm-reasoning", RichLog).clear()
-                self.query_one("#llm-content", RichLog).clear()
+                self.query_one("#stream-addon").display = False
             except Exception:
                 pass
+
+        # ── 外部接口（MainArea 调用）──────────────────────────────────────
+
+        def begin_node(self, node_id: str, slots: list[tuple[str, str]]) -> None:
+            """节点开始：重置 ViewModel，注册初始 slots，清空 UI，卸载插件。"""
+            from autosmartcut.tui.stream_vm import LLMStreamViewModel
+            self._vm = LLMStreamViewModel()
+            self._vm.register_slots(slots)
+            self._reasoning_expanded = True
+            self._clear_all_panels()
+            self.unmount_addon()
+            try:
+                self.focus()
+            except Exception:
+                pass
+
+        def handle_progress(self, event: "PipelineEvent") -> None:
+            """L2 节点所有 progress 事件的统一入口。
+
+            MainArea 只做视图切换，L2 内部路由在此处理。
+            """
+            match event.phase:
+                case "llm_stream":
+                    self._handle_llm_stream(event.payload)
+                case "2b_start":
+                    self._on_2b_start(event.payload or {})
+                case "2b_chunk":
+                    self._on_2b_chunk(event.payload or {})
+                case "2b_done":
+                    self._on_2b_done(event.payload or {})
+                case _:
+                    # decision_start, review_start 等 → 更新状态栏
+                    text = format_progress(event.node_id, event.phase, event.payload or {})
+                    try:
+                        self.query_one("#stream-status", Static).update(text)
+                    except Exception:
+                        pass
+
+        def mount_addon(self, addon: object) -> None:
+            """挂载插件 widget 到 #stream-addon 容器。"""
+            self.unmount_addon()
+            try:
+                container = self.query_one("#stream-addon")
+                container.mount(addon)
+                container.display = True
+                self._addon = addon
+            except Exception as e:
+                logger.warning("mount_addon 失败: %s", e)
+
+        def unmount_addon(self) -> None:
+            """卸载当前插件。"""
+            try:
+                container = self.query_one("#stream-addon")
+                for child in list(container.children):
+                    child.remove()
+                container.display = False
+            except Exception:
+                pass
+            self._addon = None
+
+        # ── 内部：llm_stream 处理 ─────────────────────────────────────────
+
+        def _handle_llm_stream(self, payload: dict) -> None:
+            stage = payload.get("stage", "")
+            evt = payload.get("event", "")
+            match evt:
+                case "reasoning_delta":
+                    self._vm.feed_delta(stage, reasoning=payload.get("reasoning_delta", ""))
+                    self._schedule_flush()
+                case "content_delta":
+                    self._vm.feed_delta(stage, content=payload.get("content_delta", ""))
+                    self._schedule_flush()
+                case "retry":
+                    self._vm.mark_retry(
+                        stage,
+                        payload.get("attempt", 0),
+                        payload.get("retry_reason", ""),
+                    )
+                    self._redraw_active_slot()
+                case "result":
+                    self._vm.mark_done(stage)
+                    self._redraw_active_slot()
+
+        # ── 内部：2b 专用事件 ─────────────────────────────────────────────
+
+        def _on_2b_start(self, payload: dict) -> None:
+            from autosmartcut.tui.addons import DecisionsAddon
+            n = max(1, int(payload.get("n_blocks_r1_estimate", 1)))
+            slots = [(f"block_{i}", f"块 {i + 1}") for i in range(n)]
+            self._vm.register_slots(slots)
+            self._update_progress_bar()
+            self.mount_addon(DecisionsAddon())
+
+        def _on_2b_chunk(self, payload: dict) -> None:
+            bo = int(payload.get("block_ordinal", 0))
+            slot_id = f"block_{bo}"
+            # llm_stream 部分（thinking + content）
+            self._handle_llm_stream(payload)
+            # decisions 增量写入 addon_data
+            decisions = payload.get("decisions")
+            if decisions is not None:
+                self._vm.set_addon_data(slot_id, "decisions", decisions)
+                if slot_id == self._vm.get_active() and self._addon is not None:
+                    new_items, _ = self._vm.flush_addon(slot_id, "decisions")
+                    if new_items:
+                        try:
+                            self._addon.append_items(new_items)
+                        except Exception:
+                            pass
+
+        def _on_2b_done(self, payload: dict) -> None:
+            from autosmartcut.tui.addons import ResultAddon
+            self.unmount_addon()
+            result_addon = ResultAddon()
+            self.mount_addon(result_addon)
+            try:
+                result_addon.show_result(
+                    tokens=list(payload.get("tokens") or []),
+                    keep_mask=list(payload.get("keep_mask") or []),
+                    comprehension=dict(payload.get("comprehension") or {}),
+                )
+            except Exception as e:
+                logger.warning("_on_2b_done show_result 失败: %s", e)
+
+        # ── 50ms 节流 flush ───────────────────────────────────────────────
+
+        def _schedule_flush(self) -> None:
+            if not self._flush_scheduled:
+                self._flush_scheduled = True
+                self.set_timer(0.05, self._do_flush)
+
+        def _do_flush(self) -> None:
+            self._flush_scheduled = False
+            active = self._vm.get_active()
+            if not active:
+                return
+            new_r, r_cur, new_c, c_cur = self._vm.flush(active)
+            self._write_incremental(new_r, r_cur, new_c, c_cur)
+            self._update_status_bar()
+            self._update_progress_bar()
+
+        def _write_incremental(
+            self,
+            new_r: list[str],
+            r_cur: str,
+            new_c: list[str],
+            c_cur: str,
+        ) -> None:
+            if new_r and self._reasoning_expanded:
+                try:
+                    rl = self.query_one("#stream-reasoning", RichLog)
+                    for line in new_r:
+                        rl.write(line)
+                except Exception:
+                    pass
+            try:
+                self.query_one("#stream-reasoning-cur", Static).update(
+                    r_cur if self._reasoning_expanded else ""
+                )
+            except Exception:
+                pass
+            if new_c:
+                try:
+                    cl = self.query_one("#stream-content", RichLog)
+                    for line in new_c:
+                        cl.write(line)
+                except Exception:
+                    pass
+            try:
+                self.query_one("#stream-content-cur", Static).update(c_cur)
+            except Exception:
+                pass
+
+        # ── 全量重绘（slot 切换 / retry / done）──────────────────────────
+
+        def _redraw_active_slot(self) -> None:
+            """active slot 变化后，全量重绘面板。"""
+            active = self._vm.get_active()
+            r_lines, r_cur, c_lines, c_cur = self._vm.flush_full(active)
+
+            try:
+                rl = self.query_one("#stream-reasoning", RichLog)
+                rl.clear()
+                if self._reasoning_expanded:
+                    for line in r_lines:
+                        rl.write(line)
+            except Exception:
+                pass
+            try:
+                self.query_one("#stream-reasoning-cur", Static).update(
+                    r_cur if self._reasoning_expanded else ""
+                )
+            except Exception:
+                pass
+            try:
+                cl = self.query_one("#stream-content", RichLog)
+                cl.clear()
+                for line in c_lines:
+                    cl.write(line)
+            except Exception:
+                pass
+            try:
+                self.query_one("#stream-content-cur", Static).update(c_cur)
+            except Exception:
+                pass
+
+            self._update_status_bar()
+            self._update_progress_bar()
+
+            # 插件全量刷新
+            if self._addon is not None:
+                slot = self._vm.get_slot(active)
+                if slot is not None:
+                    try:
+                        self._addon.refresh_from_slot(slot)
+                    except Exception:
+                        pass
+                    # 同步 addon flush 指针，避免后续增量重复
+                    self._vm.flush_addon(active, "decisions")
+
+        def _clear_all_panels(self) -> None:
+            for wid, cls in [
+                ("#stream-reasoning", RichLog),
+                ("#stream-content", RichLog),
+            ]:
+                try:
+                    self.query_one(wid, cls).clear()
+                except Exception:
+                    pass
+            for wid in ["#stream-reasoning-cur", "#stream-content-cur",
+                        "#stream-status", "#stream-progress"]:
+                try:
+                    self.query_one(wid, Static).update("")
+                except Exception:
+                    pass
+
+        # ── 状态栏 / 进度条 ───────────────────────────────────────────────
+
+        def _update_status_bar(self) -> None:
+            active = self._vm.get_active()
+            slot = self._vm.get_slot(active)
+            if slot is None:
+                return
+            icons = {
+                "idle": "○", "streaming": "🧠", "done": "✓",
+                "failed": "✗", "retrying": "↻",
+            }
+            icon = icons.get(slot.status, "?")
+            if slot.status == "retrying":
+                detail = f"重试（第 {slot.attempt} 次）"
+            elif slot.status == "done":
+                detail = "完成"
+            elif slot.reasoning_done:
+                detail = "生成中…"
+            else:
+                detail = "思考中…"
+            try:
+                self.query_one("#stream-status", Static).update(
+                    f"{icon} [{slot.label}] {detail}"
+                )
+            except Exception:
+                pass
+
+        def _update_progress_bar(self) -> None:
+            progress = self._vm.get_progress()
+            if len(progress) <= 1:
+                try:
+                    self.query_one("#stream-progress", Static).update("")
+                except Exception:
+                    pass
+                return
+            active = self._vm.get_active()
+            icons = {
+                "idle": "○", "streaming": "⟳", "done": "✓",
+                "failed": "✗", "retrying": "↻",
+            }
+            colors = {
+                "idle": "dim", "streaming": "dark_orange", "done": "green",
+                "failed": "red", "retrying": "yellow",
+            }
+            parts = []
+            for sid, label, status in progress:
+                icon = icons.get(status, "?")
+                color = colors.get(status, "")
+                if sid == active:
+                    parts.append(f"[bold reverse]{icon} {label}[/bold reverse]")
+                elif color:
+                    parts.append(f"[{color}]{icon} {label}[/{color}]")
+                else:
+                    parts.append(f"{icon} {label}")
+            hint = "  [dim]←/→ 切换  t 思考[/dim]"
+            try:
+                self.query_one("#stream-progress", Static).update(
+                    "  ".join(parts) + hint
+                )
+            except Exception:
+                pass
+
+        # ── 键盘动作 ──────────────────────────────────────────────────────
+
+        def action_prev_slot(self) -> None:
+            self._vm.prev_slot()
+            self._redraw_active_slot()
+
+        def action_next_slot(self) -> None:
+            self._vm.next_slot()
+            self._redraw_active_slot()
+
+        def action_toggle_reasoning(self) -> None:
+            self._reasoning_expanded = not self._reasoning_expanded
+            self._redraw_active_slot()
+
+        def reset(self) -> None:
+            """兼容旧调用（MainArea._switch_to_stream_view 内部用 begin_node 替代）。"""
+            from autosmartcut.tui.stream_vm import LLMStreamViewModel
+            self._vm = LLMStreamViewModel()
+            self._clear_all_panels()
+            self.unmount_addon()
 
     # -----------------------------------------------------------------------
     # GenericStageView
@@ -274,363 +571,28 @@ if _TEXTUAL_AVAILABLE:
                     pass
 
     # -----------------------------------------------------------------------
-    # 2b：BlockProgressBar / BlockChatView / ResultView / TwoBStageView
-    # -----------------------------------------------------------------------
-
-    class BlockProgressBar(Static):
-        """一排块状态指示器（○/⟳/✓/✗），由 TwoBStageView 驱动。"""
-
-        def __init__(self, **kwargs) -> None:
-            super().__init__("", **kwargs)
-
-    class BlockChatView(Widget):
-        """单块摘要 + 思考区 + 决策流。"""
-
-        def compose(self) -> None:
-            yield Static("", id="twob-chat-summary")
-            yield Static("▼ 思考", id="twob-thinking-toggle")
-            yield RichLog(id="twob-thinking-log", max_lines=400, wrap=True, auto_scroll=True)
-            yield Static("[bold]决策流[/bold]", id="twob-decisions-label")
-            yield RichLog(id="twob-decisions-log", max_lines=1200, wrap=True, auto_scroll=True)
-
-    class ResultView(Widget):
-        """与 2d 相同的保留/删除序列展示（依赖 format_decision_list）。"""
-
-        def compose(self) -> None:
-            with VerticalScroll():
-                yield Static("", id="twob-result-body")
-
-        def clear(self) -> None:
-            try:
-                self.query_one("#twob-result-body", Static).update("")
-            except Exception:
-                pass
-
-        def show_result(
-            self,
-            *,
-            tokens: list[dict],
-            keep_mask: list[dict],
-            comprehension: dict,
-        ) -> None:
-            from autosmartcut.nodes.l2.intelligence_2d_core import DisplayData
-
-            kc = sum(1 for e in keep_mask if e.get("keep") is True)
-            cc = sum(1 for e in keep_mask if e.get("keep") is False)
-            total = len(keep_mask)
-            stats = {
-                "keep_count": kc,
-                "cut_count": cc,
-                "total": total,
-                "override_count": 0,
-            }
-            dd = DisplayData(
-                tokens=tokens,
-                effective_mask=keep_mask,
-                overrides=[],
-                comprehension=comprehension,
-                review_report={},
-                goal="",
-                feedback_history=[],
-                stats=stats,
-            )
-            try:
-                body = format_decision_list(dd, use_markup=True)
-                head = (
-                    f"[bold]2b 最终保留/删除（{kc} 保留 / {cc} 删除 / 共 {total}）[/bold]\n"
-                )
-                self.query_one("#twob-result-body", Static).update(head + body)
-            except Exception as e:
-                logger.warning("ResultView.show_result 失败: %s", e)
-
-    class TwoBStageView(Widget):
-        """2b 分块流式主容器：ViewModel + 子部件 + 约 50ms 刷新节流。"""
-
-        can_focus = True
-
-        BINDINGS = [
-            Binding("left", "prev_block", "上一块", show=False),
-            Binding("right", "next_block", "下一块", show=False),
-            Binding("t", "toggle_thinking", "思考", show=False),
-        ]
-
-        def __init__(self, **kwargs) -> None:
-            super().__init__(**kwargs)
-            self._vm: "TwoBViewModel | None" = None
-            self._n_r1_est: int = 1
-            self._last_ui_refresh: float = 0.0
-            self._refresh_scheduled: bool = False
-            self._debounce_until: float = 0.0
-
-        def compose(self) -> None:
-            yield Static("2b 决策（R1 → R2）", id="twob-header")
-            yield BlockProgressBar(id="twob-progress")
-            with Vertical(id="twob-middle"):
-                yield BlockChatView(id="twob-chat")
-            yield ResultView(id="twob-result")
-
-        def reset(self) -> None:
-            self._vm = None
-            self._n_r1_est = 1
-            self._last_ui_refresh = 0.0
-            self._debounce_until = 0.0
-            try:
-                self.query_one("#twob-header", Static).update("2b 决策（R1 → R2）")
-                self.query_one("#twob-progress", BlockProgressBar).update("")
-                self.query_one("#twob-chat-summary", Static).update("")
-                self.query_one("#twob-thinking-toggle", Static).update("▼ 思考")
-                self.query_one("#twob-thinking-log", RichLog).clear()
-                self.query_one("#twob-decisions-log", RichLog).clear()
-                self.query_one("#twob-result", ResultView).display = False
-                self.query_one("#twob-result", ResultView).clear()
-            except Exception:
-                pass
-
-        def on_2b_start(self, payload: dict) -> None:
-            from autosmartcut.nodes.l2.l2b_view_model import TwoBViewModel
-
-            show_th = bool(payload.get("show_thinking_default", True))
-            self._n_r1_est = max(1, int(payload.get("n_blocks_r1_estimate", 1)))
-            self._vm = TwoBViewModel(show_thinking_default=show_th)
-            self.reset_panels()
-            self._refresh_ui_immediate()
-            try:
-                self.focus()
-            except Exception:
-                pass
-
-        def reset_panels(self) -> None:
-            try:
-                self.query_one("#twob-chat-summary", Static).update(
-                    f"R1 口语清洗 · 约 {self._n_r1_est} 块（流式到达后显示各块详情）"
-                )
-            except Exception:
-                pass
-
-        def _build_stream_chunk(self, payload: dict) -> object:
-            from autosmartcut.nodes.l2.intelligence_llm import StreamChunk
-
-            ev = payload.get("event", "content_delta")
-            if ev not in (
-                "reasoning_delta",
-                "content_delta",
-                "usage",
-                "retry",
-                "result",
-            ):
-                ev = "content_delta"
-            return StreamChunk(
-                stage=str(payload.get("stage", "")),
-                event=ev,  # type: ignore[arg-type]
-                reasoning_delta=str(payload.get("reasoning_delta") or ""),
-                content_delta=str(payload.get("content_delta") or ""),
-                attempt=int(payload.get("attempt") or 0),
-                retry_reason=str(payload.get("retry_reason") or ""),
-            )
-
-        def handle_2b_chunk(self, payload: dict) -> None:
-            if self._vm is None:
-                return
-            bo = int(payload.get("block_ordinal", 0))
-            sc = self._build_stream_chunk(payload)
-            self._vm.update_chunk(bo, sc)
-            self._schedule_refresh()
-
-        def _schedule_refresh(self) -> None:
-            now = time.monotonic()
-            if now - self._last_ui_refresh < 0.05:
-                if not self._refresh_scheduled:
-                    self._refresh_scheduled = True
-                    self._debounce_until = now + 0.05
-                    self.set_timer(0.05, self._flush_debounced_refresh)
-                return
-            self._last_ui_refresh = now
-            self._refresh_ui_immediate()
-
-        def _flush_debounced_refresh(self) -> None:
-            self._refresh_scheduled = False
-            now = time.monotonic()
-            if now < self._debounce_until:
-                # 仍可能更晚到达的 chunk
-                self.set_timer(self._debounce_until - now, self._flush_debounced_refresh)
-                return
-            self._last_ui_refresh = now
-            self._refresh_ui_immediate()
-
-        def _format_progress_rich(self) -> str:
-            if self._vm is None:
-                return " ".join("○" for _ in range(self._n_r1_est))
-            active = self._vm.get_active_block()
-            ph = self._vm.get_phase()
-            ordinals = self._vm.get_display_ordinals()
-            if ph == "r1" and not ordinals:
-                ordinals = list(range(1, self._n_r1_est + 1))
-            if ph in ("r2", "done") and not ordinals:
-                return "[dim]R2 启动中…（等待首包）[/dim]"
-
-            parts: list[str] = []
-            for o in ordinals:
-                st = self._vm.get_block_state(o)
-                if st is None:
-                    sym, color = "○", ""
-                else:
-                    if st.status == "failed":
-                        sym, color = "✗", "red"
-                    elif st.status == "done":
-                        sym, color = "✓", "green"
-                    elif st.status == "streaming":
-                        sym, color = "⟳", "dark_orange"
-                    else:
-                        sym, color = "○", "dim"
-                is_active = o == active
-                if is_active:
-                    cell = f"[bold reverse]{sym}[/bold reverse]"
-                elif color:
-                    cell = f"[{color}]{sym}[/{color}]"
-                else:
-                    cell = sym
-                parts.append(cell)
-            label = "R1" if ph == "r1" else ("R2" if ph == "r2" else "完成")
-            return f"[dim]{label}[/dim]  " + " ".join(parts) + f"  [dim]· 活动块 {active} · ←/→ 切换 · t 展开思考[/dim]"
-
-        def _refresh_ui_immediate(self) -> None:
-            if self._vm is None:
-                return
-            try:
-                self.query_one("#twob-progress", BlockProgressBar).update(
-                    self._format_progress_rich()
-                )
-            except Exception:
-                pass
-            self._render_chat_panels()
-
-        def _render_chat_panels(self) -> None:
-            if self._vm is None:
-                return
-            active = self._vm.get_active_block()
-            st = self._vm.get_block_state(active)
-            if st is None:
-                ords = self._vm.list_ordinals()
-                if ords:
-                    self._vm.switch_to(ords[0])
-                    st = self._vm.get_block_state(ords[0])
-            if st is None:
-                return
-            ph = self._vm.get_phase()
-            stage_label = "R1" if st.stage == "decision_r1" else "R2"
-            summ = st.input_summary or f"{stage_label} · 块 {st.block_ordinal}"
-            try:
-                self.query_one("#twob-chat-summary", Static).update(
-                    f"[bold]{summ}[/bold]  [dim]（{ph}）[/dim]"
-                )
-            except Exception:
-                pass
-            exp = st.thinking_expanded
-            arrow = "▼" if exp else "▶"
-            try:
-                self.query_one("#twob-thinking-toggle", Static).update(
-                    f"{arrow} 思考  "
-                    f"{'（已完成）' if st.thinking_done else '（流式中…）'}  "
-                    f"~{st.thinking_token_count} tok"
-                )
-            except Exception:
-                pass
-            try:
-                th = self.query_one("#twob-thinking-log", RichLog)
-                th.clear()
-                if exp and st.thinking_text:
-                    th.write(st.thinking_text)
-            except Exception:
-                pass
-            from autosmartcut.nodes.l2.intelligence_2b import REASON_LABELS
-
-            try:
-                dec = self.query_one("#twob-decisions-log", RichLog)
-                dec.clear()
-                for d in st.decisions:
-                    idx = d.get("index", "?")
-                    keep = d.get("keep")
-                    reason = str(d.get("reason", "ok"))
-                    if "reason" in d and reason in REASON_LABELS:
-                        tag = REASON_LABELS[reason]
-                    else:
-                        tag = "✓" if keep else "✗"
-                    dec.write(f"  [{idx}] {tag}  keep={keep}")
-            except Exception:
-                pass
-
-        def action_prev_block(self) -> None:
-            self._step_active(-1)
-
-        def action_next_block(self) -> None:
-            self._step_active(1)
-
-        def action_toggle_thinking(self) -> None:
-            if self._vm is None:
-                return
-            self._vm.toggle_thinking(self._vm.get_active_block())
-            self._refresh_ui_immediate()
-
-        def _step_active(self, delta: int) -> None:
-            if self._vm is None:
-                return
-            cur = self._ordinals_for_navigation()
-            if not cur:
-                return
-            try:
-                i = cur.index(self._vm.get_active_block())
-            except ValueError:
-                i = 0
-            i = (i + delta) % len(cur)
-            self._vm.switch_to(cur[i])
-            self._refresh_ui_immediate()
-
-        def _ordinals_for_navigation(self) -> list[int]:
-            if self._vm is None:
-                return []
-            xs = self._vm.get_display_ordinals()
-            if xs:
-                return xs
-            return self._vm.list_ordinals()
-
-        def mark_done(self, payload: dict | None = None) -> None:
-            if self._vm is not None:
-                self._vm.mark_done()
-            try:
-                self.query_one("#twob-header", Static).update("2b 决策 · 已完成")
-            except Exception:
-                pass
-            self._refresh_ui_immediate()
-            if payload and payload.get("tokens") and payload.get("keep_mask") is not None:
-                try:
-                    rv = self.query_one("#twob-result", ResultView)
-                    rv.show_result(
-                        tokens=list(payload["tokens"]),
-                        keep_mask=list(payload["keep_mask"]),
-                        comprehension=dict(payload.get("comprehension") or {}),
-                    )
-                    rv.display = True
-                except Exception as e:
-                    logger.warning("TwoBStageView.mark_done 展示结果失败: %s", e)
-
-    # -----------------------------------------------------------------------
     # MainArea
     # -----------------------------------------------------------------------
 
     class MainArea(Widget):
-        """主区域：根据活跃节点切换视图。"""
+        """主区域：根据活跃节点切换视图。
+
+        视图路由：
+        - L1  → L1aProgressView（动态 mount/remove）
+        - L2（非 L2D）→ LLMStreamView（统一流式视图）
+        - L2D → ReviewScreen（need_input 事件触发）
+        - L3 / 其他 → GenericStageView
+        """
 
         def compose(self):
             yield GenericStageView(id="generic-view")
-            yield LLMStreamView(id="llm-stream-view")
-            yield TwoBStageView(id="twob-stage")
+            yield LLMStreamView(id="stream-view")
 
         def show_stage_progress(self, node_id: str) -> None:
             if node_id == "l1_perception":
                 self._switch_to_l1a_view()
-            elif node_id.startswith("l2"):
-                # L2 节点：切换到 LLM 流式视图
-                self._switch_to_llm_stream_view()
+            elif node_id.startswith("l2") and node_id != "l2d_human":
+                self._switch_to_stream_view(node_id)
             else:
                 self._ensure_generic_view()
                 try:
@@ -646,15 +608,10 @@ if _TEXTUAL_AVAILABLE:
             summary_line = f"✓ {node_id}{elapsed_str}"
             if node_id == "l1_perception":
                 self._teardown_l1a_view(summary_line)
-            elif node_id.startswith("l2"):
-                # L2 节点完成：隐藏流式视图与 2b 视图，切回 generic 并记录摘要
+            elif node_id.startswith("l2") and node_id != "l2d_human":
+                # L2 节点完成：隐藏流式视图，切回 generic 并记录摘要
                 try:
-                    lv = self.query_one("#llm-stream-view", LLMStreamView)
-                    lv.display = False
-                except Exception:
-                    pass
-                try:
-                    self.query_one("#twob-stage", TwoBStageView).display = False
+                    self.query_one("#stream-view", LLMStreamView).display = False
                 except Exception:
                     pass
                 self._ensure_generic_view()
@@ -680,40 +637,14 @@ if _TEXTUAL_AVAILABLE:
                     self.query_one("#l1a-view", L1aProgressView).handle_progress(event)
                 except Exception:
                     pass
-            elif event.phase == "llm_stream":
-                # LLM 流式 chunk → LLMStreamView
+            elif event.node_id.startswith("l2") and event.node_id != "l2d_human":
+                # 所有 L2（非 L2D）progress 事件统一转发给 LLMStreamView
                 try:
-                    self.query_one("#llm-stream-view", LLMStreamView).handle_llm_chunk(
-                        event.payload
-                    )
-                except Exception:
-                    pass
-            elif event.phase == "2b_start":
-                try:
-                    tw = self.query_one("#twob-stage", TwoBStageView)
-                    tw.reset()
-                    tw.on_2b_start(event.payload or {})
-                    tw.display = True
-                    self.query_one("#llm-stream-view", LLMStreamView).display = False
-                    self.query_one("#generic-view", GenericStageView).display = False
-                except Exception:
-                    pass
-            elif event.phase == "2b_chunk":
-                try:
-                    self.query_one("#twob-stage", TwoBStageView).handle_2b_chunk(
-                        event.payload
-                    )
-                except Exception:
-                    pass
-            elif event.phase == "2b_done":
-                try:
-                    self.query_one("#twob-stage", TwoBStageView).mark_done(
-                        event.payload or {}
-                    )
+                    self.query_one("#stream-view", LLMStreamView).handle_progress(event)
                 except Exception:
                     pass
             else:
-                # 其他 progress（decision_start, review_start 等）→ GenericStageView 状态栏
+                # L3 / 其他 → GenericStageView 状态栏
                 try:
                     gv = self.query_one("#generic-view", GenericStageView)
                     gv.set_current(format_progress(event.node_id, event.phase, event.payload))
@@ -722,8 +653,11 @@ if _TEXTUAL_AVAILABLE:
 
         def _switch_to_l1a_view(self) -> None:
             try:
-                gv = self.query_one("#generic-view", GenericStageView)
-                gv.display = False
+                self.query_one("#generic-view", GenericStageView).display = False
+            except Exception:
+                pass
+            try:
+                self.query_one("#stream-view", LLMStreamView).display = False
             except Exception:
                 pass
             existing = self.query("#l1a-view")
@@ -733,36 +667,42 @@ if _TEXTUAL_AVAILABLE:
                 except Exception:
                     pass
 
-        def _switch_to_llm_stream_view(self) -> None:
-            """切换到 LLM 流式视图，清空上次内容。"""
+        def _switch_to_stream_view(self, node_id: str) -> None:
+            """切换到 LLMStreamView，根据节点注册初始 slots。"""
             try:
                 self.query_one("#generic-view", GenericStageView).display = False
             except Exception:
                 pass
             try:
-                lv = self.query_one("#llm-stream-view", LLMStreamView)
-                lv.display = True
-                lv.reset()
+                sv = self.query_one("#stream-view", LLMStreamView)
+                sv.display = True
+                match node_id:
+                    case "l2a_comprehension":
+                        sv.begin_node(node_id, [("r1", "R1 粗理解"), ("r2", "R2 精化")])
+                    case "l2b_decision":
+                        # slots 由 2b_start event 动态注册
+                        sv.begin_node(node_id, [])
+                    case "l2c_review":
+                        sv.begin_node(node_id, [("review_1", "审核轮 1")])
+                    case _:
+                        sv.begin_node(node_id, [(node_id, node_id)])
             except Exception:
                 pass
 
         def _teardown_l1a_view(self, summary_line: str) -> None:
             try:
-                lv = self.query_one("#l1a-view", L1aProgressView)
-                lv.remove()
+                self.query_one("#l1a-view", L1aProgressView).remove()
             except Exception:
                 pass
             self._ensure_generic_view()
             try:
-                gv = self.query_one("#generic-view", GenericStageView)
-                gv.append_frozen(summary_line)
+                self.query_one("#generic-view", GenericStageView).append_frozen(summary_line)
             except Exception:
                 pass
 
         def _ensure_generic_view(self) -> None:
             try:
-                gv = self.query_one("#generic-view", GenericStageView)
-                gv.display = True
+                self.query_one("#generic-view", GenericStageView).display = True
             except Exception:
                 pass
 
@@ -809,29 +749,58 @@ if _TEXTUAL_AVAILABLE:
     # -----------------------------------------------------------------------
 
     class LogArea(Widget):
-        """日志区域：可滚动，显示最近日志。"""
+        """日志区域：订阅 LogStreamHub，50ms batch 节流写入 RichLog。"""
 
-        def __init__(self, **kwargs) -> None:
+        def __init__(self, hub: "LogStreamHub | None" = None, **kwargs) -> None:
             super().__init__(**kwargs)
-            self._log_screen_ref: "RichLog | None" = None
+            self._hub = hub
+            self._hub_token: int | None = None
+            self._pending: list[str] = []
+            self._flush_scheduled: bool = False
 
         def compose(self):
             yield RichLog(id="log-rich", max_lines=2000, wrap=True)
 
+        def on_mount(self) -> None:
+            if self._hub is not None:
+                self._hub_token = self._hub.subscribe(self._on_hub_line)
+
+        def on_unmount(self) -> None:
+            if self._hub is not None and self._hub_token is not None:
+                self._hub.unsubscribe(self._hub_token)
+                self._hub_token = None
+
+        def _on_hub_line(self, line: str) -> None:
+            """Hub 回调：积攒行，50ms 后批量写入（节流）。"""
+            self._pending.append(line)
+            if not self._flush_scheduled:
+                self._flush_scheduled = True
+                self.set_timer(0.05, self._flush_pending)
+
+        def _flush_pending(self) -> None:
+            self._flush_scheduled = False
+            if not self._pending:
+                return
+            lines, self._pending = self._pending, []
+            try:
+                rl = self.query_one("#log-rich", RichLog)
+                for line in lines:
+                    rl.write(line)
+            except Exception:
+                pass
+
         def append_log(self, level: str, node_id: str, message: str) -> None:
+            """供外部直接调用（如 error 路径）。走 Hub 或直接写。"""
             prefix = f"[{level}] " if level not in ("INFO", "") else ""
             node_prefix = f"[{node_id}] " if node_id else ""
             text = f"{prefix}{node_prefix}{message}"
+            if self._hub is not None:
+                self._hub.publish(text)
+                return
             try:
-                log_widget = self.query_one("#log-rich", RichLog)
-                log_widget.write(text)
+                self.query_one("#log-rich", RichLog).write(text)
             except Exception:
                 pass
-            if self._log_screen_ref is not None:
-                try:
-                    self._log_screen_ref.write(text)
-                except Exception:
-                    self._log_screen_ref = None
 
     # -----------------------------------------------------------------------
     # ReviewScreen（Widget，嵌入 MainArea，用于 L2D 人工审阅）
@@ -915,7 +884,11 @@ if _TEXTUAL_AVAILABLE:
 
             if parsed == "show_log":
                 try:
-                    self.app.push_screen(LogScreen())
+                    mk = getattr(self.app, "make_log_screen", None)
+                    if callable(mk):
+                        self.app.push_screen(mk())
+                    else:
+                        logger.warning("当前 App 不支持 make_log_screen，无法打开日志屏")
                 except Exception as e:
                     logger.warning("show_log 推屏失败: %s", e)
                 return
@@ -940,36 +913,147 @@ if _TEXTUAL_AVAILABLE:
     from textual.binding import Binding as _Binding
 
     class LogScreen(_Screen):
-        """全屏日志界面。通过 L 键推入，Esc 返回。"""
+        """全屏日志界面：历史 run_*.log + 实时 Hub；L 进入，Esc 返回，F 切换跟随，End 回底。"""
 
-        BINDINGS = [_Binding("escape", "app.pop_screen", "返回", show=True)]
+        BINDINGS = [
+            _Binding("escape", "app.pop_screen", "返回", show=True),
+            _Binding("f", "toggle_follow", "跟随", show=True),
+            _Binding("end", "jump_bottom", "底部", show=True),
+        ]
+
+        CSS = """
+        LogScreen Vertical {
+            height: 1fr;
+        }
+        #log-screen-status {
+            height: 1;
+            color: $text-muted;
+        }
+        #log-screen-rich {
+            height: 1fr;
+        }
+        """
+
+        def __init__(
+            self,
+            hub: "LogStreamHub | None" = None,
+            repository: "LogRepository | None" = None,
+            context: "RunLogContext | None" = None,
+            **kwargs,
+        ) -> None:
+            super().__init__(**kwargs)
+            self._hub = hub
+            self._repository = repository or LogRepository()
+            self._context = context
+            self._controller: "LogScreenController | None" = None
 
         def compose(self) -> _ComposeResult:
             from textual.widgets import Footer, Header, RichLog
+            from textual.containers import Vertical
             yield Header()
-            yield RichLog(id="log-screen-rich", max_lines=2000, wrap=True)
+            with Vertical():
+                yield Static("", id="log-screen-status")
+                yield RichLog(id="log-screen-rich", max_lines=2000, wrap=True)
             yield Footer()
 
-        def on_mount(self) -> None:
-            try:
-                log_area = self.app.query_one("#log-area", LogArea)
-                src = log_area.query_one("#log-rich", RichLog)
-                dst = self.query_one("#log-screen-rich", RichLog)
-                lines = getattr(src, "_lines", None)
-                if lines:
-                    for line in lines:
-                        dst.write(line)
-                dst.scroll_end(animate=False)
-                log_area._log_screen_ref = dst
-            except Exception as e:
-                logger.warning("LogScreen.on_mount 复制日志失败: %s", e)
+        async def on_mount(self) -> None:
+            import asyncio as _asyncio
+            from autosmartcut.tui.logging.screen_controller import LogScreenController
+            from textual.widgets import RichLog as _RichLog
 
-        def on_unmount(self) -> None:
+            if self._hub is None or self._context is None:
+                try:
+                    self.query_one("#log-screen-status", Static).update(
+                        "无法加载日志（缺少 LogStreamHub 或 RunLogContext）"
+                    )
+                except Exception:
+                    pass
+                return
+
             try:
-                log_area = self.app.query_one("#log-area", LogArea)
-                log_area._log_screen_ref = None
+                rl = self.query_one("#log-screen-rich", _RichLog)
+                st = self.query_one("#log-screen-status", Static)
+            except Exception as e:
+                logger.warning("LogScreen.on_mount 查询控件失败: %s", e)
+                return
+
+            self._controller = LogScreenController(
+                self._hub,
+                self._repository,
+                self._context,
+                schedule_flush=lambda: self.set_timer(0.05, self._flush_live),
+            )
+            self._controller.attach(
+                rich_log=rl,
+                status_static=st,
+                is_suppressed=lambda: False,
+            )
+
+            # 1. 显示加载状态
+            try:
+                st.update("加载历史日志…")
             except Exception:
                 pass
+
+            # 2. 异步读文件（不阻塞主线程）
+            try:
+                lines, n_files, n_lines = await _asyncio.to_thread(
+                    self._controller.load_history_lines_sync
+                )
+            except Exception as e:
+                logger.warning("LogScreen 历史加载失败: %s", e)
+                lines, n_files, n_lines = [], 0, 0
+
+            # 3. 分批写入 RichLog，每批 yield 一次让 Textual 渲染
+            _BATCH = 500
+            self._controller.begin_batch_write()
+            try:
+                for i in range(0, len(lines), _BATCH):
+                    for line in lines[i : i + _BATCH]:
+                        rl.write(line)
+                    await _asyncio.sleep(0)
+                if lines:
+                    rl.scroll_end(animate=False)
+            finally:
+                self._controller.end_batch_write()
+
+            # 4. 更新元数据
+            self._controller.set_history_meta(n_files, n_lines)
+
+            # 5. 历史写完后再订阅实时流（保证顺序）
+            self._controller.subscribe_live()
+
+            # 6. 滚动监听
+            try:
+                self.watch(rl, "scroll_y", self._watch_scroll_y)
+            except Exception:
+                pass
+
+        def on_unmount(self) -> None:
+            if self._controller is not None:
+                self._controller.detach()
+                self._controller = None
+
+        def _flush_live(self) -> None:
+            """timer 回调，触发 controller 的 live batch flush。"""
+            if self._controller is not None:
+                self._controller.flush_live_pending()
+
+        def _watch_scroll_y(self, old: object, new: object) -> None:
+            if self._controller is not None:
+                self._controller.notify_scroll_y_changed(old, new)
+
+        def on_mouse_scroll_up(self, _event: "events.MouseScrollUp") -> None:
+            if self._controller is not None:
+                self._controller.notify_user_scroll_up()
+
+        def action_toggle_follow(self) -> None:
+            if self._controller is not None:
+                self._controller.toggle_follow()
+
+        def action_jump_bottom(self) -> None:
+            if self._controller is not None:
+                self._controller.set_follow(True)
 
 else:
     # Textual 不可用时提供占位类
@@ -986,18 +1070,6 @@ else:
         pass
 
     class MainArea:  # type: ignore[no-redef]
-        pass
-
-    class TwoBStageView:  # type: ignore[no-redef]
-        pass
-
-    class BlockProgressBar:  # type: ignore[no-redef]
-        pass
-
-    class BlockChatView:  # type: ignore[no-redef]
-        pass
-
-    class ResultView:  # type: ignore[no-redef]
         pass
 
     class LogArea:  # type: ignore[no-redef]
