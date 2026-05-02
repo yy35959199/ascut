@@ -72,14 +72,16 @@ class PipelineSession:
         *,
         scheduler: "Scheduler | None" = None,
         stage_filter: "frozenset[int] | None" = None,
+        from_node: str | None = None,
         max_reflows: int = 3,
-        force_rerun_phases: "frozenset[int] | None" = None,
+        resume_mode: bool = False,
     ) -> None:
         self._manifest_path = manifest_path
         self._config = config
         self._stage_filter = stage_filter
+        self._from_node = from_node
         self._max_reflows = max_reflows
-        self._force_rerun_phases = force_rerun_phases
+        self._resume_mode = resume_mode
 
         # Scheduler 延迟导入避免循环依赖
         if scheduler is not None:
@@ -264,14 +266,56 @@ class PipelineSession:
             if node.phase not in self._stage_filter:
                 self._node_states[node_id] = NodeState(node_id=node_id, status="skipped")
 
+    def _apply_from_node_skip(self, manifest: dict) -> None:
+        """将 from_node 之前的同 phase 节点标记为 skipped，并回填其产物到顶层 manifest。
+
+        调用时机：_apply_stage_filter() 之后，_apply_resumable_skip() 之前。
+
+        语义：
+        - from_node="2b" → 跳过 l2a_comprehension，从 l2b_decision 开始
+        - 被跳过节点的 writes 字段必须已存在于 manifest["current"] 中
+          （由 session_factory._validate_from_node_prereqs() 在构造时保证）
+        - 跳过的节点不写 layer_status（语义是"本次不跑"，不是"已完成"）
+
+        Args:
+            manifest: 已加载的清单 dict（in-place 修改）
+        """
+        if self._from_node is None:
+            return
+
+        target_id = self._FROM_NODE_MAP.get(self._from_node)
+        if target_id is None:
+            logger.warning("_apply_from_node_skip: 未知 from_node=%r，跳过", self._from_node)
+            return
+
+        current = manifest.get("current", {})
+        if not isinstance(current, dict):
+            current = {}
+
+        for nid in self._L2_TOPO_ORDER:
+            if nid == target_id:
+                break  # 到达起点，停止
+
+            # 只处理仍为 pending 的节点（stage_filter 可能已将其标为 skipped）
+            if self._node_states[nid].status != "pending":
+                continue
+
+            self._node_states[nid] = NodeState(node_id=nid, status="skipped")
+
+            # 回填该节点写出的字段到顶层 manifest，确保下游节点能从内存中读到
+            node = self._nodes.get(nid)
+            if node is not None:
+                for field in node.writes:
+                    if field in current and field not in manifest:
+                        manifest[field] = current[field]
+
+            logger.debug("from_node skip: %s → skipped，已回填 writes", nid)
+
     def _apply_resumable_skip(self, manifest: dict) -> None:
-        """resumable=True 且 layer_status 有完成标记时跳过节点。
+        """resume_mode=True 时调用：跳过已完成的 resumable 节点。
 
         跳过节点时，将 manifest["current"] 中对应节点写出的字段回填到顶层，
         确保后续节点能从内存 manifest 中读到这些字段（而不必重新执行）。
-
-        若节点的 phase 在 force_rerun_phases 中，则清除其 completed 标记并强制重跑，
-        不执行 resumable skip。
         """
         current = manifest.get("current", {})
         if not isinstance(current, dict):
@@ -280,11 +324,6 @@ class PipelineSession:
         for node_id, node in self._nodes.items():
             # 只处理仍为 pending 的节点
             if self._node_states[node_id].status != "pending":
-                continue
-
-            # 强制重跑：清除该节点的 completed 标记，不 skip
-            if self._force_rerun_phases and node.phase in self._force_rerun_phases:
-                ls_clear_node(manifest, node_id)
                 continue
 
             if node.resumable:
@@ -345,7 +384,9 @@ class PipelineSession:
         self._current_manifest = manifest  # 供 abort() 使用
 
         self._apply_stage_filter(manifest)
-        self._apply_resumable_skip(manifest)
+        self._apply_from_node_skip(manifest)
+        if self._resume_mode:
+            self._apply_resumable_skip(manifest)
 
         start_time = datetime.now()
 
@@ -687,6 +728,22 @@ class PipelineSession:
         "review_report",
         "human_feedback_history",
         "l2d_completed",
+    )
+
+    # L2 子阶段短名 → node_id 映射（用于 from_node 解析）
+    _FROM_NODE_MAP: dict[str, str] = {
+        "2a": "l2a_comprehension",
+        "2b": "l2b_decision",
+        "2c": "l2c_review",
+        "2d": "l2d_human",
+    }
+
+    # L2 节点的 DAG 拓扑顺序（固定线性链，用于 _apply_from_node_skip）
+    _L2_TOPO_ORDER: tuple[str, ...] = (
+        "l2a_comprehension",
+        "l2b_decision",
+        "l2c_review",
+        "l2d_human",
     )
 
     def _sync_to_current(self, manifest: dict) -> None:
