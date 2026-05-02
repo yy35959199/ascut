@@ -137,6 +137,18 @@ def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
         default=False,
         help=argparse.SUPPRESS,  # 内部参数，由 resume 子命令透传，不对外展示
     )
+    p.add_argument(
+        "--from-node",
+        type=str,
+        choices=["2a", "2b", "2c", "2d"],
+        default=None,
+        metavar="NODE",
+        help=(
+            "L2 子阶段起点（需搭配 --stage 含 2）。"
+            "合法值: 2a（理解）/ 2b（决策）/ 2c（审核）/ 2d（人工）。"
+            "指定后，该节点之前的 L2 子阶段将被跳过（需已完成）。"
+        ),
+    )
     p.add_argument("--verbose", action="store_true", help="DEBUG 日志")
     # 占位：validate_cli_args 曾检查旧参数
     p.set_defaults(layer1_json=None, layer2_json=None, layer3_json=None)
@@ -190,6 +202,17 @@ def _add_resume_args(p: argparse.ArgumentParser) -> None:
         "--no-vad-snap",
         action="store_true",
         help="关闭 L3 VAD 切点吸附",
+    )
+    p.add_argument(
+        "--from-node",
+        type=str,
+        choices=["2a", "2b", "2c", "2d"],
+        default=None,
+        metavar="NODE",
+        help=(
+            "L2 子阶段起点（需搭配 --stage 含 2）。"
+            "合法值: 2a（理解）/ 2b（决策）/ 2c（审核）/ 2d（人工）。"
+        ),
     )
     p.add_argument("--verbose", action="store_true", help="DEBUG 日志")
 
@@ -318,6 +341,14 @@ def _validate_cli_args(
         if not mp.is_file():
             parser.error(f"--manifest 不是有效文件: {mp}")
 
+    # --from-node 交叉校验
+    from_node = getattr(args, "from_node", None)
+    if from_node is not None and 2 not in stages:
+        parser.error(
+            f"--from-node {from_node!r} 需要 --stage 包含阶段 2，"
+            f"当前 --stage 不含 L2"
+        )
+
 
 def _args_to_params(args: argparse.Namespace) -> PipelineParams:
     """将 argparse Namespace 转换为 PipelineParams。"""
@@ -356,6 +387,7 @@ def _args_to_params(args: argparse.Namespace) -> PipelineParams:
         interactive_2d=getattr(args, "interactive_2d", False),
         verbose=getattr(args, "verbose", False),
         resume_mode=getattr(args, "resume_mode", False),
+        from_node=getattr(args, "from_node", None),
     )
 
 
@@ -551,6 +583,8 @@ def _run_resume(args: argparse.Namespace) -> int:
     if getattr(args, "no_vad_snap", False):
         run_argv += ["--no-vad-snap"]
     run_argv += ["--resume-mode"]  # resume 子命令始终以续跑模式执行
+    if getattr(args, "from_node", None):
+        run_argv += ["--from-node", args.from_node]
     if args.verbose:
         run_argv += ["--verbose"]
 

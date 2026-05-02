@@ -170,7 +170,24 @@ if _TEXTUAL_AVAILABLE:
         #stage-label, #goal-label, #force-rerun-label {
             color: $text-muted;
         }
-        """
+        #l2-sub-panel {
+            display: none;
+            width: auto;
+            min-width: 28;
+            padding: 0 1;
+            border-left: solid $primary;
+            margin-left: 1;
+        }
+        #l2-sub-label {
+            color: $text-muted;
+            margin-bottom: 1;
+        }
+        #action-row {
+            height: auto;
+        }
+        #btn-col {
+            width: auto;
+        }        """
 
         BINDINGS = [
             Binding("p", "pause", "暂停"),

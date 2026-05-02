@@ -43,6 +43,17 @@ class ProgressReport:
     warnings: list[str] = field(default_factory=list)
     has_input_video_accessible: bool = False
     """源视频文件是否可达（用于判断 TUI 中"全部重跑"按钮是否可用）。"""
+    resumable_from: dict[str, bool] = field(default_factory=dict)
+    """各 L2 子阶段是否可作为 from_node 起点。
+
+    键: "2a" / "2b" / "2c" / "2d"
+    值: True 表示该节点之前的所有同 phase 节点均已完成，且 L1 已完成。
+
+    示例：L1 完成、2a 完成、2b 未完成 →
+        {"2a": True, "2b": True, "2c": False, "2d": False}
+
+    注意："2a" 始终等于 has_l1（从 2a 开始 = 完整重跑 L2，只需 L1 完成）。
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +185,29 @@ def infer_progress(data: dict[str, Any], manifest_path: Path) -> ProgressReport:
         and not goal_str
     )
 
+    # ── 计算 L2 子阶段起点可用性 ──────────────────────────────────────
+    # L2 节点的顺序（固定，与 DAG 拓扑一致）
+    _L2_ORDERED = [
+        "l2a_comprehension",
+        "l2b_decision",
+        "l2c_review",
+        "l2d_human",
+    ]
+    _L2_SHORT = {
+        "l2a_comprehension": "2a",
+        "l2b_decision":      "2b",
+        "l2c_review":        "2c",
+        "l2d_human":         "2d",
+    }
+    has_l1 = "l1_perception" in completed_ids
+    resumable_from: dict[str, bool] = {}
+    for i, nid in enumerate(_L2_ORDERED):
+        # 可以从 nid 开始 ⟺ L1 已完成 且 nid 之前的所有 L2 节点已完成
+        all_prev_done = all(
+            _L2_ORDERED[j] in completed_ids for j in range(i)
+        )
+        resumable_from[_L2_SHORT[nid]] = has_l1 and all_prev_done
+
     return ProgressReport(
         manifest_path=manifest_path,
         run_id=str(data.get("run_id", "")),
@@ -186,6 +220,7 @@ def infer_progress(data: dict[str, Any], manifest_path: Path) -> ProgressReport:
         goal_needed=goal_needed,
         warnings=warnings,
         has_input_video_accessible=Path(str(sm.get("path", ""))).is_file() if sm.get("path") else False,
+        resumable_from=resumable_from,
     )
 
 

@@ -22,9 +22,9 @@ logger = logging.getLogger(__name__)
 try:
     from textual.app import ComposeResult
     from textual.binding import Binding
-    from textual.containers import VerticalScroll
+    from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.screen import Screen
-    from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static
+    from textual.widgets import Button, Footer, Header, Input, Label, RadioButton, RadioSet, RichLog, Static
 
     _TEXTUAL_AVAILABLE = True
 except ImportError:
@@ -60,7 +60,7 @@ if _TEXTUAL_AVAILABLE:
 
         def compose(self) -> ComposeResult:
             yield Header()
-            with VerticalScroll():
+            with VerticalScroll(id="resume-scroll"):
                 yield Static(id="resume-header")
                 yield Static(id="resume-progress")
                 yield Static(id="resume-warnings")
@@ -71,16 +71,35 @@ if _TEXTUAL_AVAILABLE:
                 id="goal-input",
             )
             yield Static("操作：", id="action-label")
-            yield Button("重跑 L3",     id="btn-rerun-3",   variant="primary")
-            yield Button("重跑 L2+L3",  id="btn-rerun-23",  variant="default")
-            yield Button("全部重跑",    id="btn-rerun-123", variant="default")
-            yield Button("从中断处继续", id="btn-resume",    variant="success")
-            yield Button("取消",        id="btn-cancel",    variant="default")
+            # 左右布局：左列按钮 + 右列 L2 子选择面板
+            with Horizontal(id="action-row"):
+                with Vertical(id="btn-col"):
+                    yield Button("重跑 L3",        id="btn-rerun-3",   variant="primary")
+                    yield Button("重跑 L2+L3 ▶",   id="btn-rerun-23",  variant="default")
+                    yield Button("全部重跑",        id="btn-rerun-123", variant="default")
+                    yield Button("从中断处继续",    id="btn-resume",    variant="success")
+                    yield Button("取消",            id="btn-cancel",    variant="default")
+                with Vertical(id="l2-sub-panel"):
+                    yield Static("从哪个子阶段开始？", id="l2-sub-label")
+                    yield RadioSet(
+                        RadioButton("2a 理解（完整重跑）", value=True),
+                        RadioButton("2b 决策"),
+                        RadioButton("2c 审核"),
+                        RadioButton("2d 人工"),
+                        id="l2-radio-set",
+                    )
+                    yield Button("确认", id="btn-l2-confirm", variant="primary")
+                    yield Button("取消", id="btn-l2-cancel",  variant="default")
             yield Footer()
 
         def on_mount(self) -> None:
             self._refresh_display()
             self._update_button_states()
+            # 子面板初始隐藏
+            try:
+                self.query_one("#l2-sub-panel").display = False
+            except Exception:
+                pass
 
         def _update_button_states(self) -> None:
             """根据进度报告设置按钮可用性。"""
@@ -94,25 +113,7 @@ if _TEXTUAL_AVAILABLE:
 
             # "重跑 L3"：需要 L1 和 L2 都已完成（有 annotations + keep_mask）
             try:
-                self.query_one("#btn-rerun-3", Button).disabled = not has_l2d
-            except Exception:
-                pass
-
-            # "重跑 L2+L3"：需要 L1 已完成（有 annotations）
-            try:
-                self.query_one("#btn-rerun-23", Button).disabled = not has_l1
-            except Exception:
-                pass
-
-            # "全部重跑"：需要源视频可达
-            try:
-                self.query_one("#btn-rerun-123", Button).disabled = not report.has_input_video_accessible
-            except Exception:
-                pass
-
-            # "从中断处继续"：仅在有未完成节点时可用
-            try:
-                self.query_one("#btn-resume", Button).disabled = report.all_completed
+                self.query_one("#stage-input", Input).focus()
             except Exception:
                 pass
 
@@ -149,7 +150,20 @@ if _TEXTUAL_AVAILABLE:
                 case "btn-rerun-3":
                     self._execute(stage="3", goal=goal, resume_mode=False)
                 case "btn-rerun-23":
-                    self._execute(stage="23", goal=goal, resume_mode=False)
+                    # 展开/收起子选择面板，不直接执行
+                    try:
+                        panel = self.query_one("#l2-sub-panel")
+                        panel.display = not panel.display
+                    except Exception:
+                        pass
+                case "btn-l2-confirm":
+                    from_node = self._get_selected_from_node()
+                    self._execute(stage="23", goal=goal, resume_mode=False, from_node=from_node)
+                case "btn-l2-cancel":
+                    try:
+                        self.query_one("#l2-sub-panel").display = False
+                    except Exception:
+                        pass
                 case "btn-rerun-123":
                     self._execute(stage="123", goal=goal, resume_mode=False)
                 case "btn-resume":
@@ -161,9 +175,27 @@ if _TEXTUAL_AVAILABLE:
         def action_cancel(self) -> None:
             self.app.pop_screen()
 
-        def _execute(self, stage: str, goal: str, resume_mode: bool) -> None:
+        def _get_selected_from_node(self) -> str | None:
+            """读取 RadioSet 当前选中项，返回对应的 from_node 值。
+
+            RadioSet 子项顺序：0=2a, 1=2b, 2=2c, 3=2d
+            "2a" 等价于不指定（从 L2 头开始），返回 None。
+            """
+            _index_to_short = {0: "2a", 1: "2b", 2: "2c", 3: "2d"}
             try:
-                self._ctrl.confirm_resume(stage=stage, goal=goal, resume_mode=resume_mode)
+                radio_set = self.query_one("#l2-radio-set", RadioSet)
+                idx = radio_set.pressed_index
+                short = _index_to_short.get(idx, "2a")
+                return None if short == "2a" else short
+            except Exception:
+                return None
+
+        def _execute(self, stage: str, goal: str, resume_mode: bool, from_node: str | None = None) -> None:
+            try:
+                self._ctrl.confirm_resume(
+                    stage=stage, goal=goal,
+                    resume_mode=resume_mode, from_node=from_node,
+                )
                 self.app.pop_screen()
                 self._ctrl.start_pipeline()
             except Exception as e:
