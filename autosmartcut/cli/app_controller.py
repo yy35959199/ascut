@@ -266,7 +266,8 @@ class AppController(SessionController):
         self,
         stage: str,
         goal: str,
-        force_rerun_phases: "frozenset[int] | None" = None,
+        resume_mode: bool = False,
+        from_node: str | None = None,
         **overrides: object,
     ) -> None:
         """用户确认参数，构造 session，进入 READY 状态。
@@ -276,7 +277,9 @@ class AppController(SessionController):
         Args:
             stage: stage 规格字符串（如 "3"、"23"、"123"）。
             goal: 剪辑意图。
-            force_rerun_phases: 强制重跑的 phase 集合（如 frozenset({2})）。
+            resume_mode: True=续跑（跳过已完成节点）；False=重跑（无条件执行，默认）。
+            from_node: L2 子阶段起点（"2a"/"2b"/"2c"/"2d"/None）。
+                       非 None 时，该节点之前的同 phase 节点将被跳过。
             **overrides: 其他 PipelineParams 字段覆盖。
         """
         if self._resolved_input is None:
@@ -288,7 +291,8 @@ class AppController(SessionController):
 
         self._setup_from_manifest(
             manifest_path, stage, goal,
-            force_rerun_phases=force_rerun_phases,
+            resume_mode=resume_mode,
+            from_node=from_node,
             **overrides,
         )
         self._set_state(AppState.READY)
@@ -399,7 +403,8 @@ class AppController(SessionController):
         manifest_path: Path,
         stage: str,
         goal: str,
-        force_rerun_phases: "frozenset[int] | None" = None,
+        resume_mode: bool = False,
+        from_node: str | None = None,
         **overrides: object,
     ) -> None:
         from autosmartcut.pipeline.session_factory import PipelineParams
@@ -408,7 +413,8 @@ class AppController(SessionController):
             manifest_path=manifest_path,
             stage=stage,
             goal=goal,
-            force_rerun_phases=force_rerun_phases,
+            resume_mode=resume_mode,
+            from_node=from_node,
             **overrides,  # type: ignore[arg-type]
         )
         self.setup(params)
