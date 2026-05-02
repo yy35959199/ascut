@@ -18,7 +18,16 @@ def _sr(data: dict) -> StructuredResult:
     return StructuredResult(data=data, assistant_content="{}", usage={}, request_messages=[])
 
 
-_PATCH_TARGET = "autosmartcut.nodes.l2.intelligence_2b.call_structured"
+_PATCH_TARGETS = (
+    "autosmartcut.nodes.l2.intelligence_2b.call_structured",
+    "autosmartcut.nodes.l2.intelligence_2b_dispatch.call_structured",
+)
+
+
+def _patch_call_structured(monkeypatch: pytest.MonkeyPatch, fake) -> None:
+    """2b 分块路径经 ``intelligence_2b_dispatch`` 调用 LLM，须两处同时替换。"""
+    for t in _PATCH_TARGETS:
+        monkeypatch.setattr(t, fake)
 
 
 def test_run_2b_rejects_non_dense_cleaned_annotations():
@@ -123,7 +132,7 @@ def test_run_2b_chunked_two_blocks_merges_keep_mask(monkeypatch):
     def _fake_llm(*_a, **_kw):
         return _sr(next(responses))
 
-    monkeypatch.setattr(_PATCH_TARGET, _fake_llm)
+    _patch_call_structured(monkeypatch, _fake_llm)
     out = run_2b_decision(manifest, mode="block")
     assert out["keep_mask"][0] == {"index": 0, "keep": False}
     assert out["keep_mask"][1] == {"index": 1, "keep": True}
@@ -149,7 +158,7 @@ def test_run_2b_chunked_empty_outline_falls_back_to_single(monkeypatch):
             return _sr({"decisions": [{"index": 0, "keep": False, "reason": "filler"}]})
         return _sr({"decisions": [{"index": 0, "keep": False}]})
 
-    monkeypatch.setattr(_PATCH_TARGET, _fake_llm)
+    _patch_call_structured(monkeypatch, _fake_llm)
     out = run_2b_decision(manifest, mode="block")
     assert n_calls == 2
     assert out["keep_mask"][0]["keep"] is False
@@ -189,7 +198,7 @@ def test_run_2b_chunked_splits_outline_block_by_config_limit(monkeypatch):
     def _fake_llm(*_a, **_kw):
         return _sr(next(responses))
 
-    monkeypatch.setattr(_PATCH_TARGET, _fake_llm)
+    _patch_call_structured(monkeypatch, _fake_llm)
     out = run_2b_decision(manifest, mode="block")
     assert out["keep_mask"][0]["keep"] is True
     assert out["keep_mask"][1]["keep"] is False
@@ -230,7 +239,7 @@ def test_run_2b_chunked_gap_block_for_uncovered_index(monkeypatch):
     def _fake_llm(*_a, **_kw):
         return _sr(next(responses))
 
-    monkeypatch.setattr(_PATCH_TARGET, _fake_llm)
+    _patch_call_structured(monkeypatch, _fake_llm)
     out = run_2b_decision(manifest, mode="block")
     assert out["keep_mask"][0]["keep"] is True
     assert out["keep_mask"][1]["keep"] is False

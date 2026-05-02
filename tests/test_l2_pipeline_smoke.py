@@ -90,10 +90,11 @@ def test_run_2a_and_2b_with_mocked_llm(monkeypatch):
         "autosmartcut.nodes.l2.intelligence_2a.call_structured",
         _fake_call_structured_2a,
     )
-    monkeypatch.setattr(
+    for _target in (
         "autosmartcut.nodes.l2.intelligence_2b.call_structured",
-        _fake_call_structured_2b,
-    )
+        "autosmartcut.nodes.l2.intelligence_2b_dispatch.call_structured",
+    ):
+        monkeypatch.setattr(_target, _fake_call_structured_2b)
 
     out_2a = run_2a_comprehension(manifest)
     assert out_2a["comprehension"]["purpose"] == "讲解自动剪辑的核心步骤与决策思路。"
