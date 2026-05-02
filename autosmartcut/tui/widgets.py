@@ -26,6 +26,42 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Spinner — 旋转动画状态（纯数据，无 Textual 依赖）
+# ---------------------------------------------------------------------------
+
+class Spinner:
+    """旋转动画帧计数器。
+
+    纯 Python，无 Textual 依赖，可独立测试。
+    定时器管理（set_interval）由调用方 Widget 负责。
+
+    用法::
+
+        spinner = Spinner()
+        spinner.tick()          # 推进一帧（在定时器回调里调用）
+        frame = spinner.frame   # 获取当前帧字符
+    """
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self) -> None:
+        self._idx: int = 0
+
+    def tick(self) -> None:
+        """推进一帧。"""
+        self._idx += 1
+
+    def reset(self) -> None:
+        """重置到第一帧。"""
+        self._idx = 0
+
+    @property
+    def frame(self) -> str:
+        """当前帧字符。"""
+        return self.FRAMES[self._idx % len(self.FRAMES)]
+
 try:
     from textual.containers import VerticalScroll
     from textual.screen import Screen
@@ -52,6 +88,9 @@ if _TEXTUAL_AVAILABLE:
         parse_l1a_chunk_done,
         parse_l1a_intra_chunk_progress,
     )
+    from autosmartcut.cli.progress_utils import format_duration as _format_duration
+
+    _time_monotonic = time.monotonic
 
     # -----------------------------------------------------------------------
     # PipelineSidebar
@@ -133,6 +172,8 @@ if _TEXTUAL_AVAILABLE:
             self._reasoning_expanded: bool = True
             self._flush_scheduled: bool = False
             self._addon: object = None  # StreamAddon | None
+            self._spinner = Spinner()
+            self._spinner_timer = None
 
         def compose(self):
             yield Static("", id="stream-status")
@@ -151,6 +192,9 @@ if _TEXTUAL_AVAILABLE:
             except Exception:
                 pass
 
+        def on_unmount(self) -> None:
+            self._stop_spinner()
+
         # ── 外部接口（MainArea 调用）──────────────────────────────────────
 
         def begin_node(self, node_id: str, slots: list[tuple[str, str]]) -> None:
@@ -161,6 +205,8 @@ if _TEXTUAL_AVAILABLE:
             self._reasoning_expanded = True
             self._clear_all_panels()
             self.unmount_addon()
+            self._spinner.reset()
+            self._start_spinner()
             try:
                 self.focus()
             except Exception:
@@ -422,9 +468,10 @@ if _TEXTUAL_AVAILABLE:
                     pass
                 return
             active = self._vm.get_active()
+            frame = self._spinner.frame
             icons = {
-                "idle": "○", "streaming": "⟳", "done": "✓",
-                "failed": "✗", "retrying": "↻",
+                "idle": frame, "streaming": frame, "done": "✓",
+                "failed": "✗", "retrying": frame,
             }
             colors = {
                 "idle": "dim", "streaming": "dark_orange", "done": "green",
@@ -468,6 +515,34 @@ if _TEXTUAL_AVAILABLE:
             self._vm = LLMStreamViewModel()
             self._clear_all_panels()
             self.unmount_addon()
+            self._stop_spinner()
+
+        # ── 旋转动画 ──────────────────────────────────────────────────────
+
+        def _start_spinner(self) -> None:
+            if self._spinner_timer is None:
+                self._spinner_timer = self.set_interval(0.1, self._tick_spinner)
+
+        def _stop_spinner(self) -> None:
+            if self._spinner_timer is not None:
+                try:
+                    self._spinner_timer.stop()
+                except Exception:
+                    pass
+                self._spinner_timer = None
+
+        def _tick_spinner(self) -> None:
+            self._spinner.tick()
+            # 若所有块都已完成，停止定时器
+            progress = self._vm.get_progress()
+            has_active = any(
+                s in ("idle", "streaming", "retrying")
+                for _, _, s in progress
+            )
+            if not has_active:
+                self._stop_spinner()
+                return
+            self._update_progress_bar()
 
     # -----------------------------------------------------------------------
     # GenericStageView
@@ -574,90 +649,187 @@ if _TEXTUAL_AVAILABLE:
     # L3ProgressView
     # -----------------------------------------------------------------------
 
+    class _L3ViewState:
+        """L3 进度视图的声明式状态（纯数据，无 Textual 依赖）。"""
+
+        __slots__ = (
+            "header", "vad_text", "vad_done",
+            "render_text", "render_done", "bar_text",
+        )
+
+        def __init__(self) -> None:
+            self.header: str = ""
+            self.vad_text: str = ""
+            self.vad_done: bool = False
+            self.render_text: str = ""
+            self.render_done: bool = False
+            self.bar_text: str = ""
+
     class L3ProgressView(Widget):
-        """L3 专用进度视图：状态文本 + 渲染进度条 + 历史行。"""
+        """L3 专用进度视图（ViewModel + 声明式渲染）。
+
+        布局：
+        - #l3-header  灰框上方：描述行
+        - #l3-log     灰框（RichLog）：所有内容
+
+        事件处理只更新 _L3ViewState，旋转动画只递增计数器，
+        然后统一调 _redraw() 根据 ViewState 重建 RichLog 内容。
+        """
 
         def compose(self):
-            yield Static("", id="l3-status")
-            yield Static("", id="l3-progress-bar")
+            yield Static("", id="l3-header")
             yield RichLog(id="l3-log", max_lines=200, wrap=True, auto_scroll=True)
 
         def on_mount(self) -> None:
+            self._state = _L3ViewState()
             self._render_total: int = 0
+            self._render_start_time: float = 0.0
+            self._spinner = Spinner()
+            self._spinner_timer = None
+
+        def on_unmount(self) -> None:
+            self._stop_spinner()
+
+        # ── 事件处理（只更新 ViewState）────────────────────────────────────
 
         def handle_progress(self, event: "PipelineEvent") -> None:
             phase = event.phase
-            payload = event.payload or {}
+            p = event.payload or {}
 
-            if phase == "vad_snap_start":
-                snap_r = payload.get("snap_radius", 0)
-                self._set_status(f"  静音吸附中（snap_radius={snap_r:.3f}s）...")
-                self._set_bar("")
+            if phase == "resolve_start":
+                self._state.header = f"  L3 执行 · {p.get('segment_count', 0)} 个保留段"
+
+            elif phase == "vad_snap_start":
+                self._state.vad_text = f"静音吸附中（snap_radius={p.get('snap_radius', 0):.3f}s）..."
+                self._state.vad_done = False
+                self._start_spinner()
 
             elif phase == "vad_snap_done":
-                count = payload.get("silence_count", 0)
-                snap_r = payload.get("snap_radius", 0)
-                elapsed = payload.get("elapsed_sec", 0)
-                line = (
-                    f"  ✓ 静音吸附完成：{count} 条静音区间，"
+                self._stop_spinner()
+                count = p.get("silence_count", 0)
+                snap_r = p.get("snap_radius", 0)
+                elapsed = p.get("elapsed_sec", 0)
+                self._state.vad_text = (
+                    f"静音吸附完成：{count} 条静音区间，"
                     f"snap_radius={snap_r:.3f}s（{elapsed:.1f}s）"
                 )
-                self._freeze_to_log(line)
-                self._set_status("")
+                self._state.vad_done = True
 
             elif phase == "render_start":
-                self._render_total = int(payload.get("segment_count", 0))
-                self._set_status(f"  渲染中（共 {self._render_total} 个 cut 单元）...")
-                self._set_bar(self._make_bar(0, self._render_total))
+                self._render_total = int(p.get("segment_count", 0))
+                self._render_start_time = _time_monotonic()
+                self._state.render_text = f"渲染中（共 {self._render_total} 个 cut 单元）..."
+                self._state.render_done = False
+                self._state.bar_text = self._make_bar(0, self._render_total, remain_str="")
+                self._start_spinner()
 
             elif phase == "render_progress":
-                done = int(payload.get("done", 0))
-                total = int(payload.get("total", self._render_total or 1))
+                done = int(p.get("done", 0))
+                total = int(p.get("total", self._render_total or 1))
                 self._render_total = total
-                self._set_bar(self._make_bar(done, total))
+                self._state.bar_text = self._make_bar(
+                    done, total, remain_str=self._estimate_remain(done, total),
+                )
 
             elif phase == "render_done":
-                elapsed = payload.get("elapsed_sec", 0)
-                # 满格进度条
-                self._set_bar(self._make_bar(self._render_total, self._render_total))
-                line = f"  ✓ 渲染完成（{elapsed:.1f}s）"
-                self._freeze_to_log(line)
-                self._set_status("")
-                self._set_bar("")
+                self._stop_spinner()
+                elapsed = p.get("elapsed_sec", 0)
+                self._state.render_text = f"渲染完成（{elapsed:.1f}s）"
+                self._state.render_done = True
+                self._state.bar_text = self._make_bar(
+                    self._render_total, self._render_total, remain_str="",
+                )
 
-            else:
-                # resolve_start 等其他 phase → 状态栏
-                text = format_progress(event.node_id, event.phase, payload)
-                if text:
-                    self._set_status(text)
+            self._redraw()
 
-        def _make_bar(self, done: int, total: int) -> str:
+        # ── 声明式渲染 ────────────────────────────────────────────────────
+
+        def _redraw(self) -> None:
+            """根据 _state 重建 #l3-header 和 #l3-log 的全部内容。"""
+            from rich.text import Text as _Text
+
+            s = self._state
+
+            # header
+            try:
+                self.query_one("#l3-header", Static).update(s.header)
+            except Exception:
+                pass
+
+            # 构建行列表：(text, is_yellow)
+            lines: list[tuple[str, bool]] = []
+            lines.append(("", False))  # 顶部空行
+
+            if s.vad_text:
+                prefix = "✓" if s.vad_done else self._spinner.frame
+                lines.append((f"  {prefix} {s.vad_text}", False))
+
+            if s.render_text:
+                lines.append(("", False))  # 空行
+                lines.append(("", False))  # 空行
+                prefix = "✓" if s.render_done else self._spinner.frame
+                lines.append((f"  {prefix} {s.render_text}", False))
+
+            if s.bar_text:
+                lines.append(("", False))  # 空行
+                lines.append((s.bar_text, True))  # 黄色
+
+            # 写入 RichLog
+            try:
+                log = self.query_one("#l3-log", RichLog)
+                log.clear()
+                for text, yellow in lines:
+                    if yellow and text:
+                        log.write(_Text(text, style="yellow"))
+                    else:
+                        log.write(text)
+            except Exception:
+                pass
+
+        # ── 旋转动画 ──────────────────────────────────────────────────────
+
+        def _start_spinner(self) -> None:
+            self._stop_spinner()
+            self._spinner.reset()
+            self._spinner_timer = self.set_interval(0.1, self._tick_spinner)
+
+        def _stop_spinner(self) -> None:
+            if self._spinner_timer is not None:
+                try:
+                    self._spinner_timer.stop()
+                except Exception:
+                    pass
+                self._spinner_timer = None
+
+        def _tick_spinner(self) -> None:
+            self._spinner.tick()
+            self._redraw()
+
+        # ── 剩余时间估算 ──────────────────────────────────────────────────
+
+        def _estimate_remain(self, done: int, total: int) -> str:
+            if done <= 0 or total <= 0 or self._render_start_time <= 0:
+                return ""
+            elapsed = _time_monotonic() - self._render_start_time
+            if elapsed <= 0:
+                return ""
+            remain_sec = elapsed / done * (total - done)
+            return _format_duration(remain_sec)
+
+        def _make_bar(self, done: int, total: int, *, remain_str: str) -> str:
             if total <= 0:
                 return ""
             pct = done / total * 100
             bar_width = 24
             filled = int(pct / 100 * bar_width)
             bar = "█" * filled + "░" * (bar_width - filled)
-            return f"  {bar} {done}/{total}  ({pct:.0f}%)"
-
-        def _set_status(self, text: str) -> None:
-            try:
-                self.query_one("#l3-status", Static).update(text)
-            except Exception:
-                pass
-
-        def _set_bar(self, text: str) -> None:
-            try:
-                self.query_one("#l3-progress-bar", Static).update(text)
-            except Exception:
-                pass
-
-        def _freeze_to_log(self, line: str) -> None:
-            if line:
-                try:
-                    self.query_one("#l3-log", RichLog).write(line)
-                except Exception:
-                    pass
+            if remain_str:
+                remain = f"  剩余 {remain_str}"
+            elif done > 0:
+                remain = ""
+            else:
+                remain = "  正在计算剩余时间..."
+            return f"  {bar} {done}/{total}  ({pct:.0f}%){remain}"
 
     # -----------------------------------------------------------------------
     # MainArea

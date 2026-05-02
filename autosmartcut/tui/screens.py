@@ -38,13 +38,17 @@ if _TEXTUAL_AVAILABLE:
     # -----------------------------------------------------------------------
 
     class ResumeScreen(Screen):
-        """诊断界面：展示 ProgressReport，提供参数选择。
+        """诊断界面：展示 ProgressReport，提供操作选择。
 
         复用场景：
         1. 首次打开清单文件（AppController.open() → DIAGNOSING）
         2. 执行中途重配（AppController.reconfigure() → DIAGNOSING）
 
-        用户确认后调 ctrl.confirm_resume()，pop screen。
+        用户选择操作后调 ctrl.confirm_resume()，pop screen。
+
+        操作语义：
+        - 重跑按钮（重跑 L3 / 重跑 L2+L3 / 全部重跑）：resume_mode=False，无条件执行指定阶段
+        - 从中断处继续：resume_mode=True，跳过已完成节点，从未完成处接续
         """
 
         BINDINGS = [Binding("escape", "cancel", "取消", show=True)]
@@ -60,32 +64,55 @@ if _TEXTUAL_AVAILABLE:
                 yield Static(id="resume-header")
                 yield Static(id="resume-progress")
                 yield Static(id="resume-warnings")
-            yield Static("Stage:", id="stage-label")
-            yield Input(
-                value=self._report.suggested_stage or "123" if self._report else "123",
-                placeholder="stage（如 3、23、123）",
-                id="stage-input",
-            )
             yield Static("Goal:", id="goal-label")
             yield Input(
                 value=self._report.goal if self._report else "",
-                placeholder="剪辑意图（L2 需要）",
+                placeholder="剪辑意图（重跑 L2 时需要）",
                 id="goal-input",
             )
-            yield Static("强制重跑 (Force Rerun):", id="force-rerun-label")
-            yield Input(
-                value="",
-                placeholder="留空=续跑；填 2 或 23 = 从头重跑对应 phase",
-                id="force-rerun-input",
-            )
-            yield Button("继续执行", id="btn-confirm", variant="primary")
-            yield Button("取消", id="btn-cancel", variant="default")
+            yield Static("操作：", id="action-label")
+            yield Button("重跑 L3",     id="btn-rerun-3",   variant="primary")
+            yield Button("重跑 L2+L3",  id="btn-rerun-23",  variant="default")
+            yield Button("全部重跑",    id="btn-rerun-123", variant="default")
+            yield Button("从中断处继续", id="btn-resume",    variant="success")
+            yield Button("取消",        id="btn-cancel",    variant="default")
             yield Footer()
 
         def on_mount(self) -> None:
             self._refresh_display()
+            self._update_button_states()
+
+        def _update_button_states(self) -> None:
+            """根据进度报告设置按钮可用性。"""
+            report = self._report
+            if report is None:
+                return
+
+            completed_ids = {n.node_id for n in report.nodes if n.completed}
+            has_l1 = "l1_perception" in completed_ids
+            has_l2d = "l2d_human" in completed_ids
+
+            # "重跑 L3"：需要 L1 和 L2 都已完成（有 annotations + keep_mask）
             try:
-                self.query_one("#stage-input", Input).focus()
+                self.query_one("#btn-rerun-3", Button).disabled = not has_l2d
+            except Exception:
+                pass
+
+            # "重跑 L2+L3"：需要 L1 已完成（有 annotations）
+            try:
+                self.query_one("#btn-rerun-23", Button).disabled = not has_l1
+            except Exception:
+                pass
+
+            # "全部重跑"：需要源视频可达
+            try:
+                self.query_one("#btn-rerun-123", Button).disabled = not report.has_input_video_accessible
+            except Exception:
+                pass
+
+            # "从中断处继续"：仅在有未完成节点时可用
+            try:
+                self.query_one("#btn-resume", Button).disabled = report.all_completed
             except Exception:
                 pass
 
@@ -94,22 +121,17 @@ if _TEXTUAL_AVAILABLE:
             if report is None:
                 return
             try:
-                # 标题
                 self.query_one("#resume-header", Static).update(
                     f"清单: {report.manifest_path}\n"
                     f"  run_id : {report.run_id}\n"
                     f"  视频   : {report.source_video}"
                 )
-                # 进度状态
                 lines = []
                 for n in report.nodes:
                     icon = "✓" if n.completed else "✗"
                     at = f"  {n.completed_at[:19]}" if n.completed_at else ""
                     lines.append(f"  {icon} {n.display_name:<20}{at}  {n.summary}")
-                if report.suggested_stage:
-                    lines.append(f"\n建议继续: --stage {report.suggested_stage}")
                 self.query_one("#resume-progress", Static).update("\n".join(lines))
-                # 警告
                 if report.warnings:
                     warn_text = "\n".join(f"  ⚠ {w}" for w in report.warnings)
                     self.query_one("#resume-warnings", Static).update(warn_text)
@@ -117,49 +139,35 @@ if _TEXTUAL_AVAILABLE:
                 logger.warning("ResumeScreen._refresh_display 失败: %s", e)
 
         def on_button_pressed(self, event: Button.Pressed) -> None:
+            goal = ""
+            try:
+                goal = self.query_one("#goal-input", Input).value.strip()
+            except Exception:
+                pass
+
             match event.button.id:
-                case "btn-confirm":
-                    self._do_confirm()
+                case "btn-rerun-3":
+                    self._execute(stage="3", goal=goal, resume_mode=False)
+                case "btn-rerun-23":
+                    self._execute(stage="23", goal=goal, resume_mode=False)
+                case "btn-rerun-123":
+                    self._execute(stage="123", goal=goal, resume_mode=False)
+                case "btn-resume":
+                    stage = (self._report.suggested_stage or "3") if self._report else "3"
+                    self._execute(stage=stage, goal=goal, resume_mode=True)
                 case "btn-cancel":
-                    self.action_cancel()
+                    self.app.pop_screen()
 
         def action_cancel(self) -> None:
             self.app.pop_screen()
 
-        def _do_confirm(self) -> None:
+        def _execute(self, stage: str, goal: str, resume_mode: bool) -> None:
             try:
-                stage = self.query_one("#stage-input", Input).value.strip() or "123"
-                goal = self.query_one("#goal-input", Input).value.strip()
-                force_rerun_raw = self.query_one("#force-rerun-input", Input).value.strip()
-            except Exception:
-                stage = "123"
-                goal = ""
-                force_rerun_raw = ""
-
-            # 解析 force_rerun_phases
-            force_rerun_phases: "frozenset[int] | None" = None
-            if force_rerun_raw:
-                try:
-                    phases: set[int] = set()
-                    for ch in force_rerun_raw:
-                        if ch not in ("1", "2", "3"):
-                            raise ValueError(f"非法字符: {ch!r}，只接受 1/2/3 的组合")
-                        phases.add(int(ch))
-                    force_rerun_phases = frozenset(phases) if phases else None
-                except ValueError as e:
-                    try:
-                        self.query_one("#resume-warnings", Static).update(f"错误: {e}")
-                    except Exception:
-                        pass
-                    return
-
-            try:
-                self._ctrl.confirm_resume(stage=stage, goal=goal, force_rerun_phases=force_rerun_phases)
+                self._ctrl.confirm_resume(stage=stage, goal=goal, resume_mode=resume_mode)
                 self.app.pop_screen()
-                # UI 层自己启动 pipeline，不经过 poster 绕一圈
                 self._ctrl.start_pipeline()
             except Exception as e:
-                logger.warning("ResumeScreen confirm_resume 失败: %s", e)
+                logger.warning("ResumeScreen 执行失败: %s", e)
                 try:
                     self.query_one("#resume-warnings", Static).update(f"错误: {e}")
                 except Exception:

@@ -142,6 +142,19 @@ if _TEXTUAL_AVAILABLE:
             height: 1;
             color: $text-muted;
         }
+        L3ProgressView {
+            height: 1fr;
+            layout: vertical;
+        }
+        #l3-header {
+            height: 1;
+            color: $text-muted;
+            margin-bottom: 1;
+        }
+        #l3-log {
+            height: 1fr;
+            border: none;
+        }
         ResumeScreen {
             background: $surface;
             padding: 1 2;
