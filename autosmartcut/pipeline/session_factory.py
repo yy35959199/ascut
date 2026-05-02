@@ -82,6 +82,17 @@ class PipelineParams:
     resume_mode: bool = False
     """True=续跑模式（跳过已完成节点）；False=重跑模式（stage 内节点无条件执行，默认）。"""
 
+    from_node: str | None = None
+    """L2 子阶段起点。合法值: "2a" / "2b" / "2c" / "2d" / None。
+
+    None 表示从 stage_filter 决定的起点开始（默认行为）。
+    非 None 时，该节点之前的同 phase 节点将被跳过（不执行）。
+
+    前置条件（由 build_session 校验）：
+    - stage_filter 必须包含 phase 2
+    - from_node 对应节点之前的所有 L2 节点必须已完成（manifest 中有数据）
+    """
+
 
 # ---------------------------------------------------------------------------
 # build_session — 工厂函数
@@ -134,6 +145,14 @@ def build_session(
     stage_filter, _ = PipelineSession.parse_stage_arg(params.stage)
     _validate_prereq_manifest(stage_filter, run.manifest_path)
 
+    # ── 3b. from_node 前置校验 ───────────────────────────────────────────────
+    if params.from_node is not None:
+        _validate_from_node_prereqs(
+            from_node=params.from_node,
+            stage_filter=stage_filter,
+            manifest_path=run.manifest_path,
+        )
+
     # ── 4. 解析 stage ────────────────────────────────────────────────────────
     stage_filter, _ = PipelineSession.parse_stage_arg(params.stage)
 
@@ -142,6 +161,7 @@ def build_session(
         manifest_path=run.manifest_path,
         config=cfg,
         stage_filter=stage_filter,
+        from_node=params.from_node,
         max_reflows=cfg.intelligence.two_d_max_reflows,
         resume_mode=params.resume_mode,
     )
@@ -220,3 +240,98 @@ def _validate_prereq_manifest(
     if need:
         data = load_manifest(manifest_path)
         validate_manifest_for_stages(need, data)
+
+
+# ---------------------------------------------------------------------------
+# from_node 校验辅助
+# ---------------------------------------------------------------------------
+
+# L2 节点顺序（与 PipelineSession._L2_TOPO_ORDER 一致）
+_L2_TOPO_ORDER = (
+    "l2a_comprehension",
+    "l2b_decision",
+    "l2c_review",
+    "l2d_human",
+)
+
+_FROM_NODE_MAP: dict[str, str] = {
+    "2a": "l2a_comprehension",
+    "2b": "l2b_decision",
+    "2c": "l2c_review",
+    "2d": "l2d_human",
+}
+
+# 每个节点被跳过时，下游需要的字段（即该节点的 writes）
+_FROM_NODE_REQUIRED_FIELDS: dict[str, frozenset[str]] = {
+    "l2a_comprehension": frozenset({"comprehension"}),
+    "l2b_decision":      frozenset({"keep_mask"}),
+    "l2c_review":        frozenset({"review_report"}),
+    "l2d_human":         frozenset({"human_feedback_history", "l2d_completed"}),
+}
+
+
+def _validate_from_node_prereqs(
+    from_node: str,
+    stage_filter: "frozenset[int]",
+    manifest_path: "Path",
+) -> None:
+    """校验 from_node 的前置条件。
+
+    校验规则：
+    1. from_node 必须是合法值（"2a"/"2b"/"2c"/"2d"）
+    2. stage_filter 必须包含 phase 2（否则 from_node 无意义）
+    3. from_node 对应节点之前的所有 L2 节点必须已完成
+       （layer_status 有 completed 记录，且 current 中有对应数据字段）
+
+    Raises:
+        ValueError: 任何校验失败
+    """
+    if from_node not in _FROM_NODE_MAP:
+        raise ValueError(
+            f"非法 --from-node {from_node!r}；"
+            f"合法值: {', '.join(sorted(_FROM_NODE_MAP))}"
+        )
+
+    if 2 not in stage_filter:
+        raise ValueError(
+            f"--from-node {from_node!r} 需要 --stage 包含阶段 2"
+        )
+
+    target_id = _FROM_NODE_MAP[from_node]
+
+    # 找出需要被跳过的前置节点
+    nodes_to_skip: list[str] = []
+    for nid in _L2_TOPO_ORDER:
+        if nid == target_id:
+            break
+        nodes_to_skip.append(nid)
+
+    if not nodes_to_skip:
+        # from_node="2a"，无需跳过任何节点，直接通过
+        return
+
+    # 加载清单，检查前置节点的完成状态和数据完整性
+    from autosmartcut.manifest.manifest_io import load_manifest, ls_get_run_status
+    data = load_manifest(manifest_path)
+    current = data.get("current", {})
+    if not isinstance(current, dict):
+        current = {}
+
+    for nid in nodes_to_skip:
+        # 检查 layer_status
+        status = ls_get_run_status(data, nid)
+        if status != "completed":
+            raise ValueError(
+                f"--from-node {from_node!r} 要求节点 {nid!r} 已完成，"
+                f"但当前状态为 {status!r}。"
+                f"请先执行完整的 L2 流程，或从更早的子阶段开始。"
+            )
+
+        # 检查数据字段完整性
+        required = _FROM_NODE_REQUIRED_FIELDS.get(nid, frozenset())
+        for field_name in required:
+            if field_name not in current:
+                raise ValueError(
+                    f"--from-node {from_node!r} 要求 current.{field_name!r} 存在，"
+                    f"但清单中缺少该字段（节点 {nid!r} 的产物）。"
+                )
