@@ -286,14 +286,20 @@ if _TEXTUAL_AVAILABLE:
             n = max(1, int(payload.get("n_blocks_r1_estimate", 1)))
             slots = [(f"block_{i}", f"块 {i + 1}") for i in range(n)]
             self._vm.register_slots(slots)
-            self._update_progress_bar()
+            self._redraw_active_slot()   # 触发进度条和状态栏初始渲染
             self.mount_addon(DecisionsAddon())
 
         def _on_2b_chunk(self, payload: dict) -> None:
             bo = int(payload.get("block_ordinal", 0))
-            slot_id = f"block_{bo}"
+            # block_ordinal 是 1-based，slots 是 0-based
+            slot_id = f"block_{bo - 1}"
             # llm_stream 部分（thinking + content）
-            self._handle_llm_stream(payload)
+            # _handle_llm_stream 用 payload["stage"] 作为 slot_id，
+            # 但 chunk.stage 是 "decision_r1"/"decision_r2"，与注册的 "block_N" 不匹配。
+            # 构造一个替换了 stage 的 payload，让数据写入正确的 slot。
+            llm_payload = dict(payload)
+            llm_payload["stage"] = slot_id
+            self._handle_llm_stream(llm_payload)
             # decisions 增量写入 addon_data
             decisions = payload.get("decisions")
             if decisions is not None:
