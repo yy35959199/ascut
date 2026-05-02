@@ -132,11 +132,10 @@ def _add_pipeline_args(p: argparse.ArgumentParser) -> None:
         help="关闭 L3 VAD 切点吸附",
     )
     p.add_argument(
-        "--force-rerun",
-        type=str,
-        default=None,
-        metavar="PHASES",
-        help="强制重跑指定 phase（如 2、23），忽略已完成的 resumable 节点；续跑时使用",
+        "--resume-mode",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,  # 内部参数，由 resume 子命令透传，不对外展示
     )
     p.add_argument("--verbose", action="store_true", help="DEBUG 日志")
     # 占位：validate_cli_args 曾检查旧参数
@@ -191,13 +190,6 @@ def _add_resume_args(p: argparse.ArgumentParser) -> None:
         "--no-vad-snap",
         action="store_true",
         help="关闭 L3 VAD 切点吸附",
-    )
-    p.add_argument(
-        "--force-rerun",
-        type=str,
-        default=None,
-        metavar="PHASES",
-        help="强制重跑指定 phase（如 2、23），忽略已完成的 resumable 节点",
     )
     p.add_argument("--verbose", action="store_true", help="DEBUG 日志")
 
@@ -327,25 +319,6 @@ def _validate_cli_args(
             parser.error(f"--manifest 不是有效文件: {mp}")
 
 
-def _parse_force_rerun(raw: str | None) -> "frozenset[int] | None":
-    """将 --force-rerun 字符串（如 "2"、"23"）解析为 frozenset[int]。
-
-    Returns:
-        frozenset of phase ints，或 None（未指定时）。
-
-    Raises:
-        ValueError: 包含非法字符。
-    """
-    if not raw:
-        return None
-    phases: set[int] = set()
-    for ch in raw.strip():
-        if ch not in ("1", "2", "3"):
-            raise ValueError(f"--force-rerun 只接受 1/2/3 的组合，非法字符: {ch!r}")
-        phases.add(int(ch))
-    return frozenset(phases) if phases else None
-
-
 def _args_to_params(args: argparse.Namespace) -> PipelineParams:
     """将 argparse Namespace 转换为 PipelineParams。"""
     stages: frozenset[int] = getattr(args, "_resolved_stages", frozenset({1, 2, 3}))
@@ -359,12 +332,6 @@ def _args_to_params(args: argparse.Namespace) -> PipelineParams:
         manifest_path = getattr(args, "manifest", None)
 
     stage_str = getattr(args, "stage", None) or "123"
-
-    force_rerun_raw = getattr(args, "force_rerun", None)
-    try:
-        force_rerun_phases = _parse_force_rerun(force_rerun_raw)
-    except ValueError as e:
-        raise ValueError(str(e)) from e
 
     return PipelineParams(
         input_video=input_video,
@@ -388,7 +355,7 @@ def _args_to_params(args: argparse.Namespace) -> PipelineParams:
         gpu_memory_utilization=getattr(args, "gpu_memory_utilization", 0.8),
         interactive_2d=getattr(args, "interactive_2d", False),
         verbose=getattr(args, "verbose", False),
-        force_rerun_phases=force_rerun_phases,
+        resume_mode=getattr(args, "resume_mode", False),
     )
 
 
@@ -583,8 +550,7 @@ def _run_resume(args: argparse.Namespace) -> int:
         run_argv += ["--config", str(args.config)]
     if getattr(args, "no_vad_snap", False):
         run_argv += ["--no-vad-snap"]
-    if getattr(args, "force_rerun", None):
-        run_argv += ["--force-rerun", args.force_rerun]
+    run_argv += ["--resume-mode"]  # resume 子命令始终以续跑模式执行
     if args.verbose:
         run_argv += ["--verbose"]
 

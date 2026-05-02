@@ -41,6 +41,8 @@ class ProgressReport:
     suggested_stage: str | None     # "3" / "23" / "123" / None
     goal_needed: bool               # 续跑 L2 时需要 goal 但当前为空
     warnings: list[str] = field(default_factory=list)
+    has_input_video_accessible: bool = False
+    """源视频文件是否可达（用于判断 TUI 中"全部重跑"按钮是否可用）。"""
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +185,7 @@ def infer_progress(data: dict[str, Any], manifest_path: Path) -> ProgressReport:
         suggested_stage=suggested,
         goal_needed=goal_needed,
         warnings=warnings,
+        has_input_video_accessible=Path(str(sm.get("path", ""))).is_file() if sm.get("path") else False,
     )
 
 

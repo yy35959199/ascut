@@ -307,3 +307,8 @@ def log_stage_result(stage_id: str, *, summary: str | None = None) -> None:
 def get_active_log_path() -> Path | None:
     """当前 loguru 文件 sink 路径（setup_logging* 之后有值；无文件 sink 时为 None）。"""
     return _active_file_path
+
+
+def get_active_log_path() -> Path | None:
+    """当前 loguru 文件 sink 路径（setup_logging* 之后有值；无文件 sink 时为 None）。"""
+    return _active_file_path

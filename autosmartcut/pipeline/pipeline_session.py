@@ -73,13 +73,13 @@ class PipelineSession:
         scheduler: "Scheduler | None" = None,
         stage_filter: "frozenset[int] | None" = None,
         max_reflows: int = 3,
-        force_rerun_phases: "frozenset[int] | None" = None,
+        resume_mode: bool = False,
     ) -> None:
         self._manifest_path = manifest_path
         self._config = config
         self._stage_filter = stage_filter
         self._max_reflows = max_reflows
-        self._force_rerun_phases = force_rerun_phases
+        self._resume_mode = resume_mode
 
         # Scheduler 延迟导入避免循环依赖
         if scheduler is not None:
@@ -265,13 +265,10 @@ class PipelineSession:
                 self._node_states[node_id] = NodeState(node_id=node_id, status="skipped")
 
     def _apply_resumable_skip(self, manifest: dict) -> None:
-        """resumable=True 且 layer_status 有完成标记时跳过节点。
+        """resume_mode=True 时调用：跳过已完成的 resumable 节点。
 
         跳过节点时，将 manifest["current"] 中对应节点写出的字段回填到顶层，
         确保后续节点能从内存 manifest 中读到这些字段（而不必重新执行）。
-
-        若节点的 phase 在 force_rerun_phases 中，则清除其 completed 标记并强制重跑，
-        不执行 resumable skip。
         """
         current = manifest.get("current", {})
         if not isinstance(current, dict):
@@ -280,11 +277,6 @@ class PipelineSession:
         for node_id, node in self._nodes.items():
             # 只处理仍为 pending 的节点
             if self._node_states[node_id].status != "pending":
-                continue
-
-            # 强制重跑：清除该节点的 completed 标记，不 skip
-            if self._force_rerun_phases and node.phase in self._force_rerun_phases:
-                ls_clear_node(manifest, node_id)
                 continue
 
             if node.resumable:
@@ -345,7 +337,8 @@ class PipelineSession:
         self._current_manifest = manifest  # 供 abort() 使用
 
         self._apply_stage_filter(manifest)
-        self._apply_resumable_skip(manifest)
+        if self._resume_mode:
+            self._apply_resumable_skip(manifest)
 
         start_time = datetime.now()
 
